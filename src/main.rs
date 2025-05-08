@@ -1,10 +1,10 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::process::Command;
 
-const GIT_ROOT: &str = "/home/youruser/src/walrus"; // change as needed
-const STACK: [&str; 2] = ["my-branch-01", "my-branch-02"];
+const GIT_ROOT: &str = "/Users/wbbradley/src/walrus";
+const STACK: [&str; 2] = ["rust-sdk-03", "rust-sdk-04"];
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -24,7 +24,38 @@ enum Commands {
     },
 }
 
-fn run_git(args: &[&str]) -> Result<String> {
+pub struct GitOutput {
+    stdout: String,
+}
+
+impl GitOutput {
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_empty()
+    }
+    pub fn output(self) -> Option<String> {
+        if self.stdout.is_empty() {
+            None
+        } else {
+            Some(self.stdout)
+        }
+    }
+    pub fn output_or(self, message: impl AsRef<str>) -> Result<String> {
+        if self.stdout.is_empty() {
+            Err(anyhow!("{}", message.as_ref()))
+        } else {
+            Ok(self.stdout)
+        }
+    }
+}
+
+impl AsRef<str> for GitOutput {
+    fn as_ref(&self) -> &str {
+        &self.stdout
+    }
+}
+
+fn run_git(args: &[&str]) -> Result<GitOutput> {
+    tracing::info!("Running `git {}`", args.join(" "));
     let out = Command::new("git")
         .args(args)
         .output()
@@ -33,10 +64,13 @@ fn run_git(args: &[&str]) -> Result<String> {
     if !out.status.success() {
         bail!("git {:?} failed with exit status: {}", args, out.status);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(GitOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    })
 }
 
 fn run_git_ok(args: &[&str]) -> Result<bool> {
+    tracing::info!("Running `git {}`", args.join(" "));
     Ok(Command::new("git")
         .args(args)
         // .stdout(Stdio::null())
@@ -46,16 +80,11 @@ fn run_git_ok(args: &[&str]) -> Result<bool> {
 }
 
 fn run_git_status_clean() -> Result<bool> {
-    Ok(run_git(&["status", "--porcelain"])
-        .context("run_git_status_clean")?
-        .is_empty())
+    Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
 
-fn git_fetch() -> Result<()> {
-    if !run_git_ok(&["fetch", "--prune"]).context("git_fetch")? {
-        bail!("git fetch failed")
-    }
-    Ok(())
+fn after_char(s: &str, c: char) -> Option<&str> {
+    s.find(c).map(|pos| &s[pos + c.len_utf8()..])
 }
 
 fn git_checkout_main() -> Result<()> {
@@ -63,12 +92,15 @@ fn git_checkout_main() -> Result<()> {
         bail!("git status is not clean, please commit or stash your changes.")
     }
     let remote = "origin";
-    let main = run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?;
-    let main_branch = main.trim().rsplit('/').next().expect("main branch");
+    let remote_main =
+        run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?.output();
+    let main_branch = after_char(&remote_main.ok_or(anyhow!("No remote main branch?"))?, '/')
+        .ok_or(anyhow!("no branch?"))?
+        .to_string();
     if !run_git_ok(&[
         "checkout",
         "-B",
-        main_branch,
+        &main_branch,
         &format!("{}/{}", remote, main_branch),
     ])
     .with_context(|| format!("git checkout {} failed", main_branch))?
@@ -79,29 +111,37 @@ fn git_checkout_main() -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // construct a subscriber that prints formatted traces to stdout
+    let subscriber = tracing_subscriber::FmtSubscriber::new();
+    // use that subscriber to process traces emitted after this point
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    // Run from the git root directory.
     let args = Args::parse();
     if let Err(e) = env::set_current_dir(GIT_ROOT) {
         bail!("cd {} failed: {}", GIT_ROOT, e);
     }
-    git_fetch()?;
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
-    let orig_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"]).context("get orig_branch")?;
-    tracing::info!("Starting branch: {}", orig_branch);
+    let orig_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
+        .output()
+        .ok_or(anyhow!("No current branch?"))?;
+    tracing::info!(
+        "Starting branch: {} [pwd={}]",
+        orig_branch,
+        env::current_dir()?.display()
+    );
 
     // --verbose: Print current stack and exit.
     if args.verbose {
         for &branch in &STACK {
-            let source = run_git(&["rev-parse", branch]).context("get source")?;
-            if source.is_empty() {
-                bail!("branch '{}' does not exist", branch);
-            }
-            let log_msg = run_git(&["log", "-1", "--pretty=format:%s", &source])
-                .context("get log message")?;
+            let source = run_git(&["rev-parse", branch])?
+                .output_or(format!("branch '{}' does not exist", branch))?;
+            let log_msg = run_git(&["log", "-1", "--pretty=format:%s", source.as_ref()])?;
             if log_msg.is_empty() {
                 bail!("branch '{}' has no commit message!?", branch);
             }
-            tracing::info!("{}: {}", branch, log_msg);
+            tracing::info!("{}: {}", branch, log_msg.as_ref());
         }
         std::process::exit(0);
     }
@@ -122,11 +162,8 @@ fn main() -> Result<()> {
                 } else {
                     format!("{}-at-{}", branch, run_version)
                 };
-                let source = run_git(&["rev-parse", &backup_branch]).context("get source")?;
-                if source.is_empty() {
-                    tracing::warn!("branch '{}' does not exist, skipping...", backup_branch);
-                    continue;
-                }
+                let source = run_git(&["rev-parse", &backup_branch])?
+                    .output_or(format!("missing tree from {backup_branch}?"))?;
                 tracing::info!("Rolling back branch '{}' to '{}'...", branch, backup_branch);
                 if !run_git_ok(&["branch", "-f", branch, &source])? {
                     bail!("git branch -f {} {} failed", branch, source);
@@ -135,19 +172,19 @@ fn main() -> Result<()> {
                     bail!("git branch -D {} failed", backup_branch);
                 }
             }
+            return Ok(());
         }
-        None => todo!(),
+        None => {
+            // Fallthrough to the default behavior.
+        }
     }
 
+    // Attempt to get everything stacked up.
     for &branch in &STACK {
-        let source = run_git(&["rev-parse", branch])?;
-        if source.is_empty() {
-            bail!("branch '{}' does not exist", branch);
-        }
-        let log_msg = run_git(&["log", "-1", "--pretty=format:%s", &source])?;
-        if log_msg.is_empty() {
-            bail!("branch '{}' has no commit message!?", branch);
-        }
+        let source = run_git(&["rev-parse", branch])?
+            .output_or(format!("branch {branch} does not exist?"))?;
+        let log_msg = run_git(&["log", "-1", "--pretty=format:%s", &source])?
+            .output_or(format!("branch '{}' has no commit message!?", branch))?;
 
         if run_git_ok(&["merge-base", "--is-ancestor", &stack_on, branch])? {
             tracing::info!(
