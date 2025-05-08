@@ -83,8 +83,10 @@ fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
 
-fn after_char(s: &str, c: char) -> Option<&str> {
-    s.find(c).map(|pos| &s[pos + c.len_utf8()..])
+fn after_text(s: &str, needle: impl AsRef<str>) -> Option<&str> {
+    let needle = needle.as_ref();
+    s.find(needle)
+        .map(|pos| &s[pos + needle.chars().fold(0, |x, y| x + y.len_utf8())..])
 }
 
 fn git_checkout_main() -> Result<()> {
@@ -94,9 +96,13 @@ fn git_checkout_main() -> Result<()> {
     let remote = "origin";
     let remote_main =
         run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?.output();
-    let main_branch = after_char(&remote_main.ok_or(anyhow!("No remote main branch?"))?, '/')
-        .ok_or(anyhow!("no branch?"))?
-        .to_string();
+    dbg!(remote_main.as_ref());
+    let main_branch = after_text(
+        &remote_main.ok_or(anyhow!("No remote main branch?"))?,
+        format!("{remote}/"),
+    )
+    .ok_or(anyhow!("no branch?"))?
+    .to_string();
     if !run_git_ok(&[
         "checkout",
         "-B",
@@ -181,6 +187,7 @@ fn main() -> Result<()> {
 
     // Attempt to get everything stacked up.
     for &branch in &STACK {
+        tracing::info!("Processing branch '{}'...", branch);
         let source = run_git(&["rev-parse", branch])?
             .output_or(format!("branch {branch} does not exist?"))?;
         let log_msg = run_git(&["log", "-1", "--pretty=format:%s", &source])?
