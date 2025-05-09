@@ -177,7 +177,7 @@ fn inner_main() -> Result<()> {
 }
 
 fn rollback(
-    stacks: &Vec<Stack>,
+    stacks: &[Stack],
     rollback_to_version: String,
 ) -> std::result::Result<(), anyhow::Error> {
     let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
@@ -213,7 +213,11 @@ fn restack(
     run_version: String,
     orig_branch: String,
 ) -> Result<(), anyhow::Error> {
-    let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
+    // Find orig_branch in the stacks to determine the stack to use.
+    let stack = stacks
+        .into_iter()
+        .find(|stack| stack.branches.contains(&orig_branch))
+        .ok_or(anyhow!("No stack found for branch {}", orig_branch))?;
     git_checkout_main()?;
     let mut stack_on = "main".to_string();
     for branch in &stack.branches {
