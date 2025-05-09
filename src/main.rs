@@ -26,8 +26,6 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List all stacks in the given directory.
-    List,
     /// Show the status of nearby stacks.
     Status,
     /// Restack your active branch and all branches in its related stack.
@@ -77,7 +75,6 @@ fn inner_main() -> Result<()> {
     tracing::debug!("This is git-stack run version {}.", run_version);
 
     match args.command {
-        Commands::List => list_stacks(&state, &dir_key),
         Commands::New {
             branch_name: Some(branch_name),
         } => new_stack(state, &dir_key, &branch_name, true),
@@ -98,13 +95,9 @@ fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
         return Ok(());
     }
     let orig_branch = orig_branch.to_string();
-    for stack in stacks.iter().rev() {
-        if stack.contains(&orig_branch) {
-            println!("You are on stack:");
-        } else {
-            println!("Stack:");
-        }
-        for branch in stack {
+    for (i, stack) in stacks.iter().enumerate().map(|(i, s)| (i + 1, s)) {
+        println!("stack {i}:");
+        for branch in stack.iter().rev() {
             if branch == &orig_branch {
                 print!("  * ");
             } else {
@@ -149,24 +142,6 @@ fn new_stack(
     }
     state.create_new_stack_with_existing_branch(dir_key, branch_name)?;
     save_state(&state)?;
-    Ok(())
-}
-
-fn list_stacks(state: &State, dir_key: &str) -> std::result::Result<(), anyhow::Error> {
-    println!("# Stacks in {dir_key}");
-    let stacks: Vec<Vec<String>> = state.get_stacks(dir_key);
-
-    for (i, stack) in stacks.iter().enumerate().map(|(i, s)| (i + 1, s)) {
-        println!(
-            "stack {i}:\n  {}",
-            stack
-                .iter()
-                .map(|d| d.as_str())
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n  ")
-        );
-    }
     Ok(())
 }
 
