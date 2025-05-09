@@ -7,6 +7,8 @@ use git::{git_checkout_main, run_git_status};
 use state::save_state;
 use std::env;
 use std::fs::canonicalize;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt; //prelude::*;
 
 mod git;
 mod state;
@@ -48,10 +50,13 @@ fn main() {
 fn inner_main() -> Result<()> {
     // Run from the git root directory.
     let args = Args::parse();
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .without_time()
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+
+    tracing_subscriber::registry()
+        // We don't need timestamps in the logs.
+        .with(tracing_subscriber::fmt::layer().without_time())
+        // Allow usage of RUST_LOG environment variable to set the log level.
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let dir_key = canonicalize(
         run_git(&["rev-parse", "--show-toplevel"])?.output_or("No git directory found")?,
@@ -69,22 +74,6 @@ fn inner_main() -> Result<()> {
         .output()
         .ok_or(anyhow!("No current branch?"))?;
 
-    // --verbose: Print current stack and exit.
-    /*if args.verbose {
-        let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
-
-        for branch in &stack.branches {
-            let source = run_git(&["rev-parse", branch])?
-                .output_or(format!("branch '{}' does not exist", branch))?;
-            let log_msg = run_git(&["log", "-1", "--pretty=format:%s", source.as_ref()])?;
-            if log_msg.is_empty() {
-                bail!("branch '{}' has no commit message!?", branch);
-            }
-            tracing::info!("{}: {}", branch, log_msg.as_ref());
-        }
-        std::process::exit(0);
-    }*/
-
     tracing::debug!("This is git-stack run version {}.", run_version);
 
     match args.command {
@@ -94,11 +83,37 @@ fn inner_main() -> Result<()> {
         } => new_stack(state, &dir_key, &branch_name, true),
         Commands::New { branch_name: None } => new_stack(state, &dir_key, &orig_branch, false),
         Commands::Restack => restack(state, &dir_key, run_version, orig_branch),
-        Commands::Status => todo!(),
+        Commands::Status => status(state, &dir_key, &orig_branch),
         Commands::Add { branch_name } => {
             add_branch_to_stack(state, &dir_key, &orig_branch, &branch_name)
         }
     }
+}
+
+fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
+    println!("# Stacks in {dir_key}");
+    let stacks = state.get_stacks(dir_key);
+    if stacks.is_empty() {
+        println!("No stacks found.");
+        return Ok(());
+    }
+    let orig_branch = orig_branch.to_string();
+    for stack in stacks.iter().rev() {
+        if stack.contains(&orig_branch) {
+            println!("You are on stack:");
+        } else {
+            println!("Stack:");
+        }
+        for branch in stack {
+            if branch == &orig_branch {
+                print!("  * ");
+            } else {
+                print!("    ");
+            }
+            println!("{}", branch);
+        }
+    }
+    Ok(())
 }
 
 fn add_branch_to_stack(
