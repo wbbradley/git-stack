@@ -1,6 +1,7 @@
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, anyhow, bail};
+pub const DEFAULT_REMOTE: &str = "origin";
 
 pub struct GitOutput {
     pub(crate) stdout: String,
@@ -32,6 +33,7 @@ impl AsRef<str> for GitOutput {
     }
 }
 
+/// Run a git command and return the output. If the git command fails, this will return an error.
 pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     tracing::debug!("Running `git {}`", args.join(" "));
     let out = Command::new("git")
@@ -57,6 +59,34 @@ pub(crate) fn git_fetch() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn git_branch_exists(branch: &str) -> bool {
+    run_git(&["rev-parse", "--verify", branch]).is_ok()
+}
+
+#[derive(Debug)]
+pub(crate) struct GitBranchStatus {
+    pub(crate) exists: bool,
+    pub(crate) is_descendent: bool,
+}
+
+pub(crate) fn git_branch_status(
+    parent_branch: Option<String>,
+    branch: &str,
+) -> Result<GitBranchStatus> {
+    let exists = git_branch_exists(branch);
+    let parent_branch = match parent_branch {
+        Some(parent_branch) => parent_branch,
+        None => git_remote_main(DEFAULT_REMOTE)?,
+    };
+    let is_descendent = exists && is_ancestor(&parent_branch, branch)?;
+    Ok(GitBranchStatus {
+        exists,
+        is_descendent,
+    })
+}
+pub(crate) fn is_ancestor(stack_on: &str, branch: &str) -> Result<bool> {
+    Ok(run_git_status(&["merge-base", "--is-ancestor", stack_on, branch])?.success())
+}
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
@@ -76,16 +106,14 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     // TODO: add support for different remotes.
     let remote = "origin";
     //  Get the HEAD ref of the remote.
-    let remote_main = run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
-        .output()
-        .ok_or(anyhow!("No remote main branch?"))?;
+    let remote_main = git_remote_main(remote)?;
     // Figure out the branch name.
     let main_branch = after_text(&remote_main, format!("{remote}/"))
         .ok_or(anyhow!("no branch?"))?
         .to_string();
 
     // Check that we don't orphan unpushed changes in the local `main` branch.
-    if !run_git_status(&["merge-base", "--is-ancestor", &main_branch, &remote_main])?.success() {
+    if !is_ancestor(&main_branch, &remote_main)? {
         bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
     }
 
@@ -105,4 +133,11 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
         ])?;
     }
     Ok(())
+}
+
+pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
+    run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
+        .output()
+        .map(|s| s.trim().to_string())
+        .ok_or(anyhow!("No remote main branch?"))
 }

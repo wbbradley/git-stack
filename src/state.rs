@@ -1,4 +1,5 @@
 use anyhow::{Result, bail, ensure};
+use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -6,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::run_git_status;
+use crate::{git::git_branch_exists, run_git};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
@@ -60,11 +61,22 @@ impl State {
             Entry::Occupied(mut entry) => {
                 tracing::debug!("adding to existing directory: {}", dir_key);
                 let stacks = entry.get_mut();
-                check_branch_does_not_exist(&branch_name, stacks)?;
+                ensure!(
+                    !is_branch_mentioned_already(&branch_name, stacks),
+                    "branch '{branch_name}' is already referenced in a stack"
+                );
 
                 let stack = find_stack_with_branch(stacks, current_branch)?;
                 assert!(!stack.is_empty());
                 let top_branch = stack.last().unwrap().clone();
+                if !git_branch_exists(&branch_name) {
+                    tracing::warn!(
+                        "Branch '{}' does not exist. Creating it from '{}'.",
+                        branch_name.green(),
+                        top_branch.yellow()
+                    );
+                    run_git(&["branch", &branch_name, &top_branch])?;
+                }
                 stack.push(branch_name);
                 Ok(top_branch)
             }
@@ -88,15 +100,9 @@ impl State {
     //}
 }
 
-fn check_branch_does_not_exist(branch_name: &String, stacks: &mut [Vec<String>]) -> Result<()> {
-    if run_git_status(&["rev-parse", branch_name])?.success() {
-        bail!("branch '{}' already exists", branch_name);
-    }
+fn is_branch_mentioned_already(branch_name: &str, stacks: &[Vec<String>]) -> bool {
     // Check whether this name is already in use.
-    if stacks.iter().any(|s| s.contains(branch_name)) {
-        bail!("Stack with name {} already exists", branch_name);
-    }
-    Ok(())
+    stacks.iter().any(|s| s.iter().any(|b| b == branch_name))
 }
 
 fn find_stack_with_branch<'a>(

@@ -4,7 +4,10 @@ use colored::Colorize;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
-use git::{git_checkout_main, run_git_status};
+use git::{
+    DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
+    git_remote_main, is_ancestor, run_git_status,
+};
 use state::save_state;
 use std::env;
 use std::fs::canonicalize;
@@ -31,10 +34,10 @@ enum Commands {
     Status,
     /// Restack your active branch and all branches in its related stack.
     Restack,
-    /// Create a new stack. If no name is given, the current branch will be used.
+    /// Track a branch as a new stack. If no name is given, the current branch will be used.
     New { branch_name: Option<String> },
-    /// Make a new branch at the top of the current stack. If no name is given, a numerically
-    /// incremental name will be used, given the current top of stack.
+    /// Assign an existing branch to the tip of the current stack, or create a new branch at the
+    /// tip of the current stack.
     Add { branch_name: String },
 }
 
@@ -99,31 +102,66 @@ fn selection_marker() -> &'static str {
 }
 
 fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
-    println!("Stacks in {}", dir_key.green());
+    git_fetch()?;
     let stacks = state.get_stacks(dir_key);
     if stacks.is_empty() {
         println!("No stacks found.");
         return Ok(());
     }
     let orig_branch = orig_branch.to_string();
+    let mut saw_stack = false;
+    let remote_main = after_text(&git_remote_main(DEFAULT_REMOTE)?, "remotes/")
+        .expect("remote main")
+        .to_string();
     for (i, stack) in stacks.iter().enumerate().map(|(i, s)| (i + 1, s)) {
-        println!("stack {i}:");
+        let stack_header: String = format!("▤ stack {i}").truecolor(148, 148, 158).to_string();
+        println!("{}", stack_header);
+        let mut last_branch = None;
         let current_stack = stack.contains(&orig_branch);
-        for branch in stack.iter().rev() {
+        saw_stack = saw_stack || current_stack;
+        for branch in stack.iter() {
+            let branch_status: GitBranchStatus = git_branch_status(last_branch.clone(), branch)?;
             if branch == &orig_branch {
                 print!("  {} ", selection_marker().purple());
             } else {
                 print!("    ");
             }
             println!(
-                "{}",
+                "{} {}",
                 if current_stack {
                     branch.green()
                 } else {
-                    branch.truecolor(128, 128, 128)
+                    branch.truecolor(178, 178, 178)
+                },
+                {
+                    let details: String = if branch_status.exists {
+                        if branch_status.is_descendent {
+                            format!(
+                                "{} with {}",
+                                "is up to date".truecolor(90, 120, 87),
+                                last_branch.unwrap_or(remote_main.clone()).yellow()
+                            )
+                        } else {
+                            format!(
+                                "{} {}",
+                                "is behind".red(),
+                                last_branch.unwrap_or(remote_main.clone()).yellow()
+                            )
+                        }
+                    } else {
+                        "does not exist".red().to_string()
+                    };
+                    details
                 }
             );
+            last_branch = Some(branch.to_string());
         }
+    }
+    if !saw_stack {
+        println!(
+            "No stack found for current branch: '{}'",
+            orig_branch.green()
+        );
     }
     Ok(())
 }
@@ -140,8 +178,7 @@ fn add_branch_to_stack(
     if current_branch == "main" {
         bail!("You are on the main branch. Please checkout a stacked branch.");
     }
-    let git_ref = state.add_to_stack(dir_key, current_branch, branch_name)?;
-    run_git(&["checkout", "-B", branch_name, &git_ref])?;
+    let _git_ref = state.add_to_stack(dir_key, current_branch, branch_name)?;
     save_state(&state)?;
     Ok(())
 }
@@ -187,7 +224,7 @@ fn restack(
         let source = run_git(&["rev-parse", branch])?
             .output_or(format!("branch {branch} does not exist?"))?;
 
-        if run_git_status(&["merge-base", "--is-ancestor", &stack_on, branch])?.success() {
+        if is_ancestor(&stack_on, branch)? {
             tracing::info!(
                 "Branch '{}' is already up to date with '{}'.",
                 branch,
@@ -195,11 +232,7 @@ fn restack(
             );
             stack_on = branch.to_string();
             tracing::info!("Force-pushing '{}' to origin...", branch);
-            if !run_git_status(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?
-                .success()
-            {
-                bail!("git push -fu origin {}:{} failed", branch, branch);
-            }
+            run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
             continue;
         } else {
             tracing::info!(
