@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -47,9 +47,9 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     })
 }
 
-pub(crate) fn run_git_ok(args: &[&str]) -> Result<bool> {
+pub(crate) fn run_git_status(args: &[&str]) -> Result<ExitStatus> {
     tracing::debug!("Running `git {}`", args.join(" "));
-    Ok(Command::new("git").args(args).status()?.success())
+    Ok(Command::new("git").args(args).status()?)
 }
 
 pub(crate) fn git_fetch() -> Result<()> {
@@ -67,7 +67,7 @@ pub(crate) fn after_text(s: &str, needle: impl AsRef<str>) -> Option<&str> {
         .map(|pos| &s[pos + needle.chars().fold(0, |x, y| x + y.len_utf8())..])
 }
 
-pub(crate) fn git_checkout_main() -> Result<()> {
+pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     if !run_git_status_clean()? {
         bail!("git status is not clean, please commit or stash your changes.")
     }
@@ -81,15 +81,21 @@ pub(crate) fn git_checkout_main() -> Result<()> {
     )
     .ok_or(anyhow!("no branch?"))?
     .to_string();
-    if !run_git_ok(&[
-        "checkout",
-        "-B",
+
+    // Repoint "main" to the remote main branch.
+    run_git(&[
+        "branch",
+        "-f",
         &main_branch,
         &format!("{}/{}", remote, main_branch),
-    ])
-    .with_context(|| format!("git checkout {} failed", main_branch))?
-    {
-        bail!("git checkout {} failed", main_branch)
+    ])?;
+    if let Some(new_branch) = new_branch {
+        run_git(&[
+            "checkout",
+            "-B",
+            new_branch,
+            &format!("{}/{}", remote, main_branch),
+        ])?;
     }
     Ok(())
 }
