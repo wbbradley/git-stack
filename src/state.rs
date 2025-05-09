@@ -17,6 +17,15 @@ pub struct Stack {
     pub branches: Vec<String>,
 }
 
+impl State {
+    pub fn get_stacks(&self, dir_key: &str) -> Vec<Stack> {
+        self.directories
+            .get(dir_key)
+            .map(|dir| dir.stacks.to_vec())
+            .unwrap_or(vec![])
+    }
+}
+
 pub fn load_state() -> anyhow::Result<State> {
     let config_path = get_xdg_path()?;
     let mut used_existing_config = true;
