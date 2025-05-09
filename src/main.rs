@@ -3,8 +3,7 @@ use clap::{Parser, Subcommand};
 use std::env;
 use std::process::Command;
 
-const GIT_ROOT: &str = "/Users/wbbradley/src/walrus";
-const STACK: [&str; 2] = ["rust-sdk-03", "rust-sdk-04"];
+mod state;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -18,6 +17,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    List {
+        #[arg(short, long)]
+        git_dir: String,
+    },
     Rollback {
         #[arg(short, long)]
         version: String,
@@ -116,17 +119,44 @@ fn git_checkout_main() -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = inner_main() {
+        tracing::error!(error = ?e);
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+fn inner_main() -> Result<()> {
     // construct a subscriber that prints formatted traces to stdout
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     // use that subscriber to process traces emitted after this point
     tracing::subscriber::set_global_default(subscriber)?;
 
+    let state = state::load_state().context("loading state")?;
+    let current_dir = env::current_dir()?;
+    let current_dir = std::fs::canonicalize(current_dir)?;
+
+    tracing::debug!("Current directory: {}", current_dir.display());
+    let dir_key = current_dir
+        .clone()
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("Invalid directory key: '{}'", current_dir.display()))?;
+    let Some(directory_state) = state.directories.get(&dir_key) else {
+        bail!(
+            "The repo '{}' does not have any stacks. You may need to create a new stack. See `git stack create <name>`.",
+            current_dir.display()
+        );
+    };
+
+    let stack = directory_state
+        .stacks
+        .first()
+        .ok_or(anyhow!("No stacks found"))?;
+
     // Run from the git root directory.
     let args = Args::parse();
-    if let Err(e) = env::set_current_dir(GIT_ROOT) {
-        bail!("cd {} failed: {}", GIT_ROOT, e);
-    }
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
     let orig_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
@@ -140,7 +170,7 @@ fn main() -> Result<()> {
 
     // --verbose: Print current stack and exit.
     if args.verbose {
-        for &branch in &STACK {
+        for branch in &stack.branches {
             let source = run_git(&["rev-parse", branch])?
                 .output_or(format!("branch '{}' does not exist", branch))?;
             let log_msg = run_git(&["log", "-1", "--pretty=format:%s", source.as_ref()])?;
@@ -158,11 +188,18 @@ fn main() -> Result<()> {
 
     // --rollback mode
     match args.command {
+        Some(Commands::List { git_dir }) => {
+            tracing::info!("Listing branches in git directory: {}", git_dir);
+            let branches = run_git(&["branch", "-r"])?
+                .output_or(format!("No remote branches found in {git_dir}"))?;
+            tracing::info!("Remote branches:\n{}", branches);
+            return Ok(());
+        }
         Some(Commands::Rollback {
             version: run_version,
         }) => {
             tracing::info!("Rolling back to version {}...", run_version);
-            for &branch in &STACK {
+            for branch in &stack.branches {
                 let backup_branch = if run_version == "origin" {
                     format!("origin/{}", branch)
                 } else {
@@ -186,7 +223,7 @@ fn main() -> Result<()> {
     }
 
     // Attempt to get everything stacked up.
-    for &branch in &STACK {
+    for branch in &stack.branches {
         tracing::info!("Processing branch '{}'...", branch);
         let source = run_git(&["rev-parse", branch])?
             .output_or(format!("branch {branch} does not exist?"))?;

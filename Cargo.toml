@@ -7,5 +7,8 @@ edition = "2024"
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 chrono = "0.4.41"
 clap = { version = "4.5.37", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.8.22"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = "0.3.19"
+xdg = "3.0.0"
