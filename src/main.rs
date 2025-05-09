@@ -1,9 +1,12 @@
+use crate::git::run_git;
+use crate::state::{Stack, State, load_state};
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use state::{Stack, State, load_state};
+use state::save_state;
 use std::env;
-use std::process::Command;
 
+mod git;
 mod state;
 
 #[derive(Parser)]
@@ -21,103 +24,12 @@ struct Args {
 enum Commands {
     /// List all stacks in the given directory.
     List,
+    /// Show the status of nearby stacks.
     Status,
+    /// Restack your active branch and all branches in its related stack.
     Restack,
-    New {
-        name: String,
-    },
-}
-
-pub struct GitOutput {
-    stdout: String,
-}
-
-impl GitOutput {
-    pub fn is_empty(&self) -> bool {
-        self.stdout.is_empty()
-    }
-    pub fn output(self) -> Option<String> {
-        if self.stdout.is_empty() {
-            None
-        } else {
-            Some(self.stdout)
-        }
-    }
-    pub fn output_or(self, message: impl AsRef<str>) -> Result<String> {
-        if self.stdout.is_empty() {
-            Err(anyhow!("{}", message.as_ref()))
-        } else {
-            Ok(self.stdout)
-        }
-    }
-}
-
-impl AsRef<str> for GitOutput {
-    fn as_ref(&self) -> &str {
-        &self.stdout
-    }
-}
-
-fn run_git(args: &[&str]) -> Result<GitOutput> {
-    tracing::debug!("Running `git {}`", args.join(" "));
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {args:?}"))?;
-
-    if !out.status.success() {
-        bail!("git {:?} failed with exit status: {}", args, out.status);
-    }
-    Ok(GitOutput {
-        stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-    })
-}
-
-fn run_git_ok(args: &[&str]) -> Result<bool> {
-    tracing::debug!("Running `git {}`", args.join(" "));
-    Ok(Command::new("git").args(args).status()?.success())
-}
-
-fn git_fetch() -> Result<()> {
-    let _ = run_git(&["fetch", "--prune"])?;
-    Ok(())
-}
-
-fn run_git_status_clean() -> Result<bool> {
-    Ok(run_git(&["status", "--porcelain"])?.is_empty())
-}
-
-fn after_text(s: &str, needle: impl AsRef<str>) -> Option<&str> {
-    let needle = needle.as_ref();
-    s.find(needle)
-        .map(|pos| &s[pos + needle.chars().fold(0, |x, y| x + y.len_utf8())..])
-}
-
-fn git_checkout_main() -> Result<()> {
-    if !run_git_status_clean()? {
-        bail!("git status is not clean, please commit or stash your changes.")
-    }
-    git_fetch()?;
-    let remote = "origin";
-    let remote_main =
-        run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?.output();
-    let main_branch = after_text(
-        &remote_main.ok_or(anyhow!("No remote main branch?"))?,
-        format!("{remote}/"),
-    )
-    .ok_or(anyhow!("no branch?"))?
-    .to_string();
-    if !run_git_ok(&[
-        "checkout",
-        "-B",
-        &main_branch,
-        &format!("{}/{}", remote, main_branch),
-    ])
-    .with_context(|| format!("git checkout {} failed", main_branch))?
-    {
-        bail!("git checkout {} failed", main_branch)
-    }
-    Ok(())
+    /// Create a new stack.
+    New { name: String },
 }
 
 fn main() {
@@ -170,14 +82,20 @@ fn inner_main() -> Result<()> {
 
     match args.command {
         Commands::List => list_stacks(&state, &dir_key),
-        Commands::New { name } => new_stack(state, dir_key, name),
+        Commands::New { name } => new_stack(state, &dir_key, &name),
         Commands::Restack => restack(state, &dir_key, run_version, orig_branch),
         Commands::Status => todo!(),
     }
 }
 
-fn new_stack(mut _state: State, _dir_key: String, _name: String) -> Result<()> {
-    todo!()
+fn new_stack(mut state: State, dir_key: &str, branch_name: &str) -> Result<()> {
+    if branch_name == "main" {
+        bail!("Cannot stack a branch named 'main'");
+    }
+
+    state.add_stack(dir_key, branch_name)?;
+    save_state(&state)?;
+    Ok(())
 }
 
 fn list_stacks(state: &State, dir_key: &str) -> std::result::Result<(), anyhow::Error> {
@@ -201,7 +119,7 @@ fn restack(
         .into_iter()
         .find(|stack| stack.branches.contains(&starting_branch))
         .ok_or(anyhow!("No stack found for branch {}", starting_branch))?;
-    git_checkout_main()?;
+    git::git_checkout_main()?;
     let mut stack_on = "main".to_string();
     for branch in &stack.branches {
         tracing::info!(
@@ -214,7 +132,7 @@ fn restack(
         let log_msg = run_git(&["log", "-1", "--pretty=format:%s", &source])?
             .output_or(format!("branch '{}' has no commit message!?", branch))?;
 
-        if run_git_ok(&["merge-base", "--is-ancestor", &stack_on, branch])? {
+        if git::run_git_ok(&["merge-base", "--is-ancestor", &stack_on, branch])? {
             tracing::info!(
                 "Branch '{}' is already up to date with '{}'.",
                 branch,
@@ -222,7 +140,7 @@ fn restack(
             );
             stack_on = branch.to_string();
             tracing::info!("Force-pushing '{}' to origin...", branch);
-            if !run_git_ok(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])? {
+            if !git::run_git_ok(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])? {
                 bail!("git push -fu origin {}:{} failed", branch, branch);
             }
             continue;
@@ -238,7 +156,7 @@ fn restack(
                 backup_branch,
                 branch
             );
-            if !run_git_ok(&["branch", &backup_branch, &source])? {
+            if !git::run_git_ok(&["branch", &backup_branch, &source])? {
                 bail!("git branch '{}' failed", backup_branch);
             }
             tracing::info!("Initiating a rebase of '{}' onto '{}'...", branch, stack_on);
@@ -246,10 +164,10 @@ fn restack(
                 "Note: use `git commit -m '{}'` to commit the changes.",
                 log_msg
             );
-            if !run_git_ok(&["checkout", branch])? {
+            if !git::run_git_ok(&["checkout", branch])? {
                 bail!("git checkout {} failed", branch);
             }
-            let rebased = run_git_ok(&["rebase", &stack_on]).context("rebase")?;
+            let rebased = git::run_git_ok(&["rebase", &stack_on]).context("rebase")?;
             if !rebased {
                 tracing::warn!("Rebase failed, aborting...");
                 tracing::warn!("Run `git mergetool` to resolve conflicts.");
@@ -262,7 +180,7 @@ fn restack(
     }
     tracing::info!("All branches are up to date with '{}'.", stack_on);
     tracing::info!("Restoring starting branch '{}'...", starting_branch);
-    if !run_git_ok(&["checkout", &starting_branch])? {
+    if !git::run_git_ok(&["checkout", &starting_branch])? {
         bail!("git checkout {} failed", starting_branch);
     }
     tracing::info!("Done.");

@@ -1,14 +1,19 @@
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fs,
+    path::PathBuf,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
-    pub directories: HashMap<String, DirectoryConfig>,
+    pub directories: HashMap<String, Directory>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DirectoryConfig {
+pub struct Directory {
     pub stacks: Vec<Stack>,
 }
 
@@ -22,8 +27,46 @@ impl State {
         self.directories
             .get(dir_key)
             .map(|dir| dir.stacks.to_vec())
-            .unwrap_or(vec![])
+            .unwrap_or_default()
     }
+    pub fn add_stack(&mut self, dir_key: &str, branch_name: &str) -> Result<()> {
+        match self.directories.entry(dir_key.to_string()) {
+            Entry::Occupied(mut e) => {
+                tracing::info!("Adding stack to existing directory: {}", dir_key);
+                let branch_name = branch_name.to_string();
+                let d = e.get_mut();
+                if d.stacks.iter().any(|s| s.branches.contains(&branch_name)) {
+                    bail!("Stack with name {} already exists", branch_name);
+                }
+                d.stacks.push(Stack {
+                    branches: vec![branch_name],
+                });
+                Ok(())
+            }
+            Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert(Directory {
+                    stacks: vec![Stack {
+                        branches: vec![branch_name.to_string()],
+                    }],
+                });
+                Ok(())
+            }
+        }
+    }
+
+    //    let stacks: Vec<Stack> = state.get_stacks(&dir_key);
+    //    if stacks.is_empty() {
+    //        state.add_stack(dir_key.clone(), name);
+    //    }
+    //    state.directories.insert(
+    //        _dir_key.clone(),
+    //        state::DirectoryConfig {
+    //            stacks: vec![Stack {
+    //                branches: vec![_name],
+    //            }],
+    //        },
+    //    );
+    //}
 }
 
 pub fn load_state() -> anyhow::Result<State> {
@@ -55,6 +98,7 @@ pub fn load_state() -> anyhow::Result<State> {
 
 pub fn save_state(state: &State) -> anyhow::Result<()> {
     let config_path = get_xdg_path()?;
+    tracing::info!(?state, ?config_path, "Saving state to config file");
     Ok(fs::write(config_path, toml::to_string(&state)?)?)
 }
 
