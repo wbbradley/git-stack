@@ -7,20 +7,21 @@ use std::process::Command;
 mod state;
 
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, arg_required_else_help = true)]
 struct Args {
     #[arg(long, short, help = "Enable verbose output")]
     verbose: bool,
 
     /// Subcommand to run.
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// List all stacks in the given directory.
     List,
+    Restack,
     Rollback {
         #[arg(short, long)]
         version: String,
@@ -124,10 +125,7 @@ fn main() {
 fn inner_main() -> Result<()> {
     // Run from the git root directory.
     let args = Args::parse();
-
-    // construct a subscriber that prints formatted traces to stdout
     let subscriber = tracing_subscriber::FmtSubscriber::new();
-    // use that subscriber to process traces emitted after this point
     tracing::subscriber::set_global_default(subscriber)?;
 
     let dir_key = std::fs::canonicalize(
@@ -169,48 +167,55 @@ fn inner_main() -> Result<()> {
     }
 
     tracing::debug!("This is git-stack run version {}.", run_version);
-    let mut stack_on = "main".to_string();
 
     // --rollback mode
     match args.command {
-        Some(Commands::List) => {
-            for stack in &stacks {
-                tracing::info!("Stack: {}", stack.branches.join(", "));
-            }
-            return Ok(());
+        Commands::List => list_stacks(&stacks),
+        Commands::Rollback { version } => rollback(&stacks, version),
+        Commands::Restack => restack(stacks, run_version, orig_branch),
+    }
+}
+
+fn rollback(
+    stacks: &Vec<Stack>,
+    rollback_to_version: String,
+) -> std::result::Result<(), anyhow::Error> {
+    let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
+    tracing::info!("Rolling back to version {}...", rollback_to_version);
+    for branch in &stack.branches {
+        let backup_branch = if rollback_to_version == "origin" {
+            format!("origin/{}", branch)
+        } else {
+            format!("{}-at-{}", branch, rollback_to_version)
+        };
+        let source = run_git(&["rev-parse", &backup_branch])?
+            .output_or(format!("missing tree from {backup_branch}?"))?;
+        tracing::info!("Rolling back branch '{}' to '{}'...", branch, backup_branch);
+        if !run_git_ok(&["branch", "-f", branch, &source])? {
+            bail!("git branch -f {} {} failed", branch, source);
         }
-        Some(Commands::Rollback {
-            version: run_version,
-        }) => {
-            let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
-            tracing::info!("Rolling back to version {}...", run_version);
-            for branch in &stack.branches {
-                let backup_branch = if run_version == "origin" {
-                    format!("origin/{}", branch)
-                } else {
-                    format!("{}-at-{}", branch, run_version)
-                };
-                let source = run_git(&["rev-parse", &backup_branch])?
-                    .output_or(format!("missing tree from {backup_branch}?"))?;
-                tracing::info!("Rolling back branch '{}' to '{}'...", branch, backup_branch);
-                if !run_git_ok(&["branch", "-f", branch, &source])? {
-                    bail!("git branch -f {} {} failed", branch, source);
-                }
-                if run_version != "origin" && !run_git_ok(&["branch", "-D", &backup_branch])? {
-                    bail!("git branch -D {} failed", backup_branch);
-                }
-            }
-            return Ok(());
-        }
-        None => {
-            // Fallthrough to the default behavior.
+        if rollback_to_version != "origin" && !run_git_ok(&["branch", "-D", &backup_branch])? {
+            bail!("git branch -D {} failed", backup_branch);
         }
     }
+    Ok(())
+}
 
+fn list_stacks(stacks: &Vec<Stack>) -> std::result::Result<(), anyhow::Error> {
+    for stack in stacks {
+        tracing::info!("Stack: {}", stack.branches.join(", "));
+    }
+    Ok(())
+}
+
+fn restack(
+    stacks: Vec<Stack>,
+    run_version: String,
+    orig_branch: String,
+) -> Result<(), anyhow::Error> {
     let stack = stacks.first().ok_or(anyhow!("No stacks found"))?;
     git_checkout_main()?;
-
-    // Attempt to get everything stacked up.
+    let mut stack_on = "main".to_string();
     for branch in &stack.branches {
         tracing::info!(
             "Starting branch: {} [pwd={}]",
