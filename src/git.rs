@@ -72,15 +72,22 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
         bail!("git status is not clean, please commit or stash your changes.")
     }
     git_fetch()?;
+    // Assuming the dominant remote is "origin".
+    // TODO: add support for different remotes.
     let remote = "origin";
-    let remote_main =
-        run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?.output();
-    let main_branch = after_text(
-        &remote_main.ok_or(anyhow!("No remote main branch?"))?,
-        format!("{remote}/"),
-    )
-    .ok_or(anyhow!("no branch?"))?
-    .to_string();
+    //  Get the HEAD ref of the remote.
+    let remote_main = run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
+        .output()
+        .ok_or(anyhow!("No remote main branch?"))?;
+    // Figure out the branch name.
+    let main_branch = after_text(&remote_main, format!("{remote}/"))
+        .ok_or(anyhow!("no branch?"))?
+        .to_string();
+
+    // Check that we don't orphan unpushed changes in the local `main` branch.
+    if !run_git_status(&["merge-base", "--is-ancestor", &main_branch, &remote_main])?.success() {
+        bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
+    }
 
     // Repoint "main" to the remote main branch.
     run_git(&[
