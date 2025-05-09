@@ -3,7 +3,7 @@ use crate::state::{State, load_state};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
-use git::{git_checkout_main, git_fetch, run_git_status};
+use git::{git_checkout_main, run_git_status};
 use state::save_state;
 use std::env;
 use std::fs::canonicalize;
@@ -119,16 +119,20 @@ fn add_branch_to_stack(
     Ok(())
 }
 
-fn new_stack(mut state: State, dir_key: &str, branch_name: &str, is_new: bool) -> Result<()> {
+fn new_stack(
+    mut state: State,
+    dir_key: &str,
+    branch_name: &str,
+    should_create_branch: bool,
+) -> Result<()> {
     if branch_name == "main" {
         bail!("Cannot stack a branch named 'main'");
     }
 
-    if is_new {
-        git_fetch()?;
+    if should_create_branch {
         git_checkout_main(Some(branch_name))?;
     }
-    state.add_stack(dir_key, branch_name)?;
+    state.create_new_stack_with_existing_branch(dir_key, branch_name)?;
     save_state(&state)?;
     Ok(())
 }

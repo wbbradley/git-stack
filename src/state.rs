@@ -21,7 +21,12 @@ impl State {
             .map(|dir| dir.to_vec())
             .unwrap_or_default()
     }
-    pub fn add_stack(&mut self, dir_key: &str, branch_name: &str) -> Result<()> {
+    /// Adds a new stack to the repo starting with the given branch name.
+    pub fn create_new_stack_with_existing_branch(
+        &mut self,
+        dir_key: &str,
+        branch_name: &str,
+    ) -> Result<()> {
         match self.directories.entry(dir_key.to_string()) {
             Entry::Occupied(mut e) => {
                 tracing::debug!("create stack in an existing directory: {}", dir_key);
