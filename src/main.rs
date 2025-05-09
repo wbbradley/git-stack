@@ -1,5 +1,6 @@
 use crate::git::run_git;
 use crate::state::{State, load_state};
+use colored::Colorize;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -75,10 +76,12 @@ fn inner_main() -> Result<()> {
     tracing::debug!("This is git-stack run version {}.", run_version);
 
     match args.command {
-        Commands::New {
-            branch_name: Some(branch_name),
-        } => new_stack(state, &dir_key, &branch_name, true),
-        Commands::New { branch_name: None } => new_stack(state, &dir_key, &orig_branch, false),
+        Commands::New { branch_name } => new_stack(
+            state,
+            &dir_key,
+            branch_name.as_ref().unwrap_or(&orig_branch),
+            branch_name.is_some(),
+        ),
         Commands::Restack => restack(state, &dir_key, run_version, orig_branch),
         Commands::Status => status(state, &dir_key, &orig_branch),
         Commands::Add { branch_name } => {
@@ -87,8 +90,16 @@ fn inner_main() -> Result<()> {
     }
 }
 
+fn selection_marker() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ">"
+    } else {
+        "→"
+    }
+}
+
 fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
-    println!("# Stacks in {dir_key}");
+    println!("Stacks in {}", dir_key.green());
     let stacks = state.get_stacks(dir_key);
     if stacks.is_empty() {
         println!("No stacks found.");
@@ -97,13 +108,21 @@ fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
     let orig_branch = orig_branch.to_string();
     for (i, stack) in stacks.iter().enumerate().map(|(i, s)| (i + 1, s)) {
         println!("stack {i}:");
+        let current_stack = stack.contains(&orig_branch);
         for branch in stack.iter().rev() {
             if branch == &orig_branch {
-                print!("  * ");
+                print!("  {} ", selection_marker().purple());
             } else {
                 print!("    ");
             }
-            println!("{}", branch);
+            println!(
+                "{}",
+                if current_stack {
+                    branch.green()
+                } else {
+                    branch.truecolor(128, 128, 128)
+                }
+            );
         }
     }
     Ok(())
