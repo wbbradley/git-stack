@@ -12,7 +12,7 @@ pub struct DirectoryConfig {
     pub stacks: Vec<Stack>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Stack {
     pub branches: Vec<String>,
 }
