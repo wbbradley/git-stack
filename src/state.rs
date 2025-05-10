@@ -11,7 +11,7 @@ use crate::{git::git_branch_exists, run_git};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
-    /// The blah.
+    /// The directory name is the key, and the value is a vector of stacks.
     #[serde(flatten, default)]
     pub directories: HashMap<String, Vec<Vec<String>>>,
 }
