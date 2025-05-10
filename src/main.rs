@@ -1,5 +1,6 @@
+#![allow(dead_code, unused_imports, unused_variables)]
 use crate::git::run_git;
-use crate::state::{State, load_state};
+use crate::state::State;
 use colored::Colorize;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -8,7 +9,7 @@ use git::{
     DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
     git_remote_main, is_ancestor, run_git_status,
 };
-use state::save_state;
+use state::{load_state, save_state};
 use std::env;
 use std::fs::canonicalize;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -35,11 +36,9 @@ enum Commands {
     Status,
     /// Restack your active branch and all branches in its related stack.
     Restack,
-    /// Track a branch as a new stack. If no name is given, the current branch will be used.
-    New { branch_name: Option<String> },
-    /// Assign an existing branch to the tip of the current stack, or create a new branch at the
-    /// tip of the current stack.
-    Add { branch_name: String },
+    /// Create a new branch and make it a descendent of the current branch. If the current branch
+    /// is `main`, this will home the branch to the remote main HEAD.
+    Checkout { branch_name: String },
 }
 
 fn main() {
@@ -61,36 +60,30 @@ fn inner_main() -> Result<()> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let dir_key = canonicalize(
+    let repo = canonicalize(
         run_git(&["rev-parse", "--show-toplevel"])?.output_or("No git directory found")?,
     )?
     .into_os_string()
     .into_string()
     .map_err(|error| anyhow!("Invalid git directory: '{}'", error.to_string_lossy()))?;
 
-    let state = load_state().context("loading state")?;
+    let mut state = load_state().context("loading state")?;
 
-    tracing::debug!("Current directory: {}", dir_key);
+    tracing::debug!("Current directory: {}", repo);
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
-    let orig_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
+    let current_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
         .output()
         .ok_or(anyhow!("No current branch?"))?;
-
-    tracing::debug!("This is git-stack run version {}.", run_version);
+    let current_upstream = run_git(&["rev-parse", "--abbrev-ref", "@{upstream}"])?.output();
+    tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
-        Commands::New { branch_name } => new_stack(
-            state,
-            &dir_key,
-            branch_name.as_ref().unwrap_or(&orig_branch),
-            branch_name.is_some(),
-        ),
-        Commands::Restack => restack(state, &dir_key, run_version, orig_branch),
-        Commands::Status => status(state, &dir_key, &orig_branch),
-        Commands::Add { branch_name } => {
-            add_branch_to_stack(state, &dir_key, &orig_branch, &branch_name)
+        Commands::Checkout { branch_name } => {
+            state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
+        Commands::Restack => todo!(), //restack(state, &repo, run_version, current_branch),
+        Commands::Status => status(state, &repo, &current_branch),
     }
 }
 
@@ -102,9 +95,11 @@ fn selection_marker() -> &'static str {
     }
 }
 
-fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
+fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
     git_fetch()?;
-    let stacks = state.get_stacks(dir_key);
+
+    /*
+    let stacks = state.get_stacks(repo);
     if stacks.is_empty() {
         println!("No stacks found.");
         return Ok(());
@@ -164,29 +159,14 @@ fn status(state: State, dir_key: &str, orig_branch: &str) -> Result<()> {
             orig_branch.green()
         );
     }
+    */
     Ok(())
 }
 
-fn add_branch_to_stack(
-    mut state: State,
-    dir_key: &str,
-    current_branch: &str,
-    branch_name: &str,
-) -> Result<()> {
-    if branch_name == "main" {
-        bail!("Cannot stack a branch named 'main'");
-    }
-    if current_branch == "main" {
-        bail!("You are on the main branch. Please checkout a stacked branch.");
-    }
-    let _git_ref = state.add_to_stack(dir_key, current_branch, branch_name)?;
-    save_state(&state)?;
-    Ok(())
-}
-
+/*
 fn new_stack(
     mut state: State,
-    dir_key: &str,
+    repo: &str,
     branch_name: &str,
     should_create_branch: bool,
 ) -> Result<()> {
@@ -197,20 +177,20 @@ fn new_stack(
     if should_create_branch {
         git_checkout_main(Some(branch_name))?;
     }
-    state.create_new_stack_with_existing_branch(dir_key, branch_name)?;
+    state.create_new_stack_with_existing_branch(repo, branch_name)?;
     save_state(&state)?;
     Ok(())
 }
 
 fn restack(
     state: State,
-    dir_key: &str,
+    repo: &str,
     run_version: String,
     starting_branch: String,
 ) -> Result<(), anyhow::Error> {
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let stack = state
-        .get_stacks(dir_key)
+        .get_stacks(repo)
         .into_iter()
         .find(|stack| stack.contains(&starting_branch))
         .ok_or(anyhow!("No stack found for branch {}", starting_branch))?;
@@ -275,3 +255,4 @@ fn restack(
     tracing::info!("Done.");
     Ok(())
 }
+*/

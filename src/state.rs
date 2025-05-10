@@ -1,111 +1,127 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    cell::{Cell, Ref, RefCell},
+    collections::BTreeMap,
     fs,
     path::PathBuf,
+    rc::Rc,
 };
 
-use crate::{git::git_branch_exists, run_git};
+use crate::{
+    git::{DEFAULT_REMOTE, after_text, git_branch_exists, git_remote_main},
+    run_git,
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Branch {
+    /// The name of the branch or ref.
+    pub name: String,
+    /// The upstream branch reference.
+    pub branches: Vec<Branch>,
+}
+
+impl Branch {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            branches: vec![],
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
     /// The directory name is the key, and the value is a vector of stacks.
     #[serde(flatten, default)]
-    pub directories: HashMap<String, Vec<Vec<String>>>,
+    pub trees: BTreeMap<String, Branch>,
 }
 
 impl State {
-    pub fn get_stacks(&self, dir_key: &str) -> Vec<Vec<String>> {
-        self.directories
-            .get(dir_key)
-            .map(|dir| dir.to_vec())
-            .unwrap_or_default()
-    }
-    /// Adds a new stack to the repo starting with the given branch name.
-    pub fn create_new_stack_with_existing_branch(
+    pub fn checkout(
         &mut self,
-        dir_key: &str,
-        branch_name: &str,
+        repo: &str,
+        current_branch: String,
+        current_upstream: Option<String>,
+        branch_name: String,
     ) -> Result<()> {
-        match self.directories.entry(dir_key.to_string()) {
-            Entry::Occupied(mut e) => {
-                tracing::debug!("create stack in an existing directory: {}", dir_key);
-                let branch_name = branch_name.to_string();
-                let d = e.get_mut();
-                ensure!(
-                    !d.iter().any(|s| s.contains(&branch_name)),
-                    "a stack with a branch named '{}' already exists",
-                    branch_name
-                );
-                d.push(vec![branch_name]);
-                Ok(())
-            }
-            Entry::Vacant(vacant_entry) => {
-                tracing::debug!("create stack in a new directory: {}", dir_key);
-                vacant_entry.insert(vec![vec![branch_name.to_string()]]);
-                Ok(())
-            }
+        // Check if the branch name already exists.
+        if self.is_branch_mentioned_already(repo, &branch_name) {
+            run_git(&["checkout", &branch_name])?;
+            return Ok(());
         }
+        let remote_main = git_remote_main(DEFAULT_REMOTE)?;
+        // Figure out the branch name.
+        let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
+            .ok_or(anyhow!("no branch?"))?
+            .to_string();
+        if current_branch == main_branch {
+            // Allow creation of the main branch for this repo if we haven't added it yet.
+            self.trees
+                .entry(repo.to_string())
+                .or_insert_with(|| Branch::new(current_branch.clone()));
+        }
+        let branch = self
+            .get_tree_branch_mut(repo, &current_branch)
+            .ok_or_else(|| anyhow::anyhow!("Branch '{current_branch}' is not being tracked."))?;
+        if !self.trees.contains_key(repo) {
+            self.trees
+                .insert(repo.to_string(), Branch::new(current_branch.clone()));
+        }
+
+        // Save the state after modifying it.
+        save_state(self)?;
+
+        // Checkout the new branch.
+        run_git(&["checkout", &branch_name])?;
+
+        Ok(())
     }
-    /// Adds a new branch to the stack of the current branch, and returns the Git SHA where the new
-    /// branch should be created.
-    pub fn add_to_stack(
-        &mut self,
-        dir_key: &str,
-        current_branch: &str,
+
+    fn is_branch_mentioned_already(&self, repo: &str, branch_name: &str) -> bool {
+        let Some(branch) = self.trees.get(repo) else {
+            return false;
+        };
+        is_branch_mentioned_in_tree(branch_name, branch)
+    }
+    fn get_tree_branch_mut<'a>(
+        &'a mut self,
+        repo: &str,
         branch_name: &str,
-    ) -> Result<String> {
-        let branch_name = branch_name.to_string();
-        match self.directories.entry(dir_key.to_string()) {
-            Entry::Occupied(mut entry) => {
-                tracing::debug!("adding to existing directory: {}", dir_key);
-                let stacks = entry.get_mut();
-                ensure!(
-                    !is_branch_mentioned_already(&branch_name, stacks),
-                    "branch '{branch_name}' is already referenced in a stack"
-                );
+    ) -> Option<&'a mut Branch> {
+        self.trees
+            .get_mut(repo)
+            .and_then(|tree| get_branch_mut(tree, branch_name))
+    }
+}
 
-                let stack = find_stack_with_branch(stacks, current_branch)?;
-                assert!(!stack.is_empty());
-                let top_branch = stack.last().unwrap().clone();
-                if !git_branch_exists(&branch_name) {
-                    tracing::warn!(
-                        "Branch '{}' does not exist. Creating it from '{}'.",
-                        branch_name.green(),
-                        top_branch.yellow()
-                    );
-                    run_git(&["branch", &branch_name, &top_branch])?;
-                }
-                stack.push(branch_name);
-                Ok(top_branch)
-            }
-            Entry::Vacant(_) => {
-                bail!("No stack found for directory {}", dir_key);
+fn get_branch_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
+    if tree.name == name {
+        Some(tree)
+    } else {
+        for child_branch in tree.branches.iter_mut() {
+            let result = get_branch_mut(child_branch, name);
+            if result.is_some() {
+                return result;
             }
         }
+        None
     }
-    //    let stacks: Vec<Stack> = state.get_stacks(&dir_key);
-    //    if stacks.is_empty() {
-    //        state.add_stack(dir_key.clone(), name);
-    //    }
-    //    state.directories.insert(
-    //        _dir_key.clone(),
-    //        state::DirectoryConfig {
-    //            stacks: vec![Stack {
-    //                branches: vec![_name],
-    //            }],
-    //        },
-    //    );
-    //}
 }
+// Linear walk through the tree to find the branch.
+fn is_branch_mentioned_in_tree(branch_name: &str, branch: &Branch) -> bool {
+    if branch.name == branch_name {
+        return true;
+    }
 
-fn is_branch_mentioned_already(branch_name: &str, stacks: &[Vec<String>]) -> bool {
-    // Check whether this name is already in use.
-    stacks.iter().any(|s| s.iter().any(|b| b == branch_name))
+    for child_branch in &branch.branches {
+        if is_branch_mentioned_in_tree(branch_name, child_branch) {
+            return true;
+        }
+    }
+    false
 }
-
 fn find_stack_with_branch<'a>(
     stacks: &'a mut [Vec<String>],
     current_branch: &str,

@@ -15,7 +15,7 @@ impl GitOutput {
         if self.stdout.is_empty() {
             None
         } else {
-            Some(self.stdout)
+            Some(self.stdout.trim().to_string())
         }
     }
     pub fn output_or(self, message: impl AsRef<str>) -> Result<String> {
