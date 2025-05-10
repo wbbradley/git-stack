@@ -17,6 +17,7 @@ use tracing_subscriber::util::SubscriberInitExt; //prelude::*;
 mod git;
 mod state;
 
+// This is an important refactoring.
 #[derive(Parser)]
 #[command(author, version, about, arg_required_else_help = true)]
 struct Args {
