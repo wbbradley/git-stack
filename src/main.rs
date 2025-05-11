@@ -84,7 +84,7 @@ fn inner_main() -> Result<()> {
         Commands::Checkout { branch_name } => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Commands::Restack => todo!(), //restack(state, &repo, run_version, current_branch),
+        Commands::Restack => restack(state, &repo, run_version, current_branch),
         Commands::Status => status(state, &repo, &current_branch),
     }
 }
@@ -233,25 +233,6 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
     Ok(())
 }
 
-/*
-fn new_stack(
-    mut state: State,
-    repo: &str,
-    branch_name: &str,
-    should_create_branch: bool,
-) -> Result<()> {
-    if branch_name == "main" {
-        bail!("Cannot stack a branch named 'main'");
-    }
-
-    if should_create_branch {
-        git_checkout_main(Some(branch_name))?;
-    }
-    state.create_new_stack_with_existing_branch(repo, branch_name)?;
-    save_state(&state)?;
-    Ok(())
-}
-
 fn restack(
     state: State,
     repo: &str,
@@ -259,11 +240,10 @@ fn restack(
     starting_branch: String,
 ) -> Result<(), anyhow::Error> {
     // Find starting_branch in the stacks of branches to determine which stack to use.
-    let stack = state
-        .get_stacks(repo)
-        .into_iter()
-        .find(|stack| stack.contains(&starting_branch))
-        .ok_or(anyhow!("No stack found for branch {}", starting_branch))?;
+    let plan = state.plan_restack(repo, &starting_branch)?;
+
+    tracing::info!(?plan, "Restacking branches with plan...");
+    /*
     git_checkout_main(None)?;
     let mut stack_on = "main".to_string();
     for branch in &stack {
@@ -322,7 +302,6 @@ fn restack(
         "git checkout {} failed",
         starting_branch
     );
-    tracing::info!("Done.");
+    tracing::info!("Done.");*/
     Ok(())
 }
-*/

@@ -114,6 +114,48 @@ impl State {
             .get_mut(repo)
             .and_then(|tree| get_branch_mut(tree, branch_name))
     }
+
+    pub(crate) fn plan_restack(
+        &self,
+        repo: &str,
+        starting_branch: &str,
+    ) -> Result<Vec<RebaseStep>> {
+        // Find all the descendents of the starting branch.
+        // Traverse the tree from the starting branch to the root,
+        let mut path: Vec<&str> = vec![];
+        if !get_path(self.trees.get(repo).unwrap(), starting_branch, &mut path) {
+            bail!("Branch {starting_branch} not found in the git-stack tree.");
+        }
+        println!("Path: {:?}", path);
+        Ok(path
+            .iter()
+            .zip(path.iter().skip(1))
+            .map(|(child, parent)| RebaseStep {
+                parent: parent.to_string(),
+                branch: child.to_string(),
+            })
+            .rev()
+            .collect::<Vec<_>>())
+    }
+}
+
+fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>) -> bool {
+    if branch.name == target_branch {
+        return true;
+    }
+    for child_branch in &branch.branches {
+        if get_path(child_branch, target_branch, path) {
+            path.push(&branch.name);
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug)]
+pub(crate) struct RebaseStep {
+    pub(crate) parent: String,
+    pub(crate) branch: String,
 }
 
 fn get_branch_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
