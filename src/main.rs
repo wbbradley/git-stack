@@ -75,7 +75,9 @@ fn inner_main() -> Result<()> {
     let current_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
         .output()
         .ok_or(anyhow!("No current branch?"))?;
-    let current_upstream = run_git(&["rev-parse", "--abbrev-ref", "@{upstream}"])?.output();
+    let current_upstream = run_git(&["rev-parse", "--abbrev-ref", "@{upstream}"])
+        .ok()
+        .and_then(|out| out.output());
     tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
@@ -95,7 +97,19 @@ fn selection_marker() -> &'static str {
     }
 }
 
-fn recur_tree(branch: &Branch, depth: usize, orig_branch: &str) {
+fn recur_tree(
+    branch: &Branch,
+    depth: usize,
+    orig_branch: &str,
+    parent_branch: Option<&str>,
+) -> Result<()> {
+    let branch_status: GitBranchStatus = git_branch_status(parent_branch, &branch.name)
+        .with_context(|| {
+            format!(
+                "attempting to fetch the branch status of {}",
+                branch.name.red()
+            )
+        })?;
     let is_current_branch = if branch.name == orig_branch {
         print!("{} ", selection_marker().purple());
         true
@@ -109,17 +123,38 @@ fn recur_tree(branch: &Branch, depth: usize, orig_branch: &str) {
     }
 
     println!(
-        "{}",
+        "{} {}",
         if is_current_branch {
             branch.name.green()
         } else {
             branch.name.truecolor(178, 178, 178)
+        },
+        {
+            let details: String = if branch_status.exists {
+                if branch_status.is_descendent {
+                    format!(
+                        "{} with {}",
+                        "is up to date".truecolor(90, 120, 87),
+                        branch_status.parent_branch.yellow()
+                    )
+                } else {
+                    format!(
+                        "{} {}",
+                        "is behind".red(),
+                        branch_status.parent_branch.yellow()
+                    )
+                }
+            } else {
+                "does not exist".red().to_string()
+            };
+            details
         }
     );
 
     for child in &branch.branches {
-        recur_tree(child, depth + 1, orig_branch);
+        recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()))?;
     }
+    Ok(())
 }
 
 fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
@@ -132,7 +167,7 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
         );
         return Ok(());
     };
-    recur_tree(tree, 0, orig_branch);
+    recur_tree(tree, 0, orig_branch, None)?;
     /*
     let stacks = state.get_stacks(repo);
     if stacks.is_empty() {

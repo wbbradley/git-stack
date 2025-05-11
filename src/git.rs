@@ -42,7 +42,11 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
         .with_context(|| format!("running git {args:?}"))?;
 
     if !out.status.success() {
-        bail!("git {:?} failed with exit status: {}", args, out.status);
+        bail!(
+            "`git {}` failed with exit status: {}",
+            args.join(" "),
+            out.status
+        );
     }
     Ok(GitOutput {
         stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -60,26 +64,28 @@ pub(crate) fn git_fetch() -> Result<()> {
 }
 
 pub(crate) fn git_branch_exists(branch: &str) -> bool {
-    run_git(&["rev-parse", "--verify", branch]).is_ok()
+    run_git(&["rev-parse", "--verify", branch]).is_ok_and(|out| !out.is_empty())
 }
 
 #[derive(Debug)]
 pub(crate) struct GitBranchStatus {
     pub(crate) exists: bool,
     pub(crate) is_descendent: bool,
+    pub(crate) parent_branch: String,
 }
 
 pub(crate) fn git_branch_status(
-    parent_branch: Option<String>,
+    parent_branch: Option<&str>,
     branch: &str,
 ) -> Result<GitBranchStatus> {
     let exists = git_branch_exists(branch);
     let parent_branch = match parent_branch {
-        Some(parent_branch) => parent_branch,
+        Some(parent_branch) => parent_branch.to_string(),
         None => git_remote_main(DEFAULT_REMOTE)?,
     };
     let is_descendent = exists && is_ancestor(&parent_branch, branch)?;
     Ok(GitBranchStatus {
+        parent_branch,
         exists,
         is_descendent,
     })

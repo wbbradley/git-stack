@@ -54,8 +54,10 @@ impl State {
         branch_name: String,
     ) -> Result<()> {
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
+        let current_branch_exists_in_tree = self.branch_exists_in_tree(repo, &current_branch);
 
         if git_branch_exists(&branch_name) {
+            println!("AAA");
             if !branch_exists_in_tree {
                 tracing::warn!(
                     "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
@@ -67,34 +69,32 @@ impl State {
             run_git(&["checkout", &branch_name])?;
             return Ok(());
         }
-        // Check if the branch name already exists.
-        if branch_exists_in_tree {
-            run_git(&["checkout", &branch_name])?;
-            return Ok(());
-        }
+        // The branch does not exist in git, let's create it, and add it to the tree.
         let remote_main = git_remote_main(DEFAULT_REMOTE)?;
         let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
             .ok_or(anyhow!("no branch?"))?
             .to_string();
-        if current_branch == main_branch {
-            // Allow creation of the main branch for this repo if we haven't added it yet.
-            self.trees
-                .entry(repo.to_string())
-                .or_insert_with(|| Branch::new(current_branch.clone()));
-        }
+        // Ensure the main branch is in the git-stack tree for this repo if we haven't
+        // added it yet.
+        self.trees
+            .entry(repo.to_string())
+            .or_insert_with(|| Branch::new(main_branch.clone()));
+
         let branch = self
             .get_tree_branch_mut(repo, &current_branch)
-            .ok_or_else(|| anyhow::anyhow!("Branch '{current_branch}' is not being tracked."))?;
-        if !self.trees.contains_key(repo) {
-            self.trees
-                .insert(repo.to_string(), Branch::new(current_branch.clone()));
-        }
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Branch '{current_branch}' is not being tracked in the git-stack tree."
+                )
+            })?;
+
+        branch.branches.push(Branch::new(branch_name.clone()));
+
+        // Actually create the git branch.
+        run_git(&["checkout", "-b", &branch_name, &current_branch])?;
 
         // Save the state after modifying it.
         save_state(self)?;
-
-        // Checkout the new branch.
-        run_git(&["checkout", &branch_name])?;
 
         Ok(())
     }
