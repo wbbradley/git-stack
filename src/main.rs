@@ -38,7 +38,11 @@ enum Commands {
     /// Show the status of the git-stack tree in the current repo.
     Status,
     /// Restack your active branch and all branches in its related stack.
-    Restack,
+    Restack {
+        /// The name of the branch to restack.
+        #[arg(long, short)]
+        branch: Option<String>,
+    },
     /// Create a new branch and make it a descendent of the current branch.
     Checkout { branch_name: String },
     /// Delete a branch from the git-stack tree.
@@ -92,7 +96,7 @@ fn inner_main() -> Result<()> {
         Commands::Checkout { branch_name } => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Commands::Restack => restack(state, &repo, run_version, current_branch),
+        Commands::Restack { branch } => restack(state, &repo, run_version, branch, current_branch),
         Commands::Status => status(state, &repo, &current_branch),
         Commands::Delete { branch_name } => state.delete_branch(&repo, &branch_name),
     }
@@ -134,7 +138,7 @@ fn recur_tree(
     println!(
         "{} {}{}",
         if is_current_branch {
-            branch.name.green()
+            branch.name.truecolor(142, 192, 124)
         } else {
             branch.name.truecolor(178, 178, 178)
         },
@@ -149,7 +153,7 @@ fn recur_tree(
                 } else {
                     format!(
                         "{} {}",
-                        "has drifted from".red(),
+                        "diverges from".red(),
                         branch_status.parent_branch.yellow()
                     )
                 }
@@ -161,7 +165,7 @@ fn recur_tree(
         {
             if let Some(upstream_status) = branch_status.upstream_status {
                 format!(
-                    " (upstream {} {})",
+                    " (upstream {} is {})",
                     upstream_status.symbolic_name.truecolor(88, 88, 88),
                     if upstream_status.synced {
                         "synced".truecolor(142, 192, 124)
@@ -261,17 +265,20 @@ fn restack(
     state: State,
     repo: &str,
     run_version: String,
-    starting_branch: String,
+    restack_branch: Option<String>,
+    orig_branch: String,
 ) -> Result<(), anyhow::Error> {
+    let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
+
     // Find starting_branch in the stacks of branches to determine which stack to use.
-    let plan = state.plan_restack(repo, &starting_branch)?;
+    let plan = state.plan_restack(repo, &restack_branch)?;
 
     tracing::info!(?plan, "Restacking branches with plan...");
     git_checkout_main(None)?;
     for RebaseStep { parent, branch } in plan {
         tracing::info!(
             "Starting branch: {} [pwd={}]",
-            starting_branch,
+            restack_branch,
             env::current_dir()?.display()
         );
         let source = run_git(&["rev-parse", &branch])?
@@ -318,11 +325,11 @@ fn restack(
             tracing::info!("Rebase completed successfully. Continuing...");
         }
     }
-    tracing::info!("Restoring starting branch '{}'...", starting_branch);
+    tracing::info!("Restoring starting branch '{}'...", restack_branch);
     ensure!(
-        run_git_status(&["checkout", "-q", &starting_branch])?.success(),
+        run_git_status(&["checkout", "-q", &orig_branch])?.success(),
         "git checkout {} failed",
-        starting_branch
+        restack_branch
     );
     tracing::info!("Done.");
     Ok(())
