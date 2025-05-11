@@ -41,6 +41,8 @@ enum Commands {
     Restack,
     /// Create a new branch and make it a descendent of the current branch.
     Checkout { branch_name: String },
+    /// Delete a branch from the git-stack tree.
+    Delete { branch_name: String },
 }
 
 fn main() {
@@ -92,6 +94,7 @@ fn inner_main() -> Result<()> {
         }
         Commands::Restack => restack(state, &repo, run_version, current_branch),
         Commands::Status => status(state, &repo, &current_branch),
+        Commands::Delete { branch_name } => state.delete_branch(&repo, &branch_name),
     }
 }
 
@@ -151,14 +154,14 @@ fn recur_tree(
                     )
                 }
             } else {
-                "does not exist".red().to_string()
+                "does not exist!".bright_red().to_string()
             };
             details
         },
         {
             if let Some(upstream_status) = branch_status.upstream_status {
                 format!(
-                    " ({} {})",
+                    " (upstream {} {})",
                     upstream_status.symbolic_name.truecolor(88, 88, 88),
                     if upstream_status.synced {
                         "synced".truecolor(142, 192, 124)

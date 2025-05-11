@@ -112,7 +112,7 @@ impl State {
     ) -> Option<&'a mut Branch> {
         self.trees
             .get_mut(repo)
-            .and_then(|tree| get_branch_mut(tree, branch_name))
+            .and_then(|tree| find_branch_by_name_mut(tree, branch_name))
     }
 
     pub(crate) fn plan_restack(
@@ -138,6 +138,20 @@ impl State {
             })
             .collect::<Vec<_>>())
     }
+
+    pub(crate) fn delete_branch(&mut self, repo: &str, branch_name: &str) -> Result<()> {
+        let Some(tree) = self
+            .trees
+            .get_mut(repo)
+            .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
+        else {
+            bail!("Branch {branch_name} not found in the git-stack tree.");
+        };
+        tree.branches.retain(|branch| branch.name != branch_name);
+        save_state(self)?;
+
+        Ok(())
+    }
 }
 
 fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>) -> bool {
@@ -160,12 +174,25 @@ pub(crate) struct RebaseStep {
     pub(crate) branch: String,
 }
 
-fn get_branch_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
-    if tree.name == name {
+fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
+    find_branch_mut(tree, &|branch| branch.name == name)
+}
+
+fn find_parent_of_branch_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
+    find_branch_mut(tree, &|branch| {
+        branch.branches.iter().any(|branch| branch.name == name)
+    })
+}
+
+fn find_branch_mut<'a, F>(tree: &'a mut Branch, pred: &F) -> Option<&'a mut Branch>
+where
+    F: Fn(&Branch) -> bool,
+{
+    if pred(tree) {
         Some(tree)
     } else {
         for child_branch in tree.branches.iter_mut() {
-            let result = get_branch_mut(child_branch, name);
+            let result = find_branch_mut(child_branch, pred);
             if result.is_some() {
                 return result;
             }
@@ -228,7 +255,7 @@ pub fn load_state() -> anyhow::Result<State> {
     Ok(state)
 }
 
-pub fn save_state(state: &State) -> anyhow::Result<()> {
+pub fn save_state(state: &State) -> Result<()> {
     let config_path = get_xdg_path()?;
     tracing::info!(?state, ?config_path, "Saving state to config file");
     Ok(fs::write(config_path, serde_yaml::to_string(&state)?)?)
