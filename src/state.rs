@@ -120,32 +120,34 @@ impl State {
         repo: &str,
         starting_branch: &str,
     ) -> Result<Vec<RebaseStep>> {
+        tracing::debug!("Planning restack for {starting_branch}");
+        let remote_main = git_remote_main(DEFAULT_REMOTE)?;
         // Find all the descendents of the starting branch.
         // Traverse the tree from the starting branch to the root,
         let mut path: Vec<&str> = vec![];
         if !get_path(self.trees.get(repo).unwrap(), starting_branch, &mut path) {
             bail!("Branch {starting_branch} not found in the git-stack tree.");
         }
-        println!("Path: {:?}", path);
+        path.insert(0, &remote_main);
         Ok(path
             .iter()
             .zip(path.iter().skip(1))
-            .map(|(child, parent)| RebaseStep {
+            .map(|(parent, child)| RebaseStep {
                 parent: parent.to_string(),
                 branch: child.to_string(),
             })
-            .rev()
             .collect::<Vec<_>>())
     }
 }
 
 fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>) -> bool {
     if branch.name == target_branch {
+        path.insert(0, &branch.name);
         return true;
     }
     for child_branch in &branch.branches {
         if get_path(child_branch, target_branch, path) {
-            path.push(&branch.name);
+            path.insert(0, &branch.name);
             return true;
         }
     }

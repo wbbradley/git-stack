@@ -7,16 +7,19 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use git::{
     DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
-    git_remote_main, is_ancestor, run_git_status,
+    git_remote_main, is_ancestor, run_git_status, shas_match,
 };
-use state::{Branch, load_state, save_state};
+use state::{Branch, RebaseStep, load_state, save_state};
 use std::env;
 use std::fs::canonicalize;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt; //prelude::*;
 
 mod git;
 mod state;
+
+const CREATE_BACKUP: bool = false;
 
 // This is an important refactoring.
 #[derive(Parser)]
@@ -32,12 +35,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show the status of nearby stacks.
+    /// Show the status of the git-stack tree in the current repo.
     Status,
     /// Restack your active branch and all branches in its related stack.
     Restack,
-    /// Create a new branch and make it a descendent of the current branch. If the current branch
-    /// is `main`, this will home the branch to the remote main HEAD.
+    /// Create a new branch and make it a descendent of the current branch.
     Checkout { branch_name: String },
 }
 
@@ -57,7 +59,11 @@ fn inner_main() -> Result<()> {
         // We don't need timestamps in the logs.
         .with(tracing_subscriber::fmt::layer().without_time())
         // Allow usage of RUST_LOG environment variable to set the log level.
-        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
         .init();
 
     let repo = canonicalize(
@@ -123,7 +129,7 @@ fn recur_tree(
     }
 
     println!(
-        "{} {}",
+        "{} {}{}",
         if is_current_branch {
             branch.name.green()
         } else {
@@ -133,14 +139,14 @@ fn recur_tree(
             let details: String = if branch_status.exists {
                 if branch_status.is_descendent {
                     format!(
-                        "{} with {}",
-                        "is up to date".truecolor(90, 120, 87),
+                        "{} {}",
+                        "is stacked on".truecolor(90, 120, 87),
                         branch_status.parent_branch.yellow()
                     )
                 } else {
                     format!(
                         "{} {}",
-                        "is behind".red(),
+                        "has drifted from".red(),
                         branch_status.parent_branch.yellow()
                     )
                 }
@@ -148,6 +154,21 @@ fn recur_tree(
                 "does not exist".red().to_string()
             };
             details
+        },
+        {
+            if let Some(upstream_status) = branch_status.upstream_status {
+                format!(
+                    " ({} {})",
+                    upstream_status.symbolic_name.truecolor(88, 88, 88),
+                    if upstream_status.synced {
+                        "synced".truecolor(142, 192, 124)
+                    } else {
+                        "not synced".bright_red()
+                    }
+                )
+            } else {
+                format!(" ({})", "no upstream".truecolor(215, 153, 33))
+            }
         }
     );
 
@@ -243,65 +264,63 @@ fn restack(
     let plan = state.plan_restack(repo, &starting_branch)?;
 
     tracing::info!(?plan, "Restacking branches with plan...");
-    /*
     git_checkout_main(None)?;
-    let mut stack_on = "main".to_string();
-    for branch in &stack {
+    for RebaseStep { parent, branch } in plan {
         tracing::info!(
             "Starting branch: {} [pwd={}]",
             starting_branch,
             env::current_dir()?.display()
         );
-        let source = run_git(&["rev-parse", branch])?
+        let source = run_git(&["rev-parse", &branch])?
             .output_or(format!("branch {branch} does not exist?"))?;
 
-        if is_ancestor(&stack_on, branch)? {
+        if is_ancestor(&parent, &branch)? {
             tracing::info!(
                 "Branch '{}' is already up to date with '{}'.",
                 branch,
-                stack_on
+                parent
             );
-            stack_on = branch.to_string();
             tracing::info!("Force-pushing '{}' to origin...", branch);
-            run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+            if !shas_match(&format!("origin/{branch}"), &branch) {
+                run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+            }
             continue;
         } else {
-            tracing::info!(
-                "Branch '{}' is not descended from '{}'...",
-                branch,
-                stack_on
-            );
-            let backup_branch = format!("{}-at-{}", branch, run_version);
-            tracing::debug!(
-                "Creating backup branch '{}' from '{}'...",
-                backup_branch,
-                branch
-            );
-            if !run_git_status(&["branch", &backup_branch, &source])?.success() {
-                tracing::warn!("failed to create backup branch {}", backup_branch);
+            tracing::info!("Branch '{}' is not descended from '{}'...", branch, parent);
+            if CREATE_BACKUP {
+                let backup_branch = format!("{}-at-{}", branch, run_version);
+                tracing::debug!(
+                    "Creating backup branch '{}' from '{}'...",
+                    backup_branch,
+                    branch
+                );
+                if !run_git_status(&["branch", &backup_branch, &source])?.success() {
+                    tracing::warn!("failed to create backup branch {}", backup_branch);
+                }
             }
-            tracing::info!("Initiating a rebase of '{}' onto '{}'...", branch, stack_on);
-            if !run_git_status(&["checkout", branch])?.success() {
+            tracing::info!("Initiating a rebase of '{}' onto '{}'...", branch, parent);
+            if !run_git_status(&["checkout", "-q", &branch])?.success() {
                 bail!("git checkout {} failed", branch);
             }
-            let rebased = run_git_status(&["rebase", &stack_on])?.success();
+            let rebased = run_git_status(&["rebase", &parent])?.success();
             if !rebased {
                 tracing::warn!("Rebase did not complete automatically.");
                 tracing::warn!("Run `git mergetool` to resolve conflicts.");
                 tracing::info!("Once you have finished the rebase, re-run this script.");
                 std::process::exit(1);
             }
+            if !shas_match(&format!("origin/{branch}"), &branch) {
+                run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+            }
             tracing::info!("Rebase completed successfully. Continuing...");
-            stack_on = branch.to_string();
         }
     }
-    tracing::info!("All branches are up to date with '{}'.", stack_on);
     tracing::info!("Restoring starting branch '{}'...", starting_branch);
     ensure!(
-        run_git_status(&["checkout", &starting_branch])?.success(),
+        run_git_status(&["checkout", "-q", &starting_branch])?.success(),
         "git checkout {} failed",
         starting_branch
     );
-    tracing::info!("Done.");*/
+    tracing::info!("Done.");
     Ok(())
 }

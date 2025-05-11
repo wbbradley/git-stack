@@ -33,6 +33,14 @@ impl AsRef<str> for GitOutput {
     }
 }
 
+/// Return whether two git references point to the same commit.
+pub(crate) fn shas_match(ref1: &str, ref2: &str) -> bool {
+    match (run_git(&["rev-parse", ref1]), run_git(&["rev-parse", ref2])) {
+        (Ok(output1), Ok(output2)) => !output1.is_empty() && output1.output() == output2.output(),
+        _ => false,
+    }
+}
+
 /// Run a git command and return the output. If the git command fails, this will return an error.
 pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     tracing::debug!("Running `git {}`", args.join(" "));
@@ -68,10 +76,17 @@ pub(crate) fn git_branch_exists(branch: &str) -> bool {
 }
 
 #[derive(Debug)]
+pub(crate) struct UpstreamStatus {
+    pub(crate) symbolic_name: String,
+    pub(crate) synced: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct GitBranchStatus {
     pub(crate) exists: bool,
     pub(crate) is_descendent: bool,
     pub(crate) parent_branch: String,
+    pub(crate) upstream_status: Option<UpstreamStatus>,
 }
 
 pub(crate) fn git_branch_status(
@@ -84,10 +99,18 @@ pub(crate) fn git_branch_status(
         None => git_remote_main(DEFAULT_REMOTE)?,
     };
     let is_descendent = exists && is_ancestor(&parent_branch, branch)?;
+    let upstream_symbolic_name = git_get_upstream(branch).ok();
+    let upstream_synced = upstream_symbolic_name
+        .as_ref()
+        .is_some_and(|upstream| shas_match(upstream, branch));
     Ok(GitBranchStatus {
         parent_branch,
         exists,
         is_descendent,
+        upstream_status: upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
+            symbolic_name,
+            synced: upstream_synced,
+        }),
     })
 }
 pub(crate) fn is_ancestor(stack_on: &str, branch: &str) -> Result<bool> {
@@ -146,4 +169,16 @@ pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
         .output()
         .map(|s| s.trim().to_string())
         .ok_or(anyhow!("No remote main branch?"))
+}
+
+pub(crate) fn git_get_upstream(branch: &str) -> Result<String> {
+    run_git(&[
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        &format!("{branch}@{{upstream}}"),
+    ])?
+    .output()
+    .map(|s| s.trim().to_string())
+    .ok_or(anyhow!("No upstream branch?"))
 }
