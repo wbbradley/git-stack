@@ -39,6 +39,13 @@ pub struct State {
 }
 
 impl State {
+    pub fn get_tree(&self, repo: &str) -> Option<&Branch> {
+        self.trees.get(repo)
+    }
+    /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
+    /// then check whether the branch exists in the git repo. If it does, then let the user know
+    /// that they need to use `git checkout` to check it out. If it doesn't, then create a new
+    /// branch.
     pub fn checkout(
         &mut self,
         repo: &str,
@@ -46,13 +53,26 @@ impl State {
         current_upstream: Option<String>,
         branch_name: String,
     ) -> Result<()> {
+        let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
+
+        if git_branch_exists(&branch_name) {
+            if !branch_exists_in_tree {
+                tracing::warn!(
+                    "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
+                    If you'd like to add it to the git-stack, please checkout the desired parent \
+                    branch, and then run `git-stack add {branch_name}` to stack {branch_name} on \
+                    top of the parent branch.",
+                );
+            }
+            run_git(&["checkout", &branch_name])?;
+            return Ok(());
+        }
         // Check if the branch name already exists.
-        if self.is_branch_mentioned_already(repo, &branch_name) {
+        if branch_exists_in_tree {
             run_git(&["checkout", &branch_name])?;
             return Ok(());
         }
         let remote_main = git_remote_main(DEFAULT_REMOTE)?;
-        // Figure out the branch name.
         let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
             .ok_or(anyhow!("no branch?"))?
             .to_string();
@@ -79,7 +99,7 @@ impl State {
         Ok(())
     }
 
-    fn is_branch_mentioned_already(&self, repo: &str, branch_name: &str) -> bool {
+    fn branch_exists_in_tree(&self, repo: &str, branch_name: &str) -> bool {
         let Some(branch) = self.trees.get(repo) else {
             return false;
         };

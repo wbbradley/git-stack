@@ -9,7 +9,7 @@ use git::{
     DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
     git_remote_main, is_ancestor, run_git_status,
 };
-use state::{load_state, save_state};
+use state::{Branch, load_state, save_state};
 use std::env;
 use std::fs::canonicalize;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -95,9 +95,44 @@ fn selection_marker() -> &'static str {
     }
 }
 
+fn recur_tree(branch: &Branch, depth: usize, orig_branch: &str) {
+    let is_current_branch = if branch.name == orig_branch {
+        print!("{} ", selection_marker().purple());
+        true
+    } else {
+        print!("  ");
+        false
+    };
+
+    for _ in 0..depth {
+        print!("  ");
+    }
+
+    println!(
+        "{}",
+        if is_current_branch {
+            branch.name.green()
+        } else {
+            branch.name.truecolor(178, 178, 178)
+        }
+    );
+
+    for child in &branch.branches {
+        recur_tree(child, depth + 1, orig_branch);
+    }
+}
+
 fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
     git_fetch()?;
 
+    let Some(tree) = state.get_tree(repo) else {
+        eprintln!(
+            "No stack tree found for repo {repo}.",
+            repo = repo.truecolor(178, 178, 218)
+        );
+        return Ok(());
+    };
+    recur_tree(tree, 0, orig_branch);
     /*
     let stacks = state.get_stacks(repo);
     if stacks.is_empty() {
