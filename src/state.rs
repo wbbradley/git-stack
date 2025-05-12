@@ -57,7 +57,6 @@ impl State {
         let current_branch_exists_in_tree = self.branch_exists_in_tree(repo, &current_branch);
 
         if git_branch_exists(&branch_name) {
-            println!("AAA");
             if !branch_exists_in_tree {
                 tracing::warn!(
                     "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
@@ -92,6 +91,11 @@ impl State {
 
         // Actually create the git branch.
         run_git(&["checkout", "-b", &branch_name, &current_branch])?;
+
+        println!(
+            "Branch {branch_name} created and checked out.",
+            branch_name = branch_name.yellow()
+        );
 
         // Save the state after modifying it.
         save_state(self)?;
@@ -153,6 +157,11 @@ impl State {
             bail!("Branch {branch_name} not found in the git-stack tree.");
         };
         tree.branches.retain(|branch| branch.name != branch_name);
+        println!(
+            "Branch {branch_name} removed from git-stack tree.",
+            branch_name = branch_name.yellow()
+        );
+
         save_state(self)?;
 
         Ok(())
@@ -189,7 +198,7 @@ impl State {
             );
         }
 
-        tracing::info!("Mounting {branch_name} on {parent_branch:?}");
+        tracing::debug!("Mounting {branch_name} on {parent_branch:?}");
 
         // Make sure the parent branch is actually changing.
         if let (Some(Branch { name: name_a, .. }), Some(Branch { name: name_b, .. })) = (
@@ -220,15 +229,25 @@ impl State {
         } else {
             bail!("Parent branch {parent_branch} not found in the git-stack tree.");
         }
+        println!(
+            "Branch {branch_name} stacked on {parent_branch}.",
+            branch_name = branch_name.yellow(),
+            parent_branch = parent_branch.yellow()
+        );
+
         save_state(self)?;
         Ok(())
     }
-    fn get_parent_branch_of(&self, repo: &str, branch_name: &str) -> Option<&Branch> {
+    pub fn get_parent_branch_of(&self, repo: &str, branch_name: &str) -> Option<&Branch> {
         self.trees
             .get(repo)
             .and_then(|tree| find_parent_of_branch(tree, branch_name))
     }
-    fn get_parent_branch_of_mut(&mut self, repo: &str, branch_name: &str) -> Option<&mut Branch> {
+    pub fn get_parent_branch_of_mut(
+        &mut self,
+        repo: &str,
+        branch_name: &str,
+    ) -> Option<&mut Branch> {
         self.trees
             .get_mut(repo)
             .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
@@ -366,7 +385,7 @@ pub fn load_state() -> anyhow::Result<State> {
 
 pub fn save_state(state: &State) -> Result<()> {
     let config_path = get_xdg_path()?;
-    tracing::info!(?state, ?config_path, "Saving state to config file");
+    tracing::debug!(?state, ?config_path, "Saving state to config file");
     Ok(fs::write(config_path, serde_yaml::to_string(&state)?)?)
 }
 

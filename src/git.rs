@@ -42,6 +42,13 @@ pub(crate) fn shas_match(ref1: &str, ref2: &str) -> bool {
 }
 
 /// Run a git command and return the output. If the git command fails, this will return an error.
+pub(crate) fn run_git_passthrough(args: &[&str]) -> Result<ExitStatus> {
+    tracing::debug!("Running `git {}`", args.join(" "));
+    let mut child = Command::new("git").args(args).spawn()?;
+    Ok(child.wait()?)
+}
+
+/// Run a git command and return the output. If the git command fails, this will return an error.
 pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     tracing::debug!("Running `git {}`", args.join(" "));
     let out = Command::new("git")

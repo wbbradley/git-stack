@@ -43,8 +43,18 @@ enum Commands {
         #[arg(long, short)]
         branch: Option<String>,
     },
-    /// Create a new branch and make it a descendent of the current branch.
-    Checkout { branch_name: String },
+    /// Shows the diff between the given branch and its parent (git-stack tree) branch.
+    Diff {
+        /// Specifies the branch whose diff should be shown. If ommitted, the current branch will
+        /// be used.
+        branch: Option<String>,
+    },
+    /// Create a new branch and make it a descendent of the current branch. If the branch already
+    /// exists, then it will simply be checked out.
+    Checkout {
+        /// The name of the branch to check out.
+        branch_name: String,
+    },
     /// Mount the current branch on top of the named parent branch. If no parent branch is named,
     /// then the trunk branch will be used.
     Mount {
@@ -52,7 +62,10 @@ enum Commands {
         parent_branch: Option<String>,
     },
     /// Delete a branch from the git-stack tree.
-    Delete { branch_name: String },
+    Delete {
+        /// The name of the branch to delete.
+        branch_name: String,
+    },
 }
 
 fn main() {
@@ -106,7 +119,25 @@ fn inner_main() -> Result<()> {
         Commands::Mount { parent_branch } => state.mount(&repo, &current_branch, parent_branch),
         Commands::Status => status(state, &repo, &current_branch),
         Commands::Delete { branch_name } => state.delete_branch(&repo, &branch_name),
+        Commands::Diff { branch } => diff(state, &repo, &branch.unwrap_or(current_branch)),
     }
+}
+
+fn diff(state: State, repo: &str, branch: &str) -> Result<()> {
+    let parent_branch = state
+        .get_parent_branch_of(repo, branch)
+        .ok_or_else(|| anyhow!("No parent branch found for current branch: {}", branch))?;
+    tracing::debug!(
+        parent_branch = &parent_branch.name,
+        branch = branch,
+        "Diffing branches"
+    );
+    let status =
+        git::run_git_passthrough(&["diff", &format!("{}..{}", &parent_branch.name, branch)])?;
+    if !status.success() {
+        bail!("git format-patch failed");
+    }
+    Ok(())
 }
 
 fn selection_marker() -> &'static str {
