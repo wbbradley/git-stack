@@ -23,19 +23,20 @@ const CREATE_BACKUP: bool = false;
 
 // This is an important refactoring.
 #[derive(Parser)]
-#[command(author, version, about, arg_required_else_help = true)]
+#[command(author, version, about)]
 struct Args {
     #[arg(long, short, help = "Enable verbose output")]
     verbose: bool,
 
     /// Subcommand to run.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Show the status of the git-stack tree in the current repo.
+enum Command {
+    /// Show the status of the git-stack tree in the current repo. This is the default command when
+    /// a command is omitted. (ie: `git stack` is the same as `git stack status`)
     Status,
     /// Restack your active branch and all branches in its related stack.
     Restack {
@@ -112,14 +113,18 @@ fn inner_main() -> Result<()> {
     tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
-        Commands::Checkout { branch_name } => {
+        Some(Command::Checkout { branch_name }) => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Commands::Restack { branch } => restack(state, &repo, run_version, branch, current_branch),
-        Commands::Mount { parent_branch } => state.mount(&repo, &current_branch, parent_branch),
-        Commands::Status => status(state, &repo, &current_branch),
-        Commands::Delete { branch_name } => state.delete_branch(&repo, &branch_name),
-        Commands::Diff { branch } => diff(state, &repo, &branch.unwrap_or(current_branch)),
+        Some(Command::Restack { branch }) => {
+            restack(state, &repo, run_version, branch, current_branch)
+        }
+        Some(Command::Mount { parent_branch }) => {
+            state.mount(&repo, &current_branch, parent_branch)
+        }
+        Some(Command::Status) | None => status(state, &repo, &current_branch),
+        Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
+        Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
     }
 }
 
