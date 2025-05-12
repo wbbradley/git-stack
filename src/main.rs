@@ -44,6 +44,12 @@ enum Command {
         #[arg(long, short)]
         branch: Option<String>,
     },
+    /// Shows the log between the given branch and its parent (git-stack tree) branch.
+    Log {
+        /// Specifies the branch whose log should be shown. If ommitted, the current branch will
+        /// be used.
+        branch: Option<String>,
+    },
     /// Shows the diff between the given branch and its parent (git-stack tree) branch.
     Diff {
         /// Specifies the branch whose diff should be shown. If ommitted, the current branch will
@@ -125,6 +131,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Status) | None => status(state, &repo, &current_branch),
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
+        Some(Command::Log { branch }) => show_log(state, &repo, &branch.unwrap_or(current_branch)),
     }
 }
 
@@ -139,6 +146,29 @@ fn diff(state: State, repo: &str, branch: &str) -> Result<()> {
     );
     let status =
         git::run_git_passthrough(&["diff", &format!("{}..{}", &parent_branch.name, branch)])?;
+    if !status.success() {
+        bail!("git format-patch failed");
+    }
+    Ok(())
+}
+
+fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
+    let parent_branch = state
+        .get_parent_branch_of(repo, branch)
+        .ok_or_else(|| anyhow!("No parent branch found for current branch: {}", branch))?;
+    tracing::debug!(
+        parent_branch = &parent_branch.name,
+        branch = branch,
+        "Log changes"
+    );
+    let status = git::run_git_passthrough(&[
+        "log",
+        "--graph",
+        "--oneline",
+        "-p",
+        "--decorate",
+        &format!("{}..{}", &parent_branch.name, branch),
+    ])?;
     if !status.success() {
         bail!("git format-patch failed");
     }
