@@ -105,6 +105,11 @@ impl State {
         };
         is_branch_mentioned_in_tree(branch_name, branch)
     }
+    fn get_tree_branch<'a>(&'a self, repo: &str, branch_name: &str) -> Option<&'a Branch> {
+        self.trees
+            .get(repo)
+            .and_then(|tree| find_branch_by_name(tree, branch_name))
+    }
     fn get_tree_branch_mut<'a>(
         &'a mut self,
         repo: &str,
@@ -152,6 +157,82 @@ impl State {
 
         Ok(())
     }
+
+    pub(crate) fn mount(
+        &mut self,
+        repo: &str,
+        branch_name: &str,
+        parent_branch: Option<String>,
+    ) -> Result<()> {
+        let parent_branch = match parent_branch {
+            Some(parent_branch) => parent_branch,
+            None => {
+                tracing::info!("No parent branch specified, using main branch.");
+                // The branch might not exist in git, let's create it, and add it to the tree.
+                let remote_main = git_remote_main(DEFAULT_REMOTE)?;
+                let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
+                    .ok_or(anyhow!("no branch?"))?
+                    .to_string();
+                // Ensure the main branch is in the git-stack tree for this repo if we haven't
+                // added it yet.
+                self.trees
+                    .entry(repo.to_string())
+                    .or_insert_with(|| Branch::new(main_branch.clone()));
+                main_branch
+            }
+        };
+
+        if branch_name == parent_branch {
+            bail!(
+                "Branch {branch_name} cannot be mounted on itself.",
+                branch_name = branch_name.red()
+            );
+        }
+
+        tracing::info!("Mounting {branch_name} on {parent_branch:?}");
+
+        // Make sure the parent branch is actually changing.
+        if let (Some(Branch { name: name_a, .. }), Some(Branch { name: name_b, .. })) = (
+            self.get_parent_branch_of(repo, branch_name),
+            self.get_tree_branch(repo, &parent_branch),
+        ) {
+            if name_a == name_b {
+                tracing::warn!("Branch {branch_name} is already mounted on {name_a}");
+                return Ok(());
+            }
+        }
+
+        let current_parent_branch = self.get_parent_branch_of_mut(repo, branch_name);
+
+        if let Some(current_parent_branch) = current_parent_branch {
+            // Remove the branch from the current parent branch.
+            current_parent_branch
+                .branches
+                .retain(|branch| branch.name != branch_name);
+        }
+
+        let new_parent_branch = self.get_tree_branch_mut(repo, &parent_branch);
+        // Add the branch to the new parent branch.
+        if let Some(new_parent_branch) = new_parent_branch {
+            new_parent_branch
+                .branches
+                .push(Branch::new(branch_name.to_string()));
+        } else {
+            bail!("Parent branch {parent_branch} not found in the git-stack tree.");
+        }
+        save_state(self)?;
+        Ok(())
+    }
+    fn get_parent_branch_of(&self, repo: &str, branch_name: &str) -> Option<&Branch> {
+        self.trees
+            .get(repo)
+            .and_then(|tree| find_parent_of_branch(tree, branch_name))
+    }
+    fn get_parent_branch_of_mut(&mut self, repo: &str, branch_name: &str) -> Option<&mut Branch> {
+        self.trees
+            .get_mut(repo)
+            .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
+    }
 }
 
 fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>) -> bool {
@@ -174,6 +255,10 @@ pub(crate) struct RebaseStep {
     pub(crate) branch: String,
 }
 
+fn find_branch_by_name<'a>(tree: &'a Branch, name: &str) -> Option<&'a Branch> {
+    find_branch(tree, &|branch| branch.name == name)
+}
+
 fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
     find_branch_mut(tree, &|branch| branch.name == name)
 }
@@ -182,6 +267,29 @@ fn find_parent_of_branch_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a
     find_branch_mut(tree, &|branch| {
         branch.branches.iter().any(|branch| branch.name == name)
     })
+}
+
+fn find_parent_of_branch<'a>(tree: &'a Branch, name: &str) -> Option<&'a Branch> {
+    find_branch(tree, &|branch| {
+        branch.branches.iter().any(|branch| branch.name == name)
+    })
+}
+
+fn find_branch<'a, F>(tree: &'a Branch, pred: &F) -> Option<&'a Branch>
+where
+    F: Fn(&Branch) -> bool,
+{
+    if pred(tree) {
+        Some(tree)
+    } else {
+        for child_branch in tree.branches.iter() {
+            let result = find_branch(child_branch, pred);
+            if result.is_some() {
+                return result;
+            }
+        }
+        None
+    }
 }
 
 fn find_branch_mut<'a, F>(tree: &'a mut Branch, pred: &F) -> Option<&'a mut Branch>
@@ -200,6 +308,7 @@ where
         None
     }
 }
+
 // Linear walk through the tree to find the branch.
 fn is_branch_mentioned_in_tree(branch_name: &str, branch: &Branch) -> bool {
     if branch.name == branch_name {

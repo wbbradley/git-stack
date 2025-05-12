@@ -45,6 +45,12 @@ enum Commands {
     },
     /// Create a new branch and make it a descendent of the current branch.
     Checkout { branch_name: String },
+    /// Mount the current branch on top of the named parent branch. If no parent branch is named,
+    /// then the trunk branch will be used.
+    Mount {
+        /// The name of the parent branch upon which to stack the current branch.
+        parent_branch: Option<String>,
+    },
     /// Delete a branch from the git-stack tree.
     Delete { branch_name: String },
 }
@@ -97,6 +103,7 @@ fn inner_main() -> Result<()> {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
         Commands::Restack { branch } => restack(state, &repo, run_version, branch, current_branch),
+        Commands::Mount { parent_branch } => state.mount(&repo, &current_branch, parent_branch),
         Commands::Status => status(state, &repo, &current_branch),
         Commands::Delete { branch_name } => state.delete_branch(&repo, &branch_name),
     }
