@@ -1,72 +1,116 @@
 # git-stack
 
-A Rust CLI tool to manage, update, and rollback a stack of Git branches.
+`git-stack` is a command-line tool for managing stacked git branches — a workflow where you develop
+features atop one another, keeping their history clean and rebasing as needed. It tracks
+relationships between branches, helps you re-stack and synchronize them, and visualizes your stack
+tree.
 
-## Overview
+## Key Features
 
-This tool manages a "stack" of related branches. It automates stacking, updating, and restoring
-them.
+- Stacked Workflow: Track parent-child branch relationships ("stacks") in your repo.
+- Restack: Automatically rebase your branch stack on top of trunk or another branch.
+- Status Tree: Visualize your current stacked branches, their hierarchy, and sync status.
+- Branch Mounting: Change the parent branch of an existing branch in your stack.
+- Diffs: Show changes between a branch and its parent.
+- Safe Operations: Prevent accidental data loss by checking upstream sync status.
 
-Main capabilities:
+## Installation
 
-- Update (rebase and force-push) all branches in the defined stack atop `origin/main`, creating
-  backups before rebasing.
-- Display summary info about the latest commit on each stack branch (`--verbose`).
-- Roll back both stack branches to a backup version (`rollback` subcommand).
+Build from source (Rust required):
+
+```bash
+cargo install --path .
+```
+
+This will install a CLI you can use as follows:
+
+```bash
+git stack <command> [options]
+```
 
 ## Usage
 
-```sh
-# Stack/rebase and update all branches
-cargo run --release
+You can invoke `git-stack` directly or as a git subcommand:
 
-# Simply show the commit message for each stack branch
-cargo run --release -- --verbose
-
-# Roll back the stack to a previous backup (by backup version or 'origin')
-cargo run --release -- rollback --version <backup-id>
+```bash
+git stack <subcommand> [options]
 ```
 
-Typical Workflow:
-1. All local changes must be committed or stashed.
-2. When running, each stack branch is rebased on the previous one (starting from `main`). Backups
-   are made before rebasing.
-3. If a conflict occurs during rebase, resolve conflicts and rerun.
+### Common Subcommands
 
-## Arguments
+- `status`: Show the current stack tree in the repo.
+  - _Default_, so `git stack` is equivalent to `git stack status`.
 
-- `--verbose, -v`
-  Print current stack info and exit.
+- `checkout <branch>`: Create a new branch stacked on the current branch, or checkout an existing
+  one in the stack.
 
-- `rollback --version <backup-id>`
-  Restore both branches in the stack to a prior state, using the given backup id (a timestamp or
-  `origin` for remote state).
+- `restack [--branch <branch>]`: Rebase the named (or current) branch and its descendents onto their
+  updated stack base (like trunk or a parent feature branch). This command recursively applies to
+  all ancestors of the given branch.
 
-## Notes
+- `mount [<parent-branch>]`: Mounts (attaches) the current branch on a different parent branch.
 
-- Requires [Git](https://git-scm.com/) installed and accessible in `PATH`.
+- `diff [<branch>]`: Show diff between a branch and its stack parent.
 
-## Error Handling
+- `delete <branch>`: Remove a branch from the stack tree.
 
-- Exits with an error if the git status is not clean.
-- Exits if the stack branches do not exist or have no commits.
-- On rebase failure, suggests manually resolving conflicts and rerunning.
+### Examples
 
-## Customization
+#### See your stack status
 
-- To use with your repo/branches, change `GIT_ROOT` & `STACK` constants at the top of `main.rs`.
-
----
-
-Example:
-```sh
-cargo run -- --verbose
-# branch-01: ...
-# branch-02: ...
-
-cargo run
-# Rebases branch-01 & branch-02 in order, force-pushes both to origin.
-
-cargo run -- rollback --version 1717682735
-# Restores both to the backup made at that timestamp.
 ```
+git stack status
+```
+
+#### Create and stack a new branch
+
+```
+git stack checkout my-feature
+```
+
+#### Restack your current branch
+
+```
+git stack restack
+```
+
+#### Change the parent stack of a feature branch
+
+```
+git stack mount new-parent-branch
+```
+
+#### Show diff with parent
+
+```
+git stack diff my-feature
+```
+
+#### Remove a branch from stack management
+
+```
+git stack delete my-feature
+```
+
+## Stack Storage
+
+- Stack state is stored per-repo in a YAML file at:
+  `~/.local/state/git-stack/state.yaml` (using XDG state dir conventions).
+
+## Requirements
+
+- A POSIX shell
+- git (on your `$PATH`)
+- Rust (to install/build)
+
+## Troubleshooting
+
+If `git stack` reports missing branches or refuses to restack:
+
+- Ensure your working tree is clean (`git status`).
+- Use standard git commands to resolve any rebase conflicts (`git mergetool` is your friend,
+  followed by `git rebase --continue`), then rerun `git stack restack`.
+
+## License
+
+[GPL2](LICENSE)
