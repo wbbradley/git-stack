@@ -207,7 +207,7 @@ fn recur_tree(
             )
         })?;
     let is_current_branch = if branch.name == orig_branch {
-        print!("{} ", selection_marker().purple());
+        print!("{} ", selection_marker().bright_purple().bold());
         true
     } else {
         print!("  ");
@@ -287,6 +287,13 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
         return Ok(());
     };
     recur_tree(tree, 0, orig_branch, None)?;
+    if !state.branch_exists_in_tree(repo, orig_branch) {
+        eprintln!(
+            "The current branch {} is not in the stack tree.",
+            orig_branch.red()
+        );
+        eprintln!("Run `git stack mount <parent_branch>` to add it.");
+    }
     Ok(())
 }
 

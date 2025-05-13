@@ -108,7 +108,7 @@ impl State {
         Ok(())
     }
 
-    fn branch_exists_in_tree(&self, repo: &str, branch_name: &str) -> bool {
+    pub fn branch_exists_in_tree(&self, repo: &str, branch_name: &str) -> bool {
         let Some(branch) = self.trees.get(repo) else {
             return false;
         };
