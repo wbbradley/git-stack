@@ -90,6 +90,7 @@ pub(crate) struct UpstreamStatus {
 
 #[derive(Debug)]
 pub(crate) struct GitBranchStatus {
+    pub(crate) sha: String,
     pub(crate) exists: bool,
     pub(crate) is_descendent: bool,
     pub(crate) parent_branch: String,
@@ -115,6 +116,7 @@ pub(crate) fn git_branch_status(
         .as_ref()
         .is_some_and(|upstream| shas_match(upstream, branch));
     Ok(GitBranchStatus {
+        sha: git_sha(branch)?,
         parent_branch,
         exists,
         is_descendent,

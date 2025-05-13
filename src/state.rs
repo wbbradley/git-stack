@@ -275,7 +275,7 @@ impl State {
             if let Some(parent) = parent {
                 if is_ancestor(&parent, &branch).unwrap_or(false) {
                     if let Ok(lkg_parent) = git_sha(&parent) {
-                        tracing::info!(
+                        tracing::debug!(
                             ?lkg_parent,
                             "Branch {} is a descendent of {}",
                             branch.yellow(),

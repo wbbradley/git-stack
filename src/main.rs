@@ -219,12 +219,13 @@ fn recur_tree(
     }
 
     println!(
-        "{} {}{}{}",
+        "{} ({}) {}{}{}",
         if is_current_branch {
             branch.name.truecolor(142, 192, 124)
         } else {
             branch.name.truecolor(178, 178, 178)
         },
+        branch_status.sha[..8].truecolor(215, 153, 33),
         {
             let details: String = if branch_status.exists {
                 if branch_status.is_descendent {
