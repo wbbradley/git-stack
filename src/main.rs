@@ -106,6 +106,7 @@ fn inner_main() -> Result<()> {
     .map_err(|error| anyhow!("Invalid git directory: '{}'", error.to_string_lossy()))?;
 
     let mut state = load_state().context("loading state")?;
+    state.refresh_lkgs(&repo)?;
 
     tracing::debug!("Current directory: {}", repo);
 
@@ -209,7 +210,7 @@ fn recur_tree(
     }
 
     println!(
-        "{} {}{}",
+        "{} {}{}{}",
         if is_current_branch {
             branch.name.truecolor(142, 192, 124)
         } else {
@@ -248,6 +249,13 @@ fn recur_tree(
                 )
             } else {
                 format!(" ({})", "no upstream".truecolor(215, 153, 33))
+            }
+        },
+        {
+            if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
+                format!(" (lkg parent {})", lkg_parent[..8].truecolor(215, 153, 33))
+            } else {
+                String::new()
             }
         }
     );

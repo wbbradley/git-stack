@@ -96,6 +96,10 @@ pub(crate) struct GitBranchStatus {
     pub(crate) upstream_status: Option<UpstreamStatus>,
 }
 
+pub(crate) fn git_sha(branch: &str) -> Result<String> {
+    run_git(&["rev-parse", branch])?.output_or("No sha found")
+}
+
 pub(crate) fn git_branch_status(
     parent_branch: Option<&str>,
     branch: &str,
@@ -120,8 +124,8 @@ pub(crate) fn git_branch_status(
         }),
     })
 }
-pub(crate) fn is_ancestor(stack_on: &str, branch: &str) -> Result<bool> {
-    Ok(run_git_status(&["merge-base", "--is-ancestor", stack_on, branch])?.success())
+pub(crate) fn is_ancestor(parent: &str, branch: &str) -> Result<bool> {
+    Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch])?.success())
 }
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
@@ -141,6 +145,7 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     // Assuming the dominant remote is "origin".
     // TODO: add support for different remotes.
     let remote = "origin";
+    let trunk = git_trunk()?;
     //  Get the HEAD ref of the remote.
     let remote_main = git_remote_main(remote)?;
     // Figure out the branch name.
@@ -171,6 +176,22 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct GitTrunk {
+    pub(crate) remote_main: String,
+    pub(crate) main_branch: String,
+}
+
+pub(crate) fn git_trunk() -> Result<GitTrunk> {
+    let remote_main = git_remote_main(DEFAULT_REMOTE)?;
+    let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
+        .ok_or(anyhow!("no branch?"))?
+        .to_string();
+    Ok(GitTrunk {
+        remote_main,
+        main_branch,
+    })
+}
+/// Returns a string of the form "origin/main".
 pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
     run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
         .output()
