@@ -145,8 +145,17 @@ fn diff(state: State, repo: &str, branch: &str) -> Result<()> {
         branch = branch,
         "Diffing branches"
     );
-    let status =
-        git::run_git_passthrough(&["diff", &format!("{}..{}", &parent_branch.name, branch)])?;
+    let branch = state
+        .get_tree_branch(repo, branch)
+        .ok_or_else(|| anyhow!("No branch found for current branch: {}", branch))?;
+    let status = git::run_git_passthrough(&[
+        "diff",
+        &format!(
+            "{}..{}",
+            branch.lkg_parent.as_deref().unwrap_or(&parent_branch.name),
+            branch.name
+        ),
+    ])?;
     if !status.success() {
         bail!("git format-patch failed");
     }

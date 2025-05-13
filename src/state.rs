@@ -115,7 +115,7 @@ impl State {
         };
         is_branch_mentioned_in_tree(branch_name, branch)
     }
-    fn get_tree_branch<'a>(&'a self, repo: &str, branch_name: &str) -> Option<&'a Branch> {
+    pub fn get_tree_branch<'a>(&'a self, repo: &str, branch_name: &str) -> Option<&'a Branch> {
         self.trees
             .get(repo)
             .and_then(|tree| find_branch_by_name(tree, branch_name))
