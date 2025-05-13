@@ -46,13 +46,13 @@ enum Command {
     },
     /// Shows the log between the given branch and its parent (git-stack tree) branch.
     Log {
-        /// Specifies the branch whose log should be shown. If ommitted, the current branch will
+        /// Specifies the branch whose log should be shown. If omitted, the current branch will
         /// be used.
         branch: Option<String>,
     },
     /// Shows the diff between the given branch and its parent (git-stack tree) branch.
     Diff {
-        /// Specifies the branch whose diff should be shown. If ommitted, the current branch will
+        /// Specifies the branch whose diff should be shown. If omitted, the current branch will
         /// be used.
         branch: Option<String>,
     },
