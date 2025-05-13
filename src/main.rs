@@ -291,7 +291,7 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
 }
 
 fn restack(
-    state: State,
+    mut state: State,
     repo: &str,
     run_version: String,
     restack_branch: Option<String>,
@@ -335,18 +335,16 @@ fn restack(
             if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
                 tracing::info!("LKG parent: {}", lkg_parent);
                 if is_ancestor(lkg_parent, &source)? {
+                    let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
+                    tracing::info!("Creating patch {}", &patch_rev);
                     // The branch is still on top of the LKG parent. Let's create a format-patch of the
                     // difference, and apply it on top of the new parent.
-                    let format_patch = run_git(&[
-                        "format-patch",
-                        "--stdout",
-                        &format!("{}..{}", &parent, &branch.name),
-                    ])?
-                    .output();
+                    let format_patch = run_git(&["format-patch", "--stdout", &patch_rev])?.output();
                     run_git(&["checkout", "-B", &branch.name, &parent])?;
                     let Some(format_patch) = format_patch else {
                         bail!("No diff between LKG and branch?! Might need to handle this case.");
                     };
+                    tracing::info!("Applying patch...");
                     let rebased = run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
                     if !rebased {
                         eprintln!(
@@ -362,6 +360,11 @@ fn restack(
                     }
                     git_push(&branch.name)?;
                     continue;
+                } else {
+                    tracing::info!(
+                        "Branch '{}' is not on top of the LKG parent. Falling through to `git rebase`...",
+                        branch.name
+                    );
                 }
             }
             run_git(&["checkout", &branch.name])?;
@@ -387,11 +390,12 @@ fn restack(
         restack_branch
     );
     tracing::info!("Done.");
+    state.refresh_lkgs(repo)?;
     Ok(())
 }
 
 fn git_push(branch: &str) -> Result<()> {
-    if !shas_match(&format!("origin/{}", branch), &branch) {
+    if !shas_match(&format!("origin/{}", branch), branch) {
         run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
     }
     Ok(())
