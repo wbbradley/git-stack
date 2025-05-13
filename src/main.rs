@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use git::{
     DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
-    git_remote_main, is_ancestor, run_git_status, shas_match,
+    git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
 };
 use state::{Branch, RebaseStep, load_state, save_state};
 use std::env;
@@ -310,56 +310,105 @@ fn restack(
             restack_branch,
             env::current_dir()?.display()
         );
-        let source = run_git(&["rev-parse", &branch])?
-            .output_or(format!("branch {branch} does not exist?"))?;
+        let source = git_sha(&branch.name)?;
 
-        if is_ancestor(&parent, &branch)? {
+        if is_ancestor(&parent, &branch.name)? {
             tracing::info!(
-                "Branch '{}' is already up to date with '{}'.",
-                branch,
+                "Branch '{}' is already stacked on '{}'.",
+                branch.name,
                 parent
             );
-            tracing::info!("Force-pushing '{}' to origin...", branch);
-            if !shas_match(&format!("origin/{branch}"), &branch) {
-                run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+            tracing::info!("Force-pushing '{}' to origin...", branch.name);
+            if !shas_match(&format!("origin/{}", branch.name), &branch.name) {
+                run_git(&[
+                    "push",
+                    "-fu",
+                    "origin",
+                    &format!("{branch_name}:{branch_name}", branch_name = branch.name),
+                ])?;
             }
             continue;
         } else {
-            tracing::info!("Branch '{}' is not descended from '{}'...", branch, parent);
-            if CREATE_BACKUP {
-                let backup_branch = format!("{}-at-{}", branch, run_version);
-                tracing::debug!(
-                    "Creating backup branch '{}' from '{}'...",
-                    backup_branch,
-                    branch
-                );
-                if !run_git_status(&["branch", &backup_branch, &source])?.success() {
-                    tracing::warn!("failed to create backup branch {}", backup_branch);
+            tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
+            make_backup(&run_version, branch, &source)?;
+
+            if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
+                tracing::info!("LKG parent: {}", lkg_parent);
+                if is_ancestor(lkg_parent, &source)? {
+                    // The branch is still on top of the LKG parent. Let's create a format-patch of the
+                    // difference, and apply it on top of the new parent.
+                    let format_patch = run_git(&[
+                        "format-patch",
+                        "--stdout",
+                        &format!("{}..{}", &parent, &branch.name),
+                    ])?
+                    .output();
+                    run_git(&["checkout", "-B", &branch.name, &parent])?;
+                    let Some(format_patch) = format_patch else {
+                        bail!("No diff between LKG and branch?! Might need to handle this case.");
+                    };
+                    let rebased = run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
+                    if !rebased {
+                        eprintln!(
+                            "{} did not complete successfully.",
+                            "`git am`".green().bold()
+                        );
+                        eprintln!("Run `git mergetool` to resolve conflicts.");
+                        eprintln!(
+                            "Once you have finished with {}, re-run `git stack restack`.",
+                            "`git am --continue`".green().bold()
+                        );
+                        std::process::exit(1);
+                    }
+                    git_push(&branch.name)?;
+                    continue;
                 }
             }
-            tracing::info!("Initiating a rebase of '{}' onto '{}'...", branch, parent);
-            if !run_git_status(&["checkout", "-q", &branch])?.success() {
-                bail!("git checkout {} failed", branch);
-            }
-            let rebased = run_git_status(&["rebase", &parent])?.success();
+            run_git(&["checkout", &branch.name])?;
+            let rebased = run_git_status(&["rebase", &parent], None)?.success();
+
             if !rebased {
-                tracing::warn!("Rebase did not complete automatically.");
-                tracing::warn!("Run `git mergetool` to resolve conflicts.");
-                tracing::info!("Once you have finished the rebase, re-run this script.");
+                eprintln!("{} did not complete automatically.", "Rebase".blue().bold());
+                eprintln!("Run `git mergetool` to resolve conflicts.");
+                eprintln!(
+                    "Once you have finished the {}, re-run this script.",
+                    "rebase".blue().bold()
+                );
                 std::process::exit(1);
             }
-            if !shas_match(&format!("origin/{branch}"), &branch) {
-                run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
-            }
+            git_push(&branch.name)?;
             tracing::info!("Rebase completed successfully. Continuing...");
         }
     }
     tracing::info!("Restoring starting branch '{}'...", restack_branch);
     ensure!(
-        run_git_status(&["checkout", "-q", &orig_branch])?.success(),
+        run_git_status(&["checkout", "-q", &orig_branch], None)?.success(),
         "git checkout {} failed",
         restack_branch
     );
     tracing::info!("Done.");
+    Ok(())
+}
+
+fn git_push(branch: &str) -> Result<()> {
+    if !shas_match(&format!("origin/{}", branch), &branch) {
+        run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+    }
+    Ok(())
+}
+
+fn make_backup(run_version: &String, branch: &Branch, source: &str) -> Result<(), anyhow::Error> {
+    if !CREATE_BACKUP {
+        return Ok(());
+    }
+    let backup_branch = format!("{}-at-{}", branch.name, run_version);
+    tracing::debug!(
+        "Creating backup branch '{}' from '{}'...",
+        backup_branch,
+        branch.name
+    );
+    if !run_git_status(&["branch", &backup_branch, source], None)?.success() {
+        tracing::warn!("failed to create backup branch {}", backup_branch);
+    }
     Ok(())
 }

@@ -59,28 +59,27 @@ impl State {
         current_upstream: Option<String>,
         branch_name: String,
     ) -> Result<()> {
-        let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
-        let current_branch_exists_in_tree = self.branch_exists_in_tree(repo, &current_branch);
-
-        if git_branch_exists(&branch_name) {
-            if !branch_exists_in_tree {
-                tracing::warn!(
-                    "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
-                    If you'd like to add it to the git-stack, please checkout the desired parent \
-                    branch, and then run `git-stack add {branch_name}` to stack {branch_name} on \
-                    top of the parent branch.",
-                );
-            }
-            run_git(&["checkout", &branch_name])?;
-            return Ok(());
-        }
         let trunk = git_trunk()?;
-
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
         // added it yet.
         self.trees
             .entry(repo.to_string())
             .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
+        save_state(self)?;
+
+        let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
+
+        if git_branch_exists(&branch_name) {
+            if !branch_exists_in_tree {
+                tracing::warn!(
+                    "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
+                    If you'd like to add it to the git-stack, please run `git-stack mount \
+                    <parent-branch>` to stack {branch_name} on top of the parent branch.",
+                );
+            }
+            run_git(&["checkout", &branch_name])?;
+            return Ok(());
+        }
 
         let branch = self
             .get_tree_branch_mut(repo, &current_branch)
@@ -139,17 +138,16 @@ impl State {
         let trunk = git_trunk()?;
         // Find all the descendents of the starting branch.
         // Traverse the tree from the starting branch to the root,
-        let mut path: Vec<&str> = vec![];
+        let mut path: Vec<&Branch> = vec![];
         if !get_path(self.trees.get(repo).unwrap(), starting_branch, &mut path) {
             bail!("Branch {starting_branch} not found in the git-stack tree.");
         }
-        path.insert(0, &trunk.remote_main);
         Ok(path
             .iter()
             .zip(path.iter().skip(1))
             .map(|(parent, child)| RebaseStep {
-                parent: parent.to_string(),
-                branch: child.to_string(),
+                parent: parent.name.to_string(),
+                branch: child,
             })
             .collect::<Vec<_>>())
     }
@@ -179,21 +177,25 @@ impl State {
         branch_name: &str,
         parent_branch: Option<String>,
     ) -> Result<()> {
+        let trunk = git_trunk()?;
+        if trunk.main_branch == branch_name {
+            bail!(
+                "Branch {branch_name} cannot be stacked on anything else.",
+                branch_name = branch_name.red()
+            );
+        }
+
         let parent_branch = match parent_branch {
             Some(parent_branch) => parent_branch,
             None => {
                 tracing::info!("No parent branch specified, using main branch.");
                 // The branch might not exist in git, let's create it, and add it to the tree.
-                let remote_main = git_remote_main(DEFAULT_REMOTE)?;
-                let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
-                    .ok_or(anyhow!("no branch?"))?
-                    .to_string();
                 // Ensure the main branch is in the git-stack tree for this repo if we haven't
                 // added it yet.
                 self.trees
                     .entry(repo.to_string())
-                    .or_insert_with(|| Branch::new(main_branch.clone(), None));
-                main_branch
+                    .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
+                trunk.main_branch
             }
         };
 
@@ -266,23 +268,31 @@ impl State {
         tracing::debug!("Refreshing lkgs for all branches...");
         let trunk = git_trunk()?;
 
-        let mut parent_lkgs: HashMap<String, String> = HashMap::default();
+        let mut parent_lkgs: HashMap<String, Option<String>> = HashMap::default();
 
-        // Traverse the tree from the root to the leaves, and update the lkgs as we go.
+        // BFS Traverse the tree from the root to the leaves, and update the lkgs as we go.
         let mut queue: VecDeque<(Option<String>, String)> = VecDeque::new();
         queue.push_back((None, trunk.main_branch.clone()));
         while let Some((parent, branch)) = queue.pop_front() {
             if let Some(parent) = parent {
+                let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
+                if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
+                    if is_ancestor(lkg_parent, &branch)? {
+                        parent_lkgs.insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
+                    } else {
+                        parent_lkgs.insert(tree_branch.name.clone(), None);
+                    }
+                }
                 if is_ancestor(&parent, &branch).unwrap_or(false) {
-                    if let Ok(lkg_parent) = git_sha(&parent) {
+                    if let Ok(new_lkg_parent) = git_sha(&parent) {
                         tracing::debug!(
-                            ?lkg_parent,
+                            lkg_parent = ?new_lkg_parent,
                             "Branch {} is a descendent of {}",
                             branch.yellow(),
                             parent.yellow(),
                         );
                         // Save the LKG parent for the branch.
-                        parent_lkgs.insert(branch.clone(), lkg_parent);
+                        parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
                     }
                 }
             }
@@ -297,21 +307,21 @@ impl State {
             let branch = self
                 .get_tree_branch_mut(repo, &branch)
                 .ok_or_else(|| anyhow!("Branch {branch} not found in the git-stack tree."))?;
-            branch.lkg_parent = Some(lkg_parent);
+            branch.lkg_parent = lkg_parent;
         }
         save_state(self)?;
         Ok(())
     }
 }
 
-fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>) -> bool {
+fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a Branch>) -> bool {
     if branch.name == target_branch {
-        path.insert(0, &branch.name);
+        path.insert(0, branch);
         return true;
     }
     for child_branch in &branch.branches {
         if get_path(child_branch, target_branch, path) {
-            path.insert(0, &branch.name);
+            path.insert(0, branch);
             return true;
         }
     }
@@ -319,9 +329,9 @@ fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a str>
 }
 
 #[derive(Debug)]
-pub(crate) struct RebaseStep {
+pub(crate) struct RebaseStep<'a> {
     pub(crate) parent: String,
-    pub(crate) branch: String,
+    pub(crate) branch: &'a Branch,
 }
 
 fn find_branch_by_name<'a>(tree: &'a Branch, name: &str) -> Option<&'a Branch> {

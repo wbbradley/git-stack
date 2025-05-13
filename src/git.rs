@@ -68,9 +68,19 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     })
 }
 
-pub(crate) fn run_git_status(args: &[&str]) -> Result<ExitStatus> {
+pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitStatus> {
     tracing::debug!("Running `git {}`", args.join(" "));
-    Ok(Command::new("git").args(args).status()?)
+    if let Some(stdin_text) = stdin {
+        let mut child = Command::new("git")
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
+        std::io::Write::write_all(stdin, stdin_text.as_bytes())?;
+        Ok(child.wait()?)
+    } else {
+        Ok(Command::new("git").args(args).status()?)
+    }
 }
 
 pub(crate) fn git_fetch() -> Result<()> {
@@ -127,7 +137,7 @@ pub(crate) fn git_branch_status(
     })
 }
 pub(crate) fn is_ancestor(parent: &str, branch: &str) -> Result<bool> {
-    Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch])?.success())
+    Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch], None)?.success())
 }
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
