@@ -110,6 +110,8 @@ If `git stack` reports missing branches or refuses to restack:
 - Ensure your working tree is clean (`git status`).
 - Use standard git commands to resolve any rebase conflicts (`git mergetool` is your friend,
   followed by `git rebase --continue`), then rerun `git stack restack`.
+- Note that the last-known-good location of the parent branch is stored in the sub-branch in order
+  to allow for cleaner movement of branches
 
 ## License
 

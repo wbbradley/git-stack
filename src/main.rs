@@ -269,68 +269,6 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
         return Ok(());
     };
     recur_tree(tree, 0, orig_branch, None)?;
-    /*
-    let stacks = state.get_stacks(repo);
-    if stacks.is_empty() {
-        println!("No stacks found.");
-        return Ok(());
-    }
-    let orig_branch = orig_branch.to_string();
-    let mut saw_stack = false;
-    let remote_main = after_text(&git_remote_main(DEFAULT_REMOTE)?, "remotes/")
-        .expect("remote main")
-        .to_string();
-    for (i, stack) in stacks.iter().enumerate().map(|(i, s)| (i + 1, s)) {
-        let stack_header: String = format!("▤ stack {i}").truecolor(148, 148, 158).to_string();
-        println!("{}", stack_header);
-        let mut last_branch = None;
-        let current_stack = stack.contains(&orig_branch);
-        saw_stack = saw_stack || current_stack;
-        for branch in stack.iter() {
-            let branch_status: GitBranchStatus = git_branch_status(last_branch.clone(), branch)?;
-            if branch == &orig_branch {
-                print!("  {} ", selection_marker().purple());
-            } else {
-                print!("    ");
-            }
-            println!(
-                "{} {}",
-                if current_stack {
-                    branch.green()
-                } else {
-                    branch.truecolor(178, 178, 178)
-                },
-                {
-                    let details: String = if branch_status.exists {
-                        if branch_status.is_descendent {
-                            format!(
-                                "{} with {}",
-                                "is up to date".truecolor(90, 120, 87),
-                                last_branch.unwrap_or(remote_main.clone()).yellow()
-                            )
-                        } else {
-                            format!(
-                                "{} {}",
-                                "is behind".red(),
-                                last_branch.unwrap_or(remote_main.clone()).yellow()
-                            )
-                        }
-                    } else {
-                        "does not exist".red().to_string()
-                    };
-                    details
-                }
-            );
-            last_branch = Some(branch.to_string());
-        }
-    }
-    if !saw_stack {
-        println!(
-            "No stack found for current branch: '{}'",
-            orig_branch.green()
-        );
-    }
-    */
     Ok(())
 }
 
