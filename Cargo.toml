@@ -10,6 +10,7 @@ clap = { version = "4.5.37", features = ["derive"] }
 colored = "3.0.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_yaml = "0.9.34"
+tempfile = "3.20.0"
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 xdg = "3.0.0"

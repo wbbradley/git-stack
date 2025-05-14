@@ -6,6 +6,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs,
     path::PathBuf,
+    process::Command,
     rc::Rc,
 };
 
@@ -21,6 +22,9 @@ use crate::{
 pub struct Branch {
     /// The name of the branch or ref.
     pub name: String,
+    /// Notes associated with the branch. This is a free-form field that can be used to store
+    /// anything.
+    pub note: Option<String>,
     /// The last-known-good parent of the branch. For use in restacking or moving branches.
     pub lkg_parent: Option<String>,
     /// The upstream branch reference.
@@ -31,6 +35,7 @@ impl Branch {
     pub fn new(name: String, lkg_parent: Option<String>) -> Self {
         Self {
             name,
+            note: None,
             lkg_parent,
             branches: vec![],
         }
@@ -310,6 +315,47 @@ impl State {
             branch.lkg_parent = lkg_parent;
         }
         save_state(self)?;
+        Ok(())
+    }
+
+    pub(crate) fn edit_note(&mut self, repo: &str, branch: &str) -> Result<()> {
+        let Some(branch) = self.get_tree_branch_mut(repo, branch) else {
+            bail!("Branch {branch} not found in the git-stack tree.");
+        };
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        // Create a temporary file.
+        let temp_file = tempfile::NamedTempFile::new()?;
+
+        fs::write(temp_file.path(), branch.note.as_deref().unwrap_or(""))?;
+
+        // Invoke the user's editor.
+        if !Command::new(editor)
+            .arg(temp_file.path().to_str().unwrap())
+            .status()?
+            .success()
+        {
+            eprintln!("Changes discarded.");
+        }
+        let text = fs::read(temp_file.path())?;
+        let buf = std::str::from_utf8(&text)?.trim().to_string();
+        branch.note = Some(buf);
+        save_state(self)?;
+        Ok(())
+    }
+
+    pub(crate) fn show_note(&self, repo: &str, branch: &str) -> Result<()> {
+        let Some(branch) = self.get_tree_branch(repo, branch) else {
+            bail!("Branch {branch} not found in the git-stack tree.");
+        };
+        let note = branch
+            .note
+            .as_deref()
+            .unwrap_or(&format!(
+                "No note set for branch '{branch}'.",
+                branch = branch.name.as_str().yellow()
+            ))
+            .to_string();
+        print!("{}{}", note, if !note.ends_with("\n") { "\n" } else { "" });
         Ok(())
     }
 }

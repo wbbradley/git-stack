@@ -50,6 +50,13 @@ enum Command {
         /// be used.
         branch: Option<String>,
     },
+    Note {
+        #[arg(long, short, default_value_t = false)]
+        edit: bool,
+        /// Specifies the branch whose note should be shown. If omitted, the current branch will
+        /// be used.
+        branch: Option<String>,
+    },
     /// Shows the diff between the given branch and its parent (git-stack tree) branch.
     Diff {
         /// Specifies the branch whose diff should be shown. If omitted, the current branch will
@@ -133,6 +140,14 @@ fn inner_main() -> Result<()> {
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
         Some(Command::Log { branch }) => show_log(state, &repo, &branch.unwrap_or(current_branch)),
+        Some(Command::Note { edit, branch }) => {
+            let branch = branch.unwrap_or(current_branch);
+            if edit {
+                state.edit_note(&repo, &branch)
+            } else {
+                state.show_note(&repo, &branch)
+            }
+        }
     }
 }
 
@@ -215,7 +230,7 @@ fn recur_tree(
     };
 
     for _ in 0..depth {
-        print!("  ");
+        print!("{}", "┃ ".truecolor(85, 85, 80));
     }
 
     println!(
@@ -269,6 +284,15 @@ fn recur_tree(
             }
         }
     );
+    if let Some(note) = &branch.note {
+        print!("  ");
+        for _ in 0..depth {
+            print!("{}", "┃ ".truecolor(85, 85, 80));
+        }
+
+        let first_line = note.lines().next().unwrap_or("");
+        println!("{} {}", "┗".truecolor(85, 85, 80), first_line.bright_blue());
+    }
 
     for child in &branch.branches {
         recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()))?;
