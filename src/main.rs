@@ -230,13 +230,13 @@ fn recur_tree(
     };
 
     for _ in 0..depth {
-        print!("{}", "┃ ".truecolor(85, 85, 80));
+        print!("{}", "┃ ".truecolor(55, 55, 50));
     }
 
     println!(
         "{} ({}) {}{}{}",
         if is_current_branch {
-            branch.name.truecolor(142, 192, 124)
+            branch.name.truecolor(142, 192, 124).bold()
         } else {
             branch.name.truecolor(178, 178, 178)
         },
@@ -287,11 +287,23 @@ fn recur_tree(
     if let Some(note) = &branch.note {
         print!("  ");
         for _ in 0..depth {
-            print!("{}", "┃ ".truecolor(85, 85, 80));
+            print!("{}", "┃ ".truecolor(55, 55, 50));
         }
 
         let first_line = note.lines().next().unwrap_or("");
-        println!("{} {}", "┗".truecolor(85, 85, 80), first_line.bright_blue());
+        println!(
+            "{} {}",
+            if is_current_branch {
+                "🗒 ".truecolor(155, 155, 150)
+            } else {
+                "›".truecolor(55, 55, 50)
+            },
+            if is_current_branch {
+                first_line.bright_blue().bold()
+            } else {
+                first_line.blue()
+            }
+        );
     }
 
     for child in &branch.branches {
@@ -373,7 +385,8 @@ fn restack(
                     let format_patch = run_git(&["format-patch", "--stdout", &patch_rev])?.output();
                     run_git(&["checkout", "-B", &branch.name, &parent])?;
                     let Some(format_patch) = format_patch else {
-                        bail!("No diff between LKG and branch?! Might need to handle this case.");
+                        tracing::debug!("No diff between LKG and branch?!");
+                        continue;
                     };
                     tracing::info!("Applying patch...");
                     let rebased = run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
