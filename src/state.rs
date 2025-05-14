@@ -347,6 +347,7 @@ impl State {
         let Some(branch) = self.get_tree_branch(repo, branch) else {
             bail!("Branch {branch} not found in the git-stack tree.");
         };
+
         let note = branch
             .note
             .as_deref()
