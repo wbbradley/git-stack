@@ -214,13 +214,15 @@ fn recur_tree(
     orig_branch: &str,
     parent_branch: Option<&str>,
 ) -> Result<()> {
-    let branch_status: GitBranchStatus = git_branch_status(parent_branch, &branch.name)
-        .with_context(|| {
-            format!(
-                "attempting to fetch the branch status of {}",
-                branch.name.red()
-            )
-        })?;
+    let Ok(branch_status) = git_branch_status(parent_branch, &branch.name).with_context(|| {
+        format!(
+            "attempting to fetch the branch status of {}",
+            branch.name.red()
+        )
+    }) else {
+        tracing::warn!("Branch {} does not exist", branch.name);
+        return Ok(());
+    };
     let is_current_branch = if branch.name == orig_branch {
         print!("{} ", selection_marker().bright_purple().bold());
         true

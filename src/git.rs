@@ -53,10 +53,15 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     tracing::debug!("Running `git {}`", args.join(" "));
     let out = Command::new("git")
         .args(args)
+        .stderr(std::process::Stdio::piped())
         .output()
         .with_context(|| format!("running git {args:?}"))?;
-
     if !out.status.success() {
+        tracing::debug!(
+            ?args,
+            "git error: {}",
+            std::str::from_utf8(&out.stderr).unwrap_or("")
+        );
         bail!(
             "`git {}` failed with exit status: {}",
             args.join(" "),
@@ -79,7 +84,18 @@ pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitS
         std::io::Write::write_all(stdin, stdin_text.as_bytes())?;
         Ok(child.wait()?)
     } else {
-        Ok(Command::new("git").args(args).status()?)
+        let output = Command::new("git")
+            .args(args)
+            .stderr(std::process::Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            tracing::debug!(
+                ?args,
+                "git error: {}",
+                std::str::from_utf8(&output.stderr).unwrap_or("")
+            );
+        }
+        Ok(output.status)
     }
 }
 
