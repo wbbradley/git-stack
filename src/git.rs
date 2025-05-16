@@ -137,7 +137,7 @@ pub(crate) fn git_branch_status(
         None => git_remote_main(DEFAULT_REMOTE)?,
     };
     let is_descendent = exists && is_ancestor(&parent_branch, branch)?;
-    let upstream_symbolic_name = git_get_upstream(branch).ok();
+    let upstream_symbolic_name = git_get_upstream(branch);
     let upstream_synced = upstream_symbolic_name
         .as_ref()
         .is_some_and(|upstream| shas_match(upstream, branch));
@@ -172,17 +172,11 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     git_fetch()?;
     // Assuming the dominant remote is "origin".
     // TODO: add support for different remotes.
-    let remote = "origin";
+    let remote = DEFAULT_REMOTE;
     let trunk = git_trunk()?;
-    //  Get the HEAD ref of the remote.
-    let remote_main = git_remote_main(remote)?;
-    // Figure out the branch name.
-    let main_branch = after_text(&remote_main, format!("{remote}/"))
-        .ok_or(anyhow!("no branch?"))?
-        .to_string();
 
     // Check that we don't orphan unpushed changes in the local `main` branch.
-    if !is_ancestor(&main_branch, &remote_main)? {
+    if !is_ancestor(&trunk.main_branch, &trunk.remote_main)? {
         bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
     }
 
@@ -190,16 +184,11 @@ pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
     run_git(&[
         "branch",
         "-f",
-        &main_branch,
-        &format!("{}/{}", remote, main_branch),
+        &trunk.main_branch,
+        &format!("{}/{}", remote, trunk.main_branch),
     ])?;
     if let Some(new_branch) = new_branch {
-        run_git(&[
-            "checkout",
-            "-B",
-            new_branch,
-            &format!("{}/{}", remote, main_branch),
-        ])?;
+        run_git(&["checkout", "-B", new_branch, &trunk.remote_main])?;
     }
     Ok(())
 }
@@ -225,16 +214,20 @@ pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
         .output()
         .map(|s| s.trim().to_string())
         .ok_or(anyhow!("No remote main branch?"))
+        .and_then(|s| {
+            Ok(after_text(s.trim(), "refs/remotes/")
+                .ok_or(anyhow!("no refs/remotes/ prefix?"))?
+                .to_string())
+        })
 }
 
-pub(crate) fn git_get_upstream(branch: &str) -> Result<String> {
+pub(crate) fn git_get_upstream(branch: &str) -> Option<String> {
     run_git(&[
         "rev-parse",
         "--abbrev-ref",
         "--symbolic-full-name",
         &format!("{branch}@{{upstream}}"),
-    ])?
-    .output()
-    .map(|s| s.trim().to_string())
-    .ok_or(anyhow!("No upstream branch?"))
+    ])
+    .ok()
+    .and_then(|s| s.output())
 }

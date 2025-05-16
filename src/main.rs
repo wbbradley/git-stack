@@ -7,9 +7,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use git::{
     DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
-    git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
+    git_get_upstream, git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
 };
-use state::{Branch, RebaseStep, load_state, save_state};
+use state::{Branch, RebaseStep};
 use std::env;
 use std::fs::canonicalize;
 use tracing::level_filters::LevelFilter;
@@ -36,13 +36,20 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Show the status of the git-stack tree in the current repo. This is the default command when
-    /// a command is omitted. (ie: `git stack` is the same as `git stack status`)
-    Status,
+    /// one is omitted. (ie: `git stack` is the same as `git stack status`)
+    Status {
+        /// Whether to fetch the latest changes from the remote before showing the status.
+        #[arg(long, short, default_value_t = false)]
+        fetch: bool,
+    },
     /// Restack your active branch and all branches in its related stack.
     Restack {
         /// The name of the branch to restack.
         #[arg(long, short)]
         branch: Option<String>,
+        /// Push any changes up to the remote after restacking.
+        #[arg(long, short)]
+        push: bool,
     },
     /// Shows the log between the given branch and its parent (git-stack tree) branch.
     Log {
@@ -50,6 +57,7 @@ enum Command {
         /// be used.
         branch: Option<String>,
     },
+    /// Show or edit per-branch notes.
     Note {
         #[arg(long, short, default_value_t = false)]
         edit: bool,
@@ -96,7 +104,12 @@ fn inner_main() -> Result<()> {
 
     tracing_subscriber::registry()
         // We don't need timestamps in the logs.
-        .with(tracing_subscriber::fmt::layer().without_time())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_file(true)
+                .with_line_number(true)
+                .without_time(),
+        )
         // Allow usage of RUST_LOG environment variable to set the log level.
         .with(
             tracing_subscriber::EnvFilter::builder()
@@ -112,7 +125,7 @@ fn inner_main() -> Result<()> {
     .into_string()
     .map_err(|error| anyhow!("Invalid git directory: '{}'", error.to_string_lossy()))?;
 
-    let mut state = load_state().context("loading state")?;
+    let mut state = State::load_state().context("loading state")?;
     state.refresh_lkgs(&repo)?;
 
     tracing::debug!("Current directory: {}", repo);
@@ -121,22 +134,20 @@ fn inner_main() -> Result<()> {
     let current_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
         .output()
         .ok_or(anyhow!("No current branch?"))?;
-    let current_upstream = run_git(&["rev-parse", "--abbrev-ref", "@{upstream}"])
-        .ok()
-        .and_then(|out| out.output());
+    let current_upstream = git_get_upstream("");
     tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
         Some(Command::Checkout { branch_name }) => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Some(Command::Restack { branch }) => {
-            restack(state, &repo, run_version, branch, current_branch)
+        Some(Command::Restack { branch, push }) => {
+            restack(state, &repo, run_version, branch, current_branch, push)
         }
         Some(Command::Mount { parent_branch }) => {
             state.mount(&repo, &current_branch, parent_branch)
         }
-        Some(Command::Status) | None => status(state, &repo, &current_branch),
+        Some(Command::Status { fetch }) => status(state, &repo, &current_branch, fetch),
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
         Some(Command::Log { branch }) => show_log(state, &repo, &branch.unwrap_or(current_branch)),
@@ -148,6 +159,7 @@ fn inner_main() -> Result<()> {
                 state.show_note(&repo, &branch)
             }
         }
+        None => status(state, &repo, &current_branch, false),
     }
 }
 
@@ -237,10 +249,11 @@ fn recur_tree(
 
     println!(
         "{} ({}) {}{}{}",
-        if is_current_branch {
-            branch.name.truecolor(142, 192, 124).bold()
-        } else {
-            branch.name.truecolor(178, 178, 178)
+        match (is_current_branch, branch_status.is_descendent) {
+            (true, true) => branch.name.truecolor(142, 192, 124).bold(),
+            (true, false) => branch.name.truecolor(215, 153, 33).bold(),
+            (false, true) => branch.name.truecolor(142, 192, 124),
+            (false, false) => branch.name.truecolor(215, 153, 33),
         },
         branch_status.sha[..8].truecolor(215, 153, 33),
         {
@@ -314,8 +327,11 @@ fn recur_tree(
     Ok(())
 }
 
-fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
-    git_fetch()?;
+fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool) -> Result<()> {
+    if fetch {
+        git_fetch()?;
+    }
+    let trunk = state.ensure_trunk(repo)?;
 
     let Some(tree) = state.get_tree(repo) else {
         eprintln!(
@@ -332,6 +348,7 @@ fn status(state: State, repo: &str, orig_branch: &str) -> Result<()> {
         );
         eprintln!("Run `git stack mount <parent_branch>` to add it.");
     }
+    state.save_state()?;
     Ok(())
 }
 
@@ -341,16 +358,17 @@ fn restack(
     run_version: String,
     restack_branch: Option<String>,
     orig_branch: String,
+    push: bool,
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let plan = state.plan_restack(repo, &restack_branch)?;
 
-    tracing::info!(?plan, "Restacking branches with plan...");
+    tracing::debug!(?plan, "Restacking branches with plan...");
     git_checkout_main(None)?;
     for RebaseStep { parent, branch } in plan {
-        tracing::info!(
+        tracing::debug!(
             "Starting branch: {} [pwd={}]",
             restack_branch,
             env::current_dir()?.display()
@@ -358,17 +376,17 @@ fn restack(
         let source = git_sha(&branch.name)?;
 
         if is_ancestor(&parent, &branch.name)? {
-            tracing::info!(
+            tracing::debug!(
                 "Branch '{}' is already stacked on '{}'.",
                 branch.name,
                 parent
             );
-            tracing::info!("Force-pushing '{}' to origin...", branch.name);
-            if !shas_match(&format!("origin/{}", branch.name), &branch.name) {
+            tracing::debug!("Force-pushing '{}' to {DEFAULT_REMOTE}...", branch.name);
+            if push && !shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name) {
                 run_git(&[
                     "push",
                     "-fu",
-                    "origin",
+                    DEFAULT_REMOTE,
                     &format!("{branch_name}:{branch_name}", branch_name = branch.name),
                 ])?;
             }
@@ -404,7 +422,9 @@ fn restack(
                         );
                         std::process::exit(1);
                     }
-                    git_push(&branch.name)?;
+                    if push {
+                        git_push(&branch.name)?;
+                    }
                     continue;
                 } else {
                     tracing::info!(
@@ -425,7 +445,9 @@ fn restack(
                 );
                 std::process::exit(1);
             }
-            git_push(&branch.name)?;
+            if push {
+                git_push(&branch.name)?;
+            }
             tracing::info!("Rebase completed successfully. Continuing...");
         }
     }
@@ -441,8 +463,13 @@ fn restack(
 }
 
 fn git_push(branch: &str) -> Result<()> {
-    if !shas_match(&format!("origin/{}", branch), branch) {
-        run_git(&["push", "-fu", "origin", &format!("{}:{}", branch, branch)])?;
+    if !shas_match(&format!("{DEFAULT_REMOTE}/{}", branch), branch) {
+        run_git(&[
+            "push",
+            "-fu",
+            DEFAULT_REMOTE,
+            &format!("{}:{}", branch, branch),
+        ])?;
     }
     Ok(())
 }

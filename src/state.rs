@@ -12,8 +12,8 @@ use std::{
 
 use crate::{
     git::{
-        DEFAULT_REMOTE, after_text, git_branch_exists, git_remote_main, git_sha, git_trunk,
-        is_ancestor,
+        DEFAULT_REMOTE, GitTrunk, after_text, git_branch_exists, git_remote_main, git_sha,
+        git_trunk, is_ancestor,
     },
     run_git,
 };
@@ -50,6 +50,40 @@ pub struct State {
 }
 
 impl State {
+    pub fn load_state() -> Result<Self> {
+        let config_path = get_xdg_path()?;
+        let mut used_existing_config = true;
+        let data = match fs::read_to_string(&config_path) {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to read config file at {}: {}",
+                    config_path.display(),
+                    error
+                );
+                tracing::warn!("Using default (empty) config");
+                used_existing_config = false;
+                "".to_string()
+            }
+        };
+        let state: Self = serde_yaml::from_str(&data)?;
+        fs::create_dir_all(config_path.parent().unwrap())
+            .inspect_err(|error| tracing::warn!("Failed to create config directory: {}", error))?;
+        if !used_existing_config {
+            tracing::info!("No existing config file found, creating a new one.");
+            state
+                .save_state()
+                .inspect_err(|error| tracing::warn!("Failed to save config file: {}", error))?;
+        }
+        Ok(state)
+    }
+
+    pub fn save_state(&self) -> Result<()> {
+        let config_path = get_xdg_path()?;
+        tracing::debug!(?self, ?config_path, "Saving state to config file");
+        Ok(fs::write(config_path, serde_yaml::to_string(&self)?)?)
+    }
+
     pub fn get_tree(&self, repo: &str) -> Option<&Branch> {
         self.trees.get(repo)
     }
@@ -70,7 +104,7 @@ impl State {
         self.trees
             .entry(repo.to_string())
             .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
-        save_state(self)?;
+        self.save_state()?;
 
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
 
@@ -108,7 +142,7 @@ impl State {
         );
 
         // Save the state after modifying it.
-        save_state(self)?;
+        self.save_state()?;
 
         Ok(())
     }
@@ -171,9 +205,20 @@ impl State {
             branch_name = branch_name.yellow()
         );
 
-        save_state(self)?;
+        self.save_state()?;
 
         Ok(())
+    }
+
+    pub(crate) fn ensure_trunk(&mut self, repo: &str) -> Result<GitTrunk> {
+        let trunk = git_trunk()?;
+        // The branch might not exist in git, let's create it, and add it to the tree.
+        // Ensure the main branch is in the git-stack tree for this repo if we haven't
+        // added it yet.
+        self.trees
+            .entry(repo.to_string())
+            .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
+        Ok(trunk)
     }
 
     pub(crate) fn mount(
@@ -182,7 +227,8 @@ impl State {
         branch_name: &str,
         parent_branch: Option<String>,
     ) -> Result<()> {
-        let trunk = git_trunk()?;
+        let trunk = self.ensure_trunk(repo)?;
+
         if trunk.main_branch == branch_name {
             bail!(
                 "Branch {branch_name} cannot be stacked on anything else.",
@@ -190,19 +236,7 @@ impl State {
             );
         }
 
-        let parent_branch = match parent_branch {
-            Some(parent_branch) => parent_branch,
-            None => {
-                tracing::info!("No parent branch specified, using main branch.");
-                // The branch might not exist in git, let's create it, and add it to the tree.
-                // Ensure the main branch is in the git-stack tree for this repo if we haven't
-                // added it yet.
-                self.trees
-                    .entry(repo.to_string())
-                    .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
-                trunk.main_branch
-            }
-        };
+        let parent_branch = parent_branch.unwrap_or(trunk.main_branch);
 
         if branch_name == parent_branch {
             bail!(
@@ -249,7 +283,7 @@ impl State {
             parent_branch = parent_branch.yellow()
         );
 
-        save_state(self)?;
+        self.save_state()?;
         Ok(())
     }
     pub fn get_parent_branch_of(&self, repo: &str, branch_name: &str) -> Option<&Branch> {
@@ -314,7 +348,7 @@ impl State {
                 .ok_or_else(|| anyhow!("Branch {branch} not found in the git-stack tree."))?;
             branch.lkg_parent = lkg_parent;
         }
-        save_state(self)?;
+        self.save_state()?;
         Ok(())
     }
 
@@ -339,7 +373,7 @@ impl State {
         let text = fs::read(temp_file.path())?;
         let buf = std::str::from_utf8(&text)?.trim().to_string();
         branch.note = Some(buf);
-        save_state(self)?;
+        self.save_state()?;
         Ok(())
     }
 
@@ -461,39 +495,6 @@ fn find_stack_with_branch<'a>(
         "No stack found for branch {}",
         current_branch
     ))
-}
-
-pub fn load_state() -> anyhow::Result<State> {
-    let config_path = get_xdg_path()?;
-    let mut used_existing_config = true;
-    let data = match fs::read_to_string(&config_path) {
-        Ok(data) => data,
-        Err(error) => {
-            tracing::warn!(
-                "Failed to read config file at {}: {}",
-                config_path.display(),
-                error
-            );
-            tracing::warn!("Using default (empty) config");
-            used_existing_config = false;
-            "".to_string()
-        }
-    };
-    let state: State = serde_yaml::from_str(&data)?;
-    fs::create_dir_all(config_path.parent().unwrap())
-        .inspect_err(|error| tracing::warn!("Failed to create config directory: {}", error))?;
-    if !used_existing_config {
-        tracing::info!("No existing config file found, creating a new one.");
-        save_state(&state)
-            .inspect_err(|error| tracing::warn!("Failed to save config file: {}", error))?;
-    }
-    Ok(state)
-}
-
-pub fn save_state(state: &State) -> Result<()> {
-    let config_path = get_xdg_path()?;
-    tracing::debug!(?state, ?config_path, "Saving state to config file");
-    Ok(fs::write(config_path, serde_yaml::to_string(&state)?)?)
 }
 
 fn get_xdg_path() -> anyhow::Result<PathBuf> {
