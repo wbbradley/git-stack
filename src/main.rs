@@ -47,6 +47,9 @@ enum Command {
         /// The name of the branch to restack.
         #[arg(long, short)]
         branch: Option<String>,
+        /// Whether to fetch the latest changes from the remote before restacking.
+        #[arg(long, short, default_value_t = false)]
+        fetch: bool,
         /// Push any changes up to the remote after restacking.
         #[arg(long, short)]
         push: bool,
@@ -141,9 +144,19 @@ fn inner_main() -> Result<()> {
         Some(Command::Checkout { branch_name }) => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Some(Command::Restack { branch, push }) => {
-            restack(state, &repo, run_version, branch, current_branch, push)
-        }
+        Some(Command::Restack {
+            branch,
+            fetch,
+            push,
+        }) => restack(
+            state,
+            &repo,
+            run_version,
+            branch,
+            current_branch,
+            fetch,
+            push,
+        ),
         Some(Command::Mount { parent_branch }) => {
             state.mount(&repo, &current_branch, parent_branch)
         }
@@ -307,12 +320,8 @@ fn recur_tree(
 
         let first_line = note.lines().next().unwrap_or("");
         println!(
-            "{} {}",
-            if is_current_branch {
-                "🗒 ".truecolor(155, 155, 150)
-            } else {
-                "›".truecolor(55, 55, 50)
-            },
+            "  {} {}",
+            "›".truecolor(55, 55, 50),
             if is_current_branch {
                 first_line.bright_blue().bold()
             } else {
@@ -321,7 +330,18 @@ fn recur_tree(
         );
     }
 
-    for child in &branch.branches {
+    let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
+    branches_sorted.sort_by(|&a, &b| {
+        let a_is_ancestor = is_ancestor(&a.name, orig_branch).unwrap_or(false);
+        let b_is_ancestor = is_ancestor(&b.name, orig_branch).unwrap_or(false);
+        match (a_is_ancestor, b_is_ancestor) {
+            (true, true) => a.name.cmp(&b.name),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.name.cmp(&b.name),
+        }
+    });
+    for child in branches_sorted {
         recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()))?;
     }
     Ok(())
@@ -358,9 +378,14 @@ fn restack(
     run_version: String,
     restack_branch: Option<String>,
     orig_branch: String,
+    fetch: bool,
     push: bool,
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
+
+    if fetch {
+        git_fetch()?;
+    }
 
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let plan = state.plan_restack(repo, &restack_branch)?;
