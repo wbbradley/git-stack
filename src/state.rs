@@ -424,6 +424,7 @@ impl State {
     pub(crate) fn edit_config(&self) -> Result<()> {
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
+        // TODO: edit only the config for the current repo.
         // Invoke the user's editor.
         let _ = Command::new(editor)
             .arg(get_xdg_path()?.to_str().unwrap())
