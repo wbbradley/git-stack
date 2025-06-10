@@ -1,20 +1,28 @@
 #![allow(dead_code, unused_imports, unused_variables)]
-use crate::git::run_git;
-use crate::state::State;
-use colored::Colorize;
+use std::{env, fs::canonicalize};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use git::{
-    DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
-    git_get_upstream, git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
+    DEFAULT_REMOTE,
+    GitBranchStatus,
+    after_text,
+    git_branch_status,
+    git_checkout_main,
+    git_fetch,
+    git_get_upstream,
+    git_remote_main,
+    git_sha,
+    is_ancestor,
+    run_git_status,
+    shas_match,
 };
-use state::{Branch, RebaseStep};
-use std::env;
-use std::fs::canonicalize;
+use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt; //prelude::*;
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
+
+use crate::{git::run_git, state::State}; //prelude::*;
 
 mod git;
 mod state;
@@ -42,6 +50,8 @@ enum Command {
         #[arg(long, short, default_value_t = false)]
         fetch: bool,
     },
+    /// Open the git-stack state file in an editor for manual editing.
+    EditState,
     /// Restack your active branch and all branches in its related stack.
     Restack {
         /// The name of the branch to restack.
@@ -144,6 +154,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Checkout { branch_name }) => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
+        Some(Command::EditState) => state.edit_config(),
         Some(Command::Restack {
             branch,
             fetch,
@@ -261,7 +272,7 @@ fn recur_tree(
     }
 
     println!(
-        "{} ({}) {}{}{}",
+        "{} ({}) {}{}{}{}",
         match (is_current_branch, branch_status.is_descendent) {
             (true, true) => branch.name.truecolor(142, 192, 124).bold(),
             (true, false) => branch.name.truecolor(215, 153, 33).bold(),
@@ -310,7 +321,11 @@ fn recur_tree(
             } else {
                 String::new()
             }
-        }
+        },
+        match branch.stack_method {
+            StackMethod::ApplyMerge => " (apply-merge)".truecolor(142, 192, 124),
+            StackMethod::Merge => " (merge)".truecolor(142, 192, 124),
+        },
     );
     if let Some(note) = &branch.note {
         print!("  ");
@@ -353,7 +368,7 @@ fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool) -> Resul
     }
     let trunk = state.ensure_trunk(repo)?;
 
-    let Some(tree) = state.get_tree(repo) else {
+    let Some(tree) = state.get_tree_mut(repo) else {
         eprintln!(
             "No stack tree found for repo {repo}.",
             repo = repo.truecolor(178, 178, 218)
@@ -392,7 +407,7 @@ fn restack(
 
     tracing::debug!(?plan, "Restacking branches with plan...");
     git_checkout_main(None)?;
-    for RebaseStep { parent, branch } in plan {
+    for RestackStep { parent, branch } in plan {
         tracing::debug!(
             "Starting branch: {} [pwd={}]",
             restack_branch,
@@ -406,74 +421,96 @@ fn restack(
                 branch.name,
                 parent
             );
-            tracing::debug!("Force-pushing '{}' to {DEFAULT_REMOTE}...", branch.name);
             if push && !shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name) {
                 run_git(&[
                     "push",
-                    "-fu",
+                    match branch.stack_method {
+                        StackMethod::ApplyMerge => {
+                            tracing::debug!(
+                                "Force-pushing '{}' to {DEFAULT_REMOTE}...",
+                                branch.name
+                            );
+                            "-fu"
+                        }
+                        StackMethod::Merge => "-u",
+                    },
                     DEFAULT_REMOTE,
                     &format!("{branch_name}:{branch_name}", branch_name = branch.name),
                 ])?;
             }
-            continue;
         } else {
             tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
             make_backup(&run_version, branch, &source)?;
 
-            if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
-                tracing::info!("LKG parent: {}", lkg_parent);
-                if is_ancestor(lkg_parent, &source)? {
-                    let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
-                    tracing::info!("Creating patch {}", &patch_rev);
-                    // The branch is still on top of the LKG parent. Let's create a format-patch of the
-                    // difference, and apply it on top of the new parent.
-                    let format_patch = run_git(&["format-patch", "--stdout", &patch_rev])?.output();
-                    run_git(&["checkout", "-B", &branch.name, &parent])?;
-                    let Some(format_patch) = format_patch else {
-                        tracing::debug!("No diff between LKG and branch?!");
-                        continue;
-                    };
-                    tracing::info!("Applying patch...");
-                    let rebased = run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
-                    if !rebased {
-                        eprintln!(
-                            "{} did not complete successfully.",
-                            "`git am`".green().bold()
-                        );
-                        eprintln!("Run `git mergetool` to resolve conflicts.");
-                        eprintln!(
-                            "Once you have finished with {}, re-run `git stack restack`.",
-                            "`git am --continue`".green().bold()
-                        );
-                        std::process::exit(1);
+            match branch.stack_method {
+                StackMethod::ApplyMerge => {
+                    if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
+                        tracing::info!("LKG parent: {}", lkg_parent);
+                        if is_ancestor(lkg_parent, &source)? {
+                            let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
+                            tracing::info!("Creating patch {}", &patch_rev);
+                            // The branch is still on top of the LKG parent. Let's create a format-patch of the
+                            // difference, and apply it on top of the new parent.
+                            let format_patch =
+                                run_git(&["format-patch", "--stdout", &patch_rev])?.output();
+                            run_git(&["checkout", "-B", &branch.name, &parent])?;
+                            let Some(format_patch) = format_patch else {
+                                tracing::debug!("No diff between LKG and branch?!");
+                                continue;
+                            };
+                            tracing::info!("Applying patch...");
+                            let rebased =
+                                run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
+                            if !rebased {
+                                eprintln!(
+                                    "{} did not complete successfully.",
+                                    "`git am`".green().bold()
+                                );
+                                eprintln!("Run `git mergetool` to resolve conflicts.");
+                                eprintln!(
+                                    "Once you have finished with {}, re-run `git stack restack`.",
+                                    "`git am --continue`".green().bold()
+                                );
+                                std::process::exit(1);
+                            }
+                            if push {
+                                git_push(&branch.name)?;
+                            }
+                            continue;
+                        } else {
+                            tracing::info!(
+                                "Branch '{}' is not on top of the LKG parent. Using `git rebase`...",
+                                branch.name
+                            );
+                            run_git(&["checkout", &branch.name])?;
+                            let rebased = run_git_status(&["rebase", &parent], None)?.success();
+
+                            if !rebased {
+                                eprintln!(
+                                    "{} did not complete automatically.",
+                                    "Rebase".blue().bold()
+                                );
+                                eprintln!("Run `git mergetool` to resolve conflicts.");
+                                eprintln!(
+                                    "Once you have finished the {}, re-run this script.",
+                                    "rebase".blue().bold()
+                                );
+                                std::process::exit(1);
+                            }
+                            if push {
+                                git_push(&branch.name)?;
+                            }
+                            tracing::info!("Rebase completed successfully. Continuing...");
+                        }
                     }
-                    if push {
-                        git_push(&branch.name)?;
-                    }
-                    continue;
-                } else {
-                    tracing::info!(
-                        "Branch '{}' is not on top of the LKG parent. Falling through to `git rebase`...",
-                        branch.name
-                    );
+                }
+                StackMethod::Merge => {
+                    run_git(&["checkout", &branch.name])
+                        .with_context(|| format!("checking out {}", branch.name))?;
+                    run_git(&["merge", &parent])
+                        .with_context(|| format!("merging {parent} into {}", branch.name))?;
                 }
             }
-            run_git(&["checkout", &branch.name])?;
-            let rebased = run_git_status(&["rebase", &parent], None)?.success();
-
-            if !rebased {
-                eprintln!("{} did not complete automatically.", "Rebase".blue().bold());
-                eprintln!("Run `git mergetool` to resolve conflicts.");
-                eprintln!(
-                    "Once you have finished the {}, re-run this script.",
-                    "rebase".blue().bold()
-                );
-                std::process::exit(1);
-            }
-            if push {
-                git_push(&branch.name)?;
-            }
-            tracing::info!("Rebase completed successfully. Continuing...");
         }
     }
     tracing::info!("Restoring starting branch '{}'...", restack_branch);

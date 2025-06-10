@@ -1,29 +1,52 @@
-use anyhow::{Result, anyhow, bail, ensure};
-use colored::Colorize;
-use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
+    default,
     fs,
     path::PathBuf,
     process::Command,
     rc::Rc,
 };
 
+use anyhow::{Result, anyhow, bail, ensure};
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+
 use crate::{
     git::{
-        DEFAULT_REMOTE, GitTrunk, after_text, git_branch_exists, git_remote_main, git_sha,
-        git_trunk, is_ancestor,
+        DEFAULT_REMOTE,
+        GitTrunk,
+        after_text,
+        git_branch_exists,
+        git_remote_main,
+        git_sha,
+        git_trunk,
+        is_ancestor,
     },
     run_git,
 };
+
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StackMethod {
+    /// Uses `git format-patch` and `git am` to restack branches.
+    #[default]
+    ApplyMerge,
+    /// Uses `git merge` to pull in changes from the parent branch.
+    Merge,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Branch {
     /// The name of the branch or ref.
     pub name: String,
+    /// The method used to stack the branch. When sharing a branch with others, it is recommended
+    /// to use `Merge` and to avoid `git push -f` to prevent accidental data loss. When coding solo
+    /// in a branch, `ApplyMerge` is recommended to keep the history clean.
+    pub stack_method: StackMethod,
     /// Notes associated with the branch. This is a free-form field that can be used to store
     /// anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The last-known-good parent of the branch. For use in restacking or moving branches.
     pub lkg_parent: Option<String>,
@@ -36,6 +59,7 @@ impl Branch {
         Self {
             name,
             note: None,
+            stack_method: StackMethod::default(),
             lkg_parent,
             branches: vec![],
         }
@@ -86,6 +110,9 @@ impl State {
 
     pub fn get_tree(&self, repo: &str) -> Option<&Branch> {
         self.trees.get(repo)
+    }
+    pub fn get_tree_mut(&mut self, repo: &str) -> Option<&mut Branch> {
+        self.trees.get_mut(repo)
     }
     /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
     /// then check whether the branch exists in the git repo. If it does, then let the user know
@@ -172,7 +199,7 @@ impl State {
         &self,
         repo: &str,
         starting_branch: &str,
-    ) -> Result<Vec<RebaseStep>> {
+    ) -> Result<Vec<RestackStep>> {
         tracing::debug!("Planning restack for {starting_branch}");
         let trunk = git_trunk()?;
         // Find all the descendents of the starting branch.
@@ -184,7 +211,7 @@ impl State {
         Ok(path
             .iter()
             .zip(path.iter().skip(1))
-            .map(|(parent, child)| RebaseStep {
+            .map(|(parent, child)| RestackStep {
                 parent: parent.name.to_string(),
                 branch: child,
             })
@@ -393,6 +420,16 @@ impl State {
         print!("{}{}", note, if !note.ends_with("\n") { "\n" } else { "" });
         Ok(())
     }
+
+    pub(crate) fn edit_config(&self) -> Result<()> {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+        // Invoke the user's editor.
+        let _ = Command::new(editor)
+            .arg(get_xdg_path()?.to_str().unwrap())
+            .status()?;
+        Ok(())
+    }
 }
 
 fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a Branch>) -> bool {
@@ -410,7 +447,7 @@ fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a Bran
 }
 
 #[derive(Debug)]
-pub(crate) struct RebaseStep<'a> {
+pub(crate) struct RestackStep<'a> {
     pub(crate) parent: String,
     pub(crate) branch: &'a Branch,
 }
@@ -502,4 +539,40 @@ fn get_xdg_path() -> anyhow::Result<PathBuf> {
     base_dirs
         .get_state_file("state.yaml")
         .ok_or_else(|| anyhow::anyhow!("Failed to find state file"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_state_write() {
+        let state = super::State {
+            trees: vec![(
+                "/tmp/foo".to_string(),
+                super::Branch {
+                    name: "main".to_string(),
+                    stack_method: Some(super::StackMethod::ApplyMerge),
+                    note: None,
+                    lkg_parent: None,
+                    branches: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let serialized = serde_yaml::to_string(&state).unwrap();
+        assert_eq!(
+            serialized,
+            "/tmp/foo:\n  name: main\n  stack_method: apply_merge\n  lkg_parent: null\n  branches: []\n",
+        );
+    }
+    #[test]
+    fn test_state_read() {
+        let state = "/tmp/foo:\n  name: main\n  stack_method: apply_merge\n  lkg_parent: null\n  branches: []\n";
+        let state: super::State = serde_yaml::from_str(state).unwrap();
+        assert_eq!(state.trees.len(), 1);
+        assert!(state.trees.contains_key("/tmp/foo"));
+        let tree = state.trees.get("/tmp/foo").unwrap();
+        assert_eq!(tree.name, "main");
+        assert_eq!(tree.stack_method, Some(super::StackMethod::ApplyMerge));
+    }
 }
