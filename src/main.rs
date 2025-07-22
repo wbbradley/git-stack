@@ -104,17 +104,6 @@ enum Command {
 }
 
 fn main() {
-    if let Err(e) = inner_main() {
-        tracing::error!(error = ?e);
-        std::process::exit(1);
-    }
-    std::process::exit(0);
-}
-
-fn inner_main() -> Result<()> {
-    // Run from the git root directory.
-    let args = Args::parse();
-
     tracing_subscriber::registry()
         // We don't need timestamps in the logs.
         .with(
@@ -130,6 +119,16 @@ fn inner_main() -> Result<()> {
                 .from_env_lossy(),
         )
         .init();
+    if let Err(e) = inner_main() {
+        tracing::error!(error = ?e);
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+fn inner_main() -> Result<()> {
+    // Run from the git root directory.
+    let args = Args::parse();
 
     let repo = canonicalize(
         run_git(&["rev-parse", "--show-toplevel"])?.output_or("No git directory found")?,
