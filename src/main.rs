@@ -5,8 +5,18 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use git::{
-    DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
-    git_get_upstream, git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
+    DEFAULT_REMOTE,
+    GitBranchStatus,
+    after_text,
+    git_branch_status,
+    git_checkout_main,
+    git_fetch,
+    git_get_upstream,
+    git_remote_main,
+    git_sha,
+    is_ancestor,
+    run_git_status,
+    shas_match,
 };
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
