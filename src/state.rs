@@ -1,8 +1,7 @@
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
-    default,
-    fs,
+    default, fs,
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -14,14 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     git::{
-        DEFAULT_REMOTE,
-        GitTrunk,
-        after_text,
-        git_branch_exists,
-        git_remote_main,
-        git_sha,
-        git_trunk,
-        is_ancestor,
+        DEFAULT_REMOTE, GitTrunk, after_text, git_branch_exists, git_remote_main, git_sha,
+        git_trunk, is_ancestor,
     },
     run_git,
 };
@@ -180,11 +173,13 @@ impl State {
         };
         is_branch_mentioned_in_tree(branch_name, branch)
     }
+
     pub fn get_tree_branch<'a>(&'a self, repo: &str, branch_name: &str) -> Option<&'a Branch> {
         self.trees
             .get(repo)
             .and_then(|tree| find_branch_by_name(tree, branch_name))
     }
+
     fn get_tree_branch_mut<'a>(
         &'a mut self,
         repo: &str,
@@ -196,10 +191,10 @@ impl State {
     }
 
     pub(crate) fn plan_restack(
-        &self,
+        &'_ self,
         repo: &str,
         starting_branch: &str,
-    ) -> Result<Vec<RestackStep>> {
+    ) -> Result<Vec<RestackStep<'_>>> {
         tracing::debug!("Planning restack for {starting_branch}");
         let trunk = git_trunk()?;
         // Find all the descendents of the starting branch.
@@ -278,11 +273,10 @@ impl State {
         if let (Some(Branch { name: name_a, .. }), Some(Branch { name: name_b, .. })) = (
             self.get_parent_branch_of(repo, branch_name),
             self.get_tree_branch(repo, &parent_branch),
-        ) {
-            if name_a == name_b {
-                tracing::warn!("Branch {branch_name} is already mounted on {name_a}");
-                return Ok(());
-            }
+        ) && name_a == name_b
+        {
+            tracing::warn!("Branch {branch_name} is already mounted on {name_a}");
+            return Ok(());
         }
 
         let current_parent_branch = self.get_parent_branch_of_mut(repo, branch_name);
@@ -349,17 +343,17 @@ impl State {
                         parent_lkgs.insert(tree_branch.name.clone(), None);
                     }
                 }
-                if is_ancestor(&parent, &branch).unwrap_or(false) {
-                    if let Ok(new_lkg_parent) = git_sha(&parent) {
-                        tracing::debug!(
-                            lkg_parent = ?new_lkg_parent,
-                            "Branch {} is a descendent of {}",
-                            branch.yellow(),
-                            parent.yellow(),
-                        );
-                        // Save the LKG parent for the branch.
-                        parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
-                    }
+                if is_ancestor(&parent, &branch).unwrap_or(false)
+                    && let Ok(new_lkg_parent) = git_sha(&parent)
+                {
+                    tracing::debug!(
+                        lkg_parent = ?new_lkg_parent,
+                        "Branch {} is a descendent of {}",
+                        branch.yellow(),
+                        parent.yellow(),
+                    );
+                    // Save the LKG parent for the branch.
+                    parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
                 }
             }
             if let Some(branch) = self.get_tree_branch(repo, &branch) {
@@ -551,7 +545,7 @@ mod tests {
                 "/tmp/foo".to_string(),
                 super::Branch {
                     name: "main".to_string(),
-                    stack_method: Some(super::StackMethod::ApplyMerge),
+                    stack_method: super::StackMethod::ApplyMerge,
                     note: None,
                     lkg_parent: None,
                     branches: vec![],
@@ -574,6 +568,6 @@ mod tests {
         assert!(state.trees.contains_key("/tmp/foo"));
         let tree = state.trees.get("/tmp/foo").unwrap();
         assert_eq!(tree.name, "main");
-        assert_eq!(tree.stack_method, Some(super::StackMethod::ApplyMerge));
+        assert_eq!(tree.stack_method, super::StackMethod::ApplyMerge);
     }
 }

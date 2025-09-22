@@ -5,18 +5,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use git::{
-    DEFAULT_REMOTE,
-    GitBranchStatus,
-    after_text,
-    git_branch_status,
-    git_checkout_main,
-    git_fetch,
-    git_get_upstream,
-    git_remote_main,
-    git_sha,
-    is_ancestor,
-    run_git_status,
-    shas_match,
+    DEFAULT_REMOTE, GitBranchStatus, after_text, git_branch_status, git_checkout_main, git_fetch,
+    git_get_upstream, git_remote_main, git_sha, is_ancestor, run_git_status, shas_match,
 };
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
@@ -51,7 +41,7 @@ enum Command {
         fetch: bool,
     },
     /// Open the git-stack state file in an editor for manual editing.
-    EditState,
+    Edit,
     /// Restack your active branch and all branches in its related stack.
     Restack {
         /// The name of the branch to restack.
@@ -153,7 +143,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Checkout { branch_name }) => {
             state.checkout(&repo, current_branch, current_upstream, branch_name)
         }
-        Some(Command::EditState) => state.edit_config(),
+        Some(Command::Edit) => state.edit_config(),
         Some(Command::Restack {
             branch,
             fetch,
