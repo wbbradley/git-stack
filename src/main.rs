@@ -404,7 +404,7 @@ fn restack(
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let plan = state.plan_restack(repo, &restack_branch)?;
 
-    tracing::debug!(?plan, "Restacking branches with plan...");
+    tracing::debug!(?plan, "Restacking branches with plan. Checking out main...");
     git_checkout_main(None)?;
     for RestackStep { parent, branch } in plan {
         tracing::debug!(
@@ -512,7 +512,7 @@ fn restack(
             }
         }
     }
-    tracing::info!("Restoring starting branch '{}'...", restack_branch);
+    tracing::debug!("Restoring starting branch '{}'...", restack_branch);
     ensure!(
         run_git_status(&["checkout", "-q", &orig_branch], None)?.success(),
         "git checkout {} failed",
