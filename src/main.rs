@@ -101,6 +101,15 @@ enum Command {
         /// The name of the branch to delete.
         branch_name: String,
     },
+    /// Clean up branches from the git-stack tree that no longer exist locally.
+    Cleanup {
+        /// Show what would be cleaned up without actually removing anything.
+        #[arg(long, short, default_value_t = false)]
+        dry_run: bool,
+        /// Clean up all trees in the config, removing invalid repos and cleaning branches.
+        #[arg(long, short, default_value_t = false)]
+        all: bool,
+    },
 }
 
 fn main() {
@@ -172,6 +181,9 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Status { fetch }) => status(state, &repo, &current_branch, fetch),
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
+        Some(Command::Cleanup { dry_run, all }) => {
+            state.cleanup_missing_branches(&repo, dry_run, all)
+        }
         Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
         Some(Command::Log { branch }) => show_log(state, &repo, &branch.unwrap_or(current_branch)),
         Some(Command::Note { edit, branch }) => {

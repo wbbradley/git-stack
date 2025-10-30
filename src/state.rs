@@ -36,7 +36,7 @@ pub enum StackMethod {
     Merge,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     /// The name of the branch or ref.
     pub name: String,
@@ -235,6 +235,161 @@ impl State {
         );
 
         self.save_state()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_missing_branches(
+        &mut self,
+        repo: &str,
+        dry_run: bool,
+        all: bool,
+    ) -> Result<()> {
+        if all {
+            self.cleanup_all_trees(dry_run)
+        } else {
+            self.cleanup_single_tree(repo, dry_run)
+        }
+    }
+
+    fn cleanup_single_tree(&mut self, repo: &str, dry_run: bool) -> Result<()> {
+        let Some(tree) = self.trees.get_mut(repo) else {
+            println!("No stack tree found for repo {}", repo.yellow());
+            return Ok(());
+        };
+
+        let mut removed_branches = Vec::new();
+        let mut remounted_branches = Vec::new();
+
+        // Recursively cleanup the tree
+        cleanup_tree_recursive(tree, &mut removed_branches, &mut remounted_branches);
+
+        if removed_branches.is_empty() {
+            println!("No missing branches found. Tree is clean.");
+            return Ok(());
+        }
+
+        // Print summary
+        println!("Cleanup summary for {}:", repo.yellow());
+        println!();
+        println!("Removed branches (no longer exist locally):");
+        for branch_name in &removed_branches {
+            println!("  - {}", branch_name.red());
+        }
+
+        if !remounted_branches.is_empty() {
+            println!();
+            println!("Re-mounted branches (moved to grandparent):");
+            for (branch_name, new_parent) in &remounted_branches {
+                println!(
+                    "  - {} {} {}",
+                    branch_name.yellow(),
+                    "→".truecolor(90, 90, 90),
+                    new_parent.green()
+                );
+            }
+        }
+
+        if dry_run {
+            println!();
+            println!("{}", "Dry run mode: no changes were saved.".bright_blue());
+        } else {
+            self.save_state()?;
+            println!();
+            println!("{}", "Changes saved.".green());
+        }
+
+        Ok(())
+    }
+
+    fn cleanup_all_trees(&mut self, dry_run: bool) -> Result<()> {
+        let mut repos_to_remove = Vec::new();
+        let mut total_removed_branches = 0;
+        let mut total_remounted_branches = 0;
+
+        // Collect all repo paths first to avoid borrow checker issues
+        let repo_paths: Vec<String> = self.trees.keys().cloned().collect();
+
+        println!("Scanning {} repositories...", repo_paths.len());
+        println!();
+
+        for repo_path in &repo_paths {
+            // Check if the directory exists
+            if !std::path::Path::new(repo_path).exists() {
+                println!(
+                    "{}: {}",
+                    repo_path.yellow(),
+                    "directory does not exist".red()
+                );
+                repos_to_remove.push(repo_path.clone());
+                continue;
+            }
+
+            // Check if git works in this directory
+            let original_dir = std::env::current_dir()?;
+            let git_works = std::env::set_current_dir(repo_path).is_ok()
+                && run_git(&["rev-parse", "--git-dir"]).is_ok();
+
+            // Always restore the original directory
+            std::env::set_current_dir(original_dir)?;
+
+            if !git_works {
+                println!("{}: {}", repo_path.yellow(), "git is not working".red());
+                repos_to_remove.push(repo_path.clone());
+                continue;
+            }
+
+            // Change to the repo directory and clean up branches
+            let original_dir = std::env::current_dir()?;
+            std::env::set_current_dir(repo_path)?;
+
+            let tree = self.trees.get_mut(repo_path).unwrap();
+            let mut removed_branches = Vec::new();
+            let mut remounted_branches = Vec::new();
+
+            cleanup_tree_recursive(tree, &mut removed_branches, &mut remounted_branches);
+
+            std::env::set_current_dir(original_dir)?;
+
+            if !removed_branches.is_empty() || !remounted_branches.is_empty() {
+                println!(
+                    "{}: cleaned up {} branches, re-mounted {}",
+                    repo_path.yellow(),
+                    removed_branches.len().to_string().red(),
+                    remounted_branches.len().to_string().green()
+                );
+                total_removed_branches += removed_branches.len();
+                total_remounted_branches += remounted_branches.len();
+            } else {
+                println!("{}: {}", repo_path.yellow(), "clean".green());
+            }
+        }
+
+        // Remove invalid repos
+        if !repos_to_remove.is_empty() {
+            println!();
+            println!("Removing {} invalid repositories:", repos_to_remove.len());
+            for repo_path in &repos_to_remove {
+                println!("  - {}", repo_path.red());
+                self.trees.remove(repo_path);
+            }
+        }
+
+        println!();
+        println!("Summary:");
+        println!("  Repositories scanned: {}", repo_paths.len());
+        println!("  Invalid repositories removed: {}", repos_to_remove.len());
+        println!("  Branches removed: {}", total_removed_branches);
+        println!("  Branches re-mounted: {}", total_remounted_branches);
+
+        if dry_run {
+            println!();
+            println!("{}", "Dry run mode: no changes were saved.".bright_blue());
+        } else {
+            self.save_state()?;
+            println!();
+            println!("{}", "Changes saved.".green());
+        }
 
         Ok(())
     }
@@ -520,6 +675,46 @@ fn is_branch_mentioned_in_tree(branch_name: &str, branch: &Branch) -> bool {
         }
     }
     false
+}
+
+/// Recursively cleans up missing branches from the tree.
+/// Returns the number of branches cleaned up at this level.
+fn cleanup_tree_recursive(
+    branch: &mut Branch,
+    removed_branches: &mut Vec<String>,
+    remounted_branches: &mut Vec<(String, String)>,
+) {
+    // First, recursively process all children
+    for child in &mut branch.branches {
+        cleanup_tree_recursive(child, removed_branches, remounted_branches);
+    }
+
+    // Collect branches to remove and their children to adopt
+    let mut branches_to_adopt: Vec<Branch> = Vec::new();
+    let mut indices_to_remove = Vec::new();
+
+    for (index, child) in branch.branches.iter().enumerate() {
+        if !git_branch_exists(&child.name) {
+            // This branch doesn't exist locally, mark it for removal
+            removed_branches.push(child.name.clone());
+
+            // Collect its children to be adopted by the current branch
+            for grandchild in &child.branches {
+                branches_to_adopt.push(grandchild.clone());
+                remounted_branches.push((grandchild.name.clone(), branch.name.clone()));
+            }
+
+            indices_to_remove.push(index);
+        }
+    }
+
+    // Remove missing branches (in reverse order to maintain indices)
+    for &index in indices_to_remove.iter().rev() {
+        branch.branches.remove(index);
+    }
+
+    // Add adopted branches
+    branch.branches.extend(branches_to_adopt);
 }
 fn find_stack_with_branch<'a>(
     stacks: &'a mut [Vec<String>],
