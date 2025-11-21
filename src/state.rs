@@ -1,8 +1,7 @@
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
-    default,
-    fs,
+    default, fs,
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -14,14 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     git::{
-        DEFAULT_REMOTE,
-        GitTrunk,
-        after_text,
-        git_branch_exists,
-        git_remote_main,
-        git_sha,
-        git_trunk,
-        is_ancestor,
+        DEFAULT_REMOTE, GitTrunk, after_text, git_branch_exists, git_remote_main, git_sha,
+        git_trunk, is_ancestor,
     },
     run_git,
 };
@@ -587,6 +580,78 @@ impl State {
             .status()?;
         Ok(())
     }
+
+    /// Try to auto-mount the current branch if it's not in the tree.
+    /// Returns Ok(true) if the branch was auto-mounted, Ok(false) if it was already in the tree,
+    /// or Err if auto-mount failed.
+    pub(crate) fn try_auto_mount(&mut self, repo: &str, branch_name: &str) -> Result<bool> {
+        // Check if the branch is already in the tree
+        if self.branch_exists_in_tree(repo, branch_name) {
+            return Ok(false);
+        }
+
+        // Check if this branch exists in git
+        if !git_branch_exists(branch_name) {
+            bail!("Branch {branch_name} does not exist in git");
+        }
+
+        // Get the tree for this repo
+        let Some(tree) = self.get_tree(repo) else {
+            bail!("No tree found for repo {repo}");
+        };
+
+        // Collect all mounted branches
+        let mut all_branches = Vec::new();
+        collect_all_branches(tree, &mut all_branches);
+
+        // Find all mounted branches that are ancestors of the current branch
+        let mut ancestor_branches = Vec::new();
+        for mounted_branch in &all_branches {
+            if let Ok(true) = is_ancestor(mounted_branch, branch_name) {
+                ancestor_branches.push(mounted_branch.clone());
+            }
+        }
+
+        // Determine the parent branch
+        let parent_branch = if ancestor_branches.is_empty() {
+            // No ancestors found, default to the trunk/main branch
+            let trunk = git_trunk()?;
+            tracing::info!(
+                "No mounted ancestor branches found for {}. Defaulting to trunk branch {}.",
+                branch_name,
+                trunk.main_branch
+            );
+            trunk.main_branch
+        } else {
+            // Find the deepest ancestor branch (highest depth in the tree)
+            let mut deepest_branch = None;
+            let mut max_depth = 0;
+
+            for ancestor in &ancestor_branches {
+                if let Some(depth) = get_branch_depth(tree, ancestor, 0)
+                    && depth >= max_depth
+                {
+                    max_depth = depth;
+                    deepest_branch = Some(ancestor.clone());
+                }
+            }
+
+            deepest_branch
+                .ok_or_else(|| anyhow!("Failed to determine parent branch for auto-mount"))?
+        };
+
+        tracing::info!("Auto-mounting branch {} on {}", branch_name, parent_branch);
+        println!(
+            "Auto-mounting branch {} on {}...",
+            branch_name.yellow(),
+            parent_branch.yellow()
+        );
+
+        // Mount the branch
+        self.mount(repo, branch_name, Some(parent_branch))?;
+
+        Ok(true)
+    }
 }
 
 fn get_path<'a>(branch: &'a Branch, target_branch: &str, path: &mut Vec<&'a Branch>) -> bool {
@@ -729,6 +794,27 @@ fn find_stack_with_branch<'a>(
         "No stack found for branch {}",
         current_branch
     ))
+}
+
+/// Collect all branch names from the tree recursively.
+fn collect_all_branches(branch: &Branch, branches: &mut Vec<String>) {
+    branches.push(branch.name.clone());
+    for child in &branch.branches {
+        collect_all_branches(child, branches);
+    }
+}
+
+/// Calculate the depth of a branch in the tree. Returns None if the branch is not found.
+fn get_branch_depth(tree: &Branch, target: &str, current_depth: usize) -> Option<usize> {
+    if tree.name == target {
+        return Some(current_depth);
+    }
+    for child in &tree.branches {
+        if let Some(depth) = get_branch_depth(child, target, current_depth + 1) {
+            return Some(depth);
+        }
+    }
+    None
 }
 
 fn get_xdg_path() -> anyhow::Result<PathBuf> {

@@ -167,34 +167,45 @@ fn inner_main() -> Result<()> {
             branch,
             fetch,
             push,
-        }) => restack(
-            state,
-            &repo,
-            run_version,
-            branch,
-            current_branch,
-            fetch,
-            push,
-        ),
+        }) => {
+            let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
+            state.try_auto_mount(&repo, &restack_branch)?;
+            restack(state, &repo, run_version, branch, current_branch, fetch, push)
+        }
         Some(Command::Mount { parent_branch }) => {
             state.mount(&repo, &current_branch, parent_branch)
         }
-        Some(Command::Status { fetch }) => status(state, &repo, &current_branch, fetch),
+        Some(Command::Status { fetch }) => {
+            state.try_auto_mount(&repo, &current_branch)?;
+            status(state, &repo, &current_branch, fetch)
+        }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
             state.cleanup_missing_branches(&repo, dry_run, all)
         }
-        Some(Command::Diff { branch }) => diff(state, &repo, &branch.unwrap_or(current_branch)),
-        Some(Command::Log { branch }) => show_log(state, &repo, &branch.unwrap_or(current_branch)),
+        Some(Command::Diff { branch }) => {
+            let branch_to_diff = branch.clone().unwrap_or_else(|| current_branch.clone());
+            state.try_auto_mount(&repo, &branch_to_diff)?;
+            diff(state, &repo, &branch.unwrap_or(current_branch))
+        }
+        Some(Command::Log { branch }) => {
+            let branch_to_log = branch.clone().unwrap_or_else(|| current_branch.clone());
+            state.try_auto_mount(&repo, &branch_to_log)?;
+            show_log(state, &repo, &branch.unwrap_or(current_branch))
+        }
         Some(Command::Note { edit, branch }) => {
             let branch = branch.unwrap_or(current_branch);
+            state.try_auto_mount(&repo, &branch)?;
             if edit {
                 state.edit_note(&repo, &branch)
             } else {
                 state.show_note(&repo, &branch)
             }
         }
-        None => status(state, &repo, &current_branch, false),
+        None => {
+            state.try_auto_mount(&repo, &current_branch)?;
+            status(state, &repo, &current_branch, false)
+        }
     }
 }
 

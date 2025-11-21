@@ -2,6 +2,13 @@
 name = "git-stack"
 version = "0.1.0"
 edition = "2024"
+license = "GPL2"
+keywords = ["git", "stack", "vcs"]
+categories = ["development-tools"]
+description = "A git stacking CLI for basic stacked diff management."
+readme = "README.md"
+homepage = "https://github.com/wbbradley/git-stack"
+repository = "https://github.com/wbbradley/git-stack"
 
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
