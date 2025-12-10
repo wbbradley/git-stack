@@ -170,7 +170,15 @@ fn inner_main() -> Result<()> {
         }) => {
             let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
             state.try_auto_mount(&repo, &restack_branch)?;
-            restack(state, &repo, run_version, branch, current_branch, fetch, push)
+            restack(
+                state,
+                &repo,
+                run_version,
+                branch,
+                current_branch,
+                fetch,
+                push,
+            )
         }
         Some(Command::Mount { parent_branch }) => {
             state.mount(&repo, &current_branch, parent_branch)
@@ -466,9 +474,11 @@ fn restack(
 
             match branch.stack_method {
                 StackMethod::ApplyMerge => {
+                    // Check if we can use the fast format-patch/am approach:
+                    // requires an LKG parent that is still an ancestor of the branch
                     if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
-                        tracing::info!("LKG parent: {}", lkg_parent);
                         if is_ancestor(lkg_parent, &source)? {
+                            tracing::info!("LKG parent: {}", lkg_parent);
                             let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
                             tracing::info!("Creating patch {}", &patch_rev);
                             // The branch is still on top of the LKG parent. Let's create a format-patch of the
@@ -499,32 +509,27 @@ fn restack(
                                 git_push(&branch.name)?;
                             }
                             continue;
-                        } else {
-                            tracing::info!(
-                                "Branch '{}' is not on top of the LKG parent. Using `git rebase`...",
-                                branch.name
-                            );
-                            run_git(&["checkout", &branch.name])?;
-                            let rebased = run_git_status(&["rebase", &parent], None)?.success();
-
-                            if !rebased {
-                                eprintln!(
-                                    "{} did not complete automatically.",
-                                    "Rebase".blue().bold()
-                                );
-                                eprintln!("Run `git mergetool` to resolve conflicts.");
-                                eprintln!(
-                                    "Once you have finished the {}, re-run this script.",
-                                    "rebase".blue().bold()
-                                );
-                                std::process::exit(1);
-                            }
-                            if push {
-                                git_push(&branch.name)?;
-                            }
-                            tracing::info!("Rebase completed successfully. Continuing...");
                         }
                     }
+
+                    // Fall back to regular rebase (no LKG parent, or branch diverged from LKG)
+                    tracing::info!("Using `git rebase` for '{}'...", branch.name);
+                    run_git(&["checkout", &branch.name])?;
+                    let rebased = run_git_status(&["rebase", &parent], None)?.success();
+
+                    if !rebased {
+                        eprintln!("{} did not complete automatically.", "Rebase".blue().bold());
+                        eprintln!("Run `git mergetool` to resolve conflicts.");
+                        eprintln!(
+                            "Once you have finished the {}, re-run this script.",
+                            "rebase".blue().bold()
+                        );
+                        std::process::exit(1);
+                    }
+                    if push {
+                        git_push(&branch.name)?;
+                    }
+                    tracing::info!("Rebase completed successfully. Continuing...");
                 }
                 StackMethod::Merge => {
                     run_git(&["checkout", &branch.name])

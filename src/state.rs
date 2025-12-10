@@ -1,7 +1,8 @@
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
-    default, fs,
+    default,
+    fs,
     path::PathBuf,
     process::Command,
     rc::Rc,
@@ -13,8 +14,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     git::{
-        DEFAULT_REMOTE, GitTrunk, after_text, git_branch_exists, git_remote_main, git_sha,
-        git_trunk, is_ancestor,
+        DEFAULT_REMOTE,
+        GitTrunk,
+        after_text,
+        git_branch_exists,
+        git_remote_main,
+        git_sha,
+        git_trunk,
+        is_ancestor,
     },
     run_git,
 };
