@@ -10,6 +10,7 @@ use git::{
     after_text,
     git_branch_status,
     git_checkout_main,
+    git_diff_stats,
     git_fetch,
     git_get_upstream,
     git_remote_main,
@@ -33,7 +34,7 @@ const CREATE_BACKUP: bool = false;
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
-    #[arg(long, short, help = "Enable verbose output")]
+    #[arg(long, short, global = true, help = "Enable verbose output")]
     verbose: bool,
 
     /// Subcommand to run.
@@ -185,7 +186,7 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Status { fetch }) => {
             state.try_auto_mount(&repo, &current_branch)?;
-            status(state, &repo, &current_branch, fetch)
+            status(state, &repo, &current_branch, fetch, args.verbose)
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
@@ -212,7 +213,7 @@ fn inner_main() -> Result<()> {
         }
         None => {
             state.try_auto_mount(&repo, &current_branch)?;
-            status(state, &repo, &current_branch, false)
+            status(state, &repo, &current_branch, false, args.verbose)
         }
     }
 }
@@ -279,6 +280,7 @@ fn recur_tree(
     depth: usize,
     orig_branch: &str,
     parent_branch: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     let Ok(branch_status) = git_branch_status(parent_branch, &branch.name).with_context(|| {
         format!(
@@ -301,84 +303,116 @@ fn recur_tree(
         print!("{}", "┃ ".truecolor(55, 55, 50));
     }
 
-    println!(
-        "{} ({}) {}{}{}{}",
-        match (is_current_branch, branch_status.is_descendent) {
-            (true, true) => branch.name.truecolor(142, 192, 124).bold(),
-            (true, false) => branch.name.truecolor(215, 153, 33).bold(),
-            (false, true) => branch.name.truecolor(142, 192, 124),
-            (false, false) => branch.name.truecolor(215, 153, 33),
-        },
-        branch_status.sha[..8].truecolor(215, 153, 33),
-        {
-            let details: String = if branch_status.exists {
-                if branch_status.is_descendent {
+    // Branch name coloring: green for synced, red for diverged, bold for current branch
+    let branch_name_colored = match (is_current_branch, branch_status.is_descendent) {
+        (true, true) => branch.name.truecolor(142, 192, 124).bold(),
+        (true, false) => branch.name.red().bold(),
+        (false, true) => branch.name.truecolor(142, 192, 124),
+        (false, false) => branch.name.red(),
+    };
+
+    // Get diff stats from LKG ancestor to current branch
+    let diff_stats = if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
+        match git_diff_stats(lkg_parent, &branch_status.sha) {
+            Ok((adds, dels)) => format!(
+                " {} {}",
+                format!("+{}", adds).green(),
+                format!("-{}", dels).red()
+            ),
+            Err(_) => String::new(), // Silently skip on error
+        }
+    } else {
+        String::new() // No LKG = no stats (e.g., trunk root)
+    };
+
+    if verbose {
+        println!(
+            "{}{} ({}) {}{}{}{}",
+            branch_name_colored,
+            diff_stats,
+            branch_status.sha[..8].truecolor(215, 153, 33),
+            {
+                let details: String = if branch_status.exists {
+                    if branch_status.is_descendent {
+                        format!(
+                            "{} {}",
+                            "is stacked on".truecolor(90, 120, 87),
+                            branch_status.parent_branch.yellow()
+                        )
+                    } else {
+                        format!(
+                            "{} {}",
+                            "diverges from".red(),
+                            branch_status.parent_branch.yellow()
+                        )
+                    }
+                } else {
+                    "does not exist!".bright_red().to_string()
+                };
+                details
+            },
+            {
+                if let Some(upstream_status) = branch_status.upstream_status {
                     format!(
-                        "{} {}",
-                        "is stacked on".truecolor(90, 120, 87),
-                        branch_status.parent_branch.yellow()
+                        " (upstream {} is {})",
+                        upstream_status.symbolic_name.truecolor(88, 88, 88),
+                        if upstream_status.synced {
+                            "synced".truecolor(142, 192, 124)
+                        } else {
+                            "not synced".bright_red()
+                        }
                     )
                 } else {
-                    format!(
-                        "{} {}",
-                        "diverges from".red(),
-                        branch_status.parent_branch.yellow()
-                    )
+                    format!(" ({})", "no upstream".truecolor(215, 153, 33))
                 }
-            } else {
-                "does not exist!".bright_red().to_string()
-            };
-            details
-        },
-        {
-            if let Some(upstream_status) = branch_status.upstream_status {
-                format!(
-                    " (upstream {} is {})",
-                    upstream_status.symbolic_name.truecolor(88, 88, 88),
-                    if upstream_status.synced {
-                        "synced".truecolor(142, 192, 124)
-                    } else {
-                        "not synced".bright_red()
-                    }
-                )
-            } else {
-                format!(" ({})", "no upstream".truecolor(215, 153, 33))
-            }
-        },
-        {
-            if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
-                format!(" (lkg parent {})", lkg_parent[..8].truecolor(215, 153, 33))
-            } else {
-                String::new()
-            }
-        },
-        match branch.stack_method {
-            StackMethod::ApplyMerge => " (apply-merge)".truecolor(142, 192, 124),
-            StackMethod::Merge => " (merge)".truecolor(142, 192, 124),
-        },
-    );
-    if let Some(note) = &branch.note {
-        print!("  ");
-        for _ in 0..depth {
-            print!("{}", "┃ ".truecolor(55, 55, 50));
-        }
-
-        let first_line = note.lines().next().unwrap_or("");
-        println!(
-            "  {} {}",
-            "›".truecolor(55, 55, 50),
-            if is_current_branch {
-                first_line.bright_blue().bold()
-            } else {
-                first_line.blue()
-            }
+            },
+            {
+                if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
+                    format!(" (lkg parent {})", lkg_parent[..8].truecolor(215, 153, 33))
+                } else {
+                    String::new()
+                }
+            },
+            match branch.stack_method {
+                StackMethod::ApplyMerge => " (apply-merge)".truecolor(142, 192, 124),
+                StackMethod::Merge => " (merge)".truecolor(142, 192, 124),
+            },
         );
+        if let Some(note) = &branch.note {
+            print!("  ");
+            for _ in 0..depth {
+                print!("{}", "┃ ".truecolor(55, 55, 50));
+            }
+
+            let first_line = note.lines().next().unwrap_or("");
+            println!(
+                "  {} {}",
+                "›".truecolor(55, 55, 50),
+                if is_current_branch {
+                    first_line.bright_blue().bold()
+                } else {
+                    first_line.blue()
+                }
+            );
+        }
+    } else {
+        println!("{}{}", branch_name_colored, diff_stats);
     }
 
     let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
+    // Pre-compute is_ancestor results to avoid repeated git merge-base calls during sorting
+    let ancestor_cache: std::collections::HashMap<&str, bool> = branches_sorted
+        .iter()
+        .map(|b| {
+            (
+                b.name.as_str(),
+                is_ancestor(&b.name, orig_branch).unwrap_or(false),
+            )
+        })
+        .collect();
     branches_sorted.sort_by(|&a, &b| {
-        let a_is_ancestor = is_ancestor(&a.name, orig_branch).unwrap_or(false);
-        let b_is_ancestor = is_ancestor(&b.name, orig_branch).unwrap_or(false);
+        let a_is_ancestor = ancestor_cache.get(a.name.as_str()).copied().unwrap_or(false);
+        let b_is_ancestor = ancestor_cache.get(b.name.as_str()).copied().unwrap_or(false);
         match (a_is_ancestor, b_is_ancestor) {
             (true, true) => a.name.cmp(&b.name),
             (true, false) => std::cmp::Ordering::Less,
@@ -387,25 +421,23 @@ fn recur_tree(
         }
     });
     for child in branches_sorted {
-        recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()))?;
+        recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()), verbose)?;
     }
     Ok(())
 }
 
-fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool) -> Result<()> {
+fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool, verbose: bool) -> Result<()> {
     if fetch {
         git_fetch()?;
     }
-    let trunk = state.ensure_trunk(repo)?;
+    // ensure_trunk creates the tree if it doesn't exist
+    let _trunk = state.ensure_trunk(repo)?;
 
-    let Some(tree) = state.get_tree_mut(repo) else {
-        eprintln!(
-            "No stack tree found for repo {repo}.",
-            repo = repo.truecolor(178, 178, 218)
-        );
-        return Ok(());
-    };
-    recur_tree(tree, 0, orig_branch, None)?;
+    // Auto-cleanup any missing branches before displaying the tree
+    state.auto_cleanup_missing_branches(repo)?;
+
+    let tree = state.get_tree_mut(repo).expect("tree exists after ensure_trunk");
+    recur_tree(tree, 0, orig_branch, None, verbose)?;
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
             "The current branch {} is not in the stack tree.",

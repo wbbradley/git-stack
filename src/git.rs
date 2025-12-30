@@ -127,6 +127,37 @@ pub(crate) fn git_sha(branch: &str) -> Result<String> {
     run_git(&["rev-parse", branch])?.output_or("No sha found")
 }
 
+/// Get diff stats (additions, deletions) between two commits.
+/// Runs: git log --numstat --pretty="" <base>..<head>
+pub(crate) fn git_diff_stats(base: &str, head: &str) -> Result<(usize, usize)> {
+    let start = std::time::Instant::now();
+    let range = format!("{}..{}", base, head);
+    let output = run_git(&["log", "--numstat", "--pretty=", &range])?;
+
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+
+    for line in output.stdout.lines() {
+        // Format: "additions\tdeletions\tfilename" or "-\t-\tbinary"
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2
+            && let (Ok(add), Ok(del)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>())
+        {
+            additions += add;
+            deletions += del;
+        }
+        // Skip binary files (shown as "-\t-")
+    }
+
+    tracing::debug!(
+        "git_diff_stats({}, {}) took {:?}",
+        base,
+        head,
+        start.elapsed()
+    );
+    Ok((additions, deletions))
+}
+
 pub(crate) fn git_branch_status(
     parent_branch: Option<&str>,
     branch: &str,

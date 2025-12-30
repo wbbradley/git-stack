@@ -252,6 +252,44 @@ impl State {
         }
     }
 
+    /// Auto-cleanup missing branches silently during status display.
+    /// Returns true if any branches were cleaned up.
+    pub(crate) fn auto_cleanup_missing_branches(&mut self, repo: &str) -> Result<bool> {
+        let Some(tree) = self.trees.get_mut(repo) else {
+            return Ok(false);
+        };
+
+        let mut removed_branches = Vec::new();
+        let mut remounted_branches = Vec::new();
+
+        cleanup_tree_recursive(tree, &mut removed_branches, &mut remounted_branches);
+
+        if removed_branches.is_empty() {
+            return Ok(false);
+        }
+
+        // Print brief summary of auto-cleanup
+        for branch_name in &removed_branches {
+            println!(
+                "{} {} (branch no longer exists)",
+                "Auto-removed:".truecolor(90, 90, 90),
+                branch_name.red()
+            );
+        }
+        for (branch_name, new_parent) in &remounted_branches {
+            println!(
+                "{} {} {} {}",
+                "Auto-remounted:".truecolor(90, 90, 90),
+                branch_name.yellow(),
+                "→".truecolor(90, 90, 90),
+                new_parent.green()
+            );
+        }
+        println!();
+
+        Ok(true)
+    }
+
     fn cleanup_single_tree(&mut self, repo: &str, dry_run: bool) -> Result<()> {
         let Some(tree) = self.trees.get_mut(repo) else {
             println!("No stack tree found for repo {}", repo.yellow());
@@ -592,6 +630,9 @@ impl State {
     /// Returns Ok(true) if the branch was auto-mounted, Ok(false) if it was already in the tree,
     /// or Err if auto-mount failed.
     pub(crate) fn try_auto_mount(&mut self, repo: &str, branch_name: &str) -> Result<bool> {
+        // Ensure the tree exists for this repo
+        self.ensure_trunk(repo)?;
+
         // Check if the branch is already in the tree
         if self.branch_exists_in_tree(repo, branch_name) {
             return Ok(false);
@@ -602,10 +643,8 @@ impl State {
             bail!("Branch {branch_name} does not exist in git");
         }
 
-        // Get the tree for this repo
-        let Some(tree) = self.get_tree(repo) else {
-            bail!("No tree found for repo {repo}");
-        };
+        // Get the tree for this repo (guaranteed to exist after ensure_trunk)
+        let tree = self.get_tree(repo).expect("tree exists after ensure_trunk");
 
         // Collect all mounted branches
         let mut all_branches = Vec::new();
