@@ -13,16 +13,8 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    git::{
-        DEFAULT_REMOTE,
-        GitTrunk,
-        after_text,
-        git_branch_exists,
-        git_sha,
-        git_trunk,
-        is_ancestor,
-    },
-    git2_ops::GitRepo,
+    git::{GitTrunk, after_text, git_branch_exists, git_trunk},
+    git2_ops::{DEFAULT_REMOTE, GitRepo},
     run_git,
 };
 
@@ -120,13 +112,13 @@ impl State {
     /// branch.
     pub fn checkout(
         &mut self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
         current_branch: String,
         current_upstream: Option<String>,
         branch_name: String,
     ) -> Result<()> {
-        let trunk = git_trunk(git)?;
+        let trunk = git_trunk(git_repo)?;
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
         // added it yet.
         self.trees
@@ -136,7 +128,7 @@ impl State {
 
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
 
-        if git_branch_exists(git, &branch_name) {
+        if git_branch_exists(git_repo, &branch_name) {
             if !branch_exists_in_tree {
                 tracing::warn!(
                     "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
@@ -158,7 +150,7 @@ impl State {
 
         branch.branches.push(Branch::new(
             branch_name.clone(),
-            git_sha(git, &current_branch).ok(),
+            git_sha(git_repo, &current_branch).ok(),
         ));
 
         // Actually create the git branch.
@@ -200,12 +192,12 @@ impl State {
 
     pub(crate) fn plan_restack(
         &'_ self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
         starting_branch: &str,
     ) -> Result<Vec<RestackStep<'_>>> {
         tracing::debug!("Planning restack for {starting_branch}");
-        let trunk = git_trunk(git)?;
+        let trunk = git_trunk(git_repo)?;
         // Find all the descendents of the starting branch.
         // Traverse the tree from the starting branch to the root,
         let mut path: Vec<&Branch> = vec![];
@@ -243,7 +235,7 @@ impl State {
 
     pub(crate) fn cleanup_missing_branches(
         &mut self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
         dry_run: bool,
         all: bool,
@@ -251,7 +243,7 @@ impl State {
         if all {
             self.cleanup_all_trees(dry_run)
         } else {
-            self.cleanup_single_tree(git, repo, dry_run)
+            self.cleanup_single_tree(git_repo, repo, dry_run)
         }
     }
 
@@ -259,7 +251,7 @@ impl State {
     /// Returns true if any branches were cleaned up.
     pub(crate) fn auto_cleanup_missing_branches(
         &mut self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
     ) -> Result<bool> {
         let Some(tree) = self.trees.get_mut(repo) else {
@@ -269,7 +261,12 @@ impl State {
         let mut removed_branches = Vec::new();
         let mut remounted_branches = Vec::new();
 
-        cleanup_tree_recursive(git, tree, &mut removed_branches, &mut remounted_branches);
+        cleanup_tree_recursive(
+            git_repo,
+            tree,
+            &mut removed_branches,
+            &mut remounted_branches,
+        );
 
         if removed_branches.is_empty() {
             return Ok(false);
@@ -297,7 +294,7 @@ impl State {
         Ok(true)
     }
 
-    fn cleanup_single_tree(&mut self, git: &GitRepo, repo: &str, dry_run: bool) -> Result<()> {
+    fn cleanup_single_tree(&mut self, git_repo: &GitRepo, repo: &str, dry_run: bool) -> Result<()> {
         let Some(tree) = self.trees.get_mut(repo) else {
             println!("No stack tree found for repo {}", repo.yellow());
             return Ok(());
@@ -307,7 +304,12 @@ impl State {
         let mut remounted_branches = Vec::new();
 
         // Recursively cleanup the tree
-        cleanup_tree_recursive(git, tree, &mut removed_branches, &mut remounted_branches);
+        cleanup_tree_recursive(
+            git_repo,
+            tree,
+            &mut removed_branches,
+            &mut remounted_branches,
+        );
 
         if removed_branches.is_empty() {
             println!("No missing branches found. Tree is clean.");
@@ -452,8 +454,8 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn ensure_trunk(&mut self, git: &GitRepo, repo: &str) -> Result<GitTrunk> {
-        let trunk = git_trunk(git)?;
+    pub(crate) fn ensure_trunk(&mut self, git_repo: &GitRepo, repo: &str) -> Result<GitTrunk> {
+        let trunk = git_trunk(git_repo)?;
         // The branch might not exist in git, let's create it, and add it to the tree.
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
         // added it yet.
@@ -465,12 +467,12 @@ impl State {
 
     pub(crate) fn mount(
         &mut self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
         branch_name: &str,
         parent_branch: Option<String>,
     ) -> Result<()> {
-        let trunk = self.ensure_trunk(git, repo)?;
+        let trunk = self.ensure_trunk(git_repo, repo)?;
 
         if trunk.main_branch == branch_name {
             bail!(
@@ -514,7 +516,7 @@ impl State {
         if let Some(new_parent_branch) = new_parent_branch {
             new_parent_branch.branches.push(Branch::new(
                 branch_name.to_string(),
-                git_sha(git, &parent_branch).ok(),
+                git_sha(git_repo, &parent_branch).ok(),
             ));
         } else {
             bail!("Parent branch {parent_branch} not found in the git-stack tree.");
@@ -543,11 +545,11 @@ impl State {
             .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
     }
 
-    pub(crate) fn refresh_lkgs(&mut self, git: &GitRepo, repo: &str) -> Result<()> {
+    pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
         // For each sub-branch in the tree, check if the parent
 
         tracing::debug!("Refreshing lkgs for all branches...");
-        let trunk = git_trunk(git)?;
+        let trunk = git_trunk(git_repo)?;
 
         let mut parent_lkgs: HashMap<String, Option<String>> = HashMap::default();
 
@@ -558,14 +560,14 @@ impl State {
             if let Some(parent) = parent {
                 let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
                 if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
-                    if is_ancestor(git, lkg_parent, &branch)? {
+                    if is_ancestor(git_repo, lkg_parent, &branch)? {
                         parent_lkgs.insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
                     } else {
                         parent_lkgs.insert(tree_branch.name.clone(), None);
                     }
                 }
-                if is_ancestor(git, &parent, &branch).unwrap_or(false)
-                    && let Ok(new_lkg_parent) = git_sha(git, &parent)
+                if is_ancestor(git_repo, &parent, &branch).unwrap_or(false)
+                    && let Ok(new_lkg_parent) = git_sha(git_repo, &parent)
                 {
                     tracing::debug!(
                         lkg_parent = ?new_lkg_parent,
@@ -652,12 +654,12 @@ impl State {
     /// or Err if auto-mount failed.
     pub(crate) fn try_auto_mount(
         &mut self,
-        git: &GitRepo,
+        git_repo: &GitRepo,
         repo: &str,
         branch_name: &str,
     ) -> Result<bool> {
         // Ensure the tree exists for this repo
-        self.ensure_trunk(git, repo)?;
+        self.ensure_trunk(git_repo, repo)?;
 
         // Check if the branch is already in the tree
         if self.branch_exists_in_tree(repo, branch_name) {
@@ -665,7 +667,7 @@ impl State {
         }
 
         // Check if this branch exists in git
-        if !git_branch_exists(git, branch_name) {
+        if !git_branch_exists(git_repo, branch_name) {
             bail!("Branch {branch_name} does not exist in git");
         }
 
@@ -679,7 +681,7 @@ impl State {
         // Find all mounted branches that are ancestors of the current branch
         let mut ancestor_branches = Vec::new();
         for mounted_branch in &all_branches {
-            if let Ok(true) = is_ancestor(git, mounted_branch, branch_name) {
+            if let Ok(true) = is_ancestor(git_repo, mounted_branch, branch_name) {
                 ancestor_branches.push(mounted_branch.clone());
             }
         }
@@ -687,7 +689,7 @@ impl State {
         // Determine the parent branch
         let parent_branch = if ancestor_branches.is_empty() {
             // No ancestors found, default to the trunk/main branch
-            let trunk = git_trunk(git)?;
+            let trunk = git_trunk(git_repo)?;
             tracing::info!(
                 "No mounted ancestor branches found for {}. Defaulting to trunk branch {}.",
                 branch_name,
@@ -720,7 +722,7 @@ impl State {
         );
 
         // Mount the branch
-        self.mount(git, repo, branch_name, Some(parent_branch))?;
+        self.mount(git_repo, repo, branch_name, Some(parent_branch))?;
 
         Ok(true)
     }
@@ -817,14 +819,14 @@ fn is_branch_mentioned_in_tree(branch_name: &str, branch: &Branch) -> bool {
 /// Recursively cleans up missing branches from the tree.
 /// Returns the number of branches cleaned up at this level.
 fn cleanup_tree_recursive(
-    git: &GitRepo,
+    git_repo: &GitRepo,
     branch: &mut Branch,
     removed_branches: &mut Vec<String>,
     remounted_branches: &mut Vec<(String, String)>,
 ) {
     // First, recursively process all children
     for child in &mut branch.branches {
-        cleanup_tree_recursive(git, child, removed_branches, remounted_branches);
+        cleanup_tree_recursive(git_repo, child, removed_branches, remounted_branches);
     }
 
     // Collect branches to remove and their children to adopt
@@ -832,7 +834,7 @@ fn cleanup_tree_recursive(
     let mut indices_to_remove = Vec::new();
 
     for (index, child) in branch.branches.iter().enumerate() {
-        if !git_branch_exists(git, &child.name) {
+        if !git_branch_exists(git_repo, &child.name) {
             // This branch doesn't exist locally, mark it for removal
             removed_branches.push(child.name.clone());
 

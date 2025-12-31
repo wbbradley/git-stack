@@ -1,6 +1,4 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use colored::Colorize;
 

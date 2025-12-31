@@ -7,8 +7,6 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{git2_ops::GitRepo, stats::record_git_command};
 
-pub const DEFAULT_REMOTE: &str = "origin";
-
 pub struct GitOutput {
     pub(crate) stdout: String,
 }
@@ -37,11 +35,6 @@ impl AsRef<str> for GitOutput {
     fn as_ref(&self) -> &str {
         &self.stdout
     }
-}
-
-/// Return whether two git references point to the same commit.
-pub(crate) fn shas_match(repo: &GitRepo, ref1: &str, ref2: &str) -> bool {
-    repo.shas_match(ref1, ref2)
 }
 
 /// Run a git command and return the output. If the git command fails, this will return an error.
@@ -123,55 +116,6 @@ pub(crate) fn git_branch_exists(repo: &GitRepo, branch: &str) -> bool {
 pub(crate) struct UpstreamStatus {
     pub(crate) symbolic_name: String,
     pub(crate) synced: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct GitBranchStatus {
-    pub(crate) sha: String,
-    pub(crate) exists: bool,
-    pub(crate) is_descendent: bool,
-    pub(crate) parent_branch: String,
-    pub(crate) upstream_status: Option<UpstreamStatus>,
-}
-
-pub(crate) fn git_sha(repo: &GitRepo, branch: &str) -> Result<String> {
-    repo.sha(branch)
-}
-
-/// Get diff stats (additions, deletions) between two commits.
-pub(crate) fn git_diff_stats(repo: &GitRepo, base: &str, head: &str) -> Result<(usize, usize)> {
-    repo.diff_stats(base, head)
-}
-
-pub(crate) fn git_branch_status(
-    repo: &GitRepo,
-    parent_branch: Option<&str>,
-    branch: &str,
-) -> Result<GitBranchStatus> {
-    let exists = git_branch_exists(repo, branch);
-    let parent_branch = match parent_branch {
-        Some(parent_branch) => parent_branch.to_string(),
-        None => repo.remote_main(DEFAULT_REMOTE)?,
-    };
-    let is_descendent = exists && is_ancestor(repo, &parent_branch, branch)?;
-    let upstream_symbolic_name = repo.get_upstream(branch);
-    let upstream_synced = upstream_symbolic_name
-        .as_ref()
-        .is_some_and(|upstream| shas_match(repo, upstream, branch));
-    Ok(GitBranchStatus {
-        sha: git_sha(repo, branch)?,
-        parent_branch,
-        exists,
-        is_descendent,
-        upstream_status: upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
-            symbolic_name,
-            synced: upstream_synced,
-        }),
-    })
-}
-
-pub(crate) fn is_ancestor(repo: &GitRepo, parent: &str, branch: &str) -> Result<bool> {
-    repo.is_ancestor(parent, branch)
 }
 
 pub(crate) fn run_git_status_clean() -> Result<bool> {
