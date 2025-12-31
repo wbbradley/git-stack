@@ -26,6 +26,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 use crate::{git::run_git, state::State};
 
 mod git;
+mod git2_ops;
 mod state;
 mod stats;
 
@@ -170,6 +171,9 @@ fn inner_main() -> Result<()> {
     .into_os_string()
     .into_string()
     .map_err(|error| anyhow!("Invalid git directory: '{}'", error.to_string_lossy()))?;
+
+    // Initialize git2 for fast read-only operations
+    git2_ops::init_repo(&repo)?;
 
     let mut state = State::load_state().context("loading state")?;
     state.refresh_lkgs(&repo)?;

@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::git2_ops;
 use crate::stats::record_git_command;
 pub const DEFAULT_REMOTE: &str = "origin";
 
@@ -38,9 +39,16 @@ impl AsRef<str> for GitOutput {
 
 /// Return whether two git references point to the same commit.
 pub(crate) fn shas_match(ref1: &str, ref2: &str) -> bool {
-    match (run_git(&["rev-parse", ref1]), run_git(&["rev-parse", ref2])) {
-        (Ok(output1), Ok(output2)) => !output1.is_empty() && output1.output() == output2.output(),
-        _ => false,
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::shas_match(ref1, ref2)
+    } else {
+        match (run_git(&["rev-parse", ref1]), run_git(&["rev-parse", ref2])) {
+            (Ok(output1), Ok(output2)) => {
+                !output1.is_empty() && output1.output() == output2.output()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -116,7 +124,12 @@ pub(crate) fn git_fetch() -> Result<()> {
 }
 
 pub(crate) fn git_branch_exists(branch: &str) -> bool {
-    run_git(&["rev-parse", "--verify", branch]).is_ok_and(|out| !out.is_empty())
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::branch_exists(branch).unwrap_or(false)
+    } else {
+        run_git(&["rev-parse", "--verify", branch]).is_ok_and(|out| !out.is_empty())
+    }
 }
 
 #[derive(Debug)]
@@ -135,38 +148,48 @@ pub(crate) struct GitBranchStatus {
 }
 
 pub(crate) fn git_sha(branch: &str) -> Result<String> {
-    run_git(&["rev-parse", branch])?.output_or("No sha found")
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::git_sha(branch)
+    } else {
+        run_git(&["rev-parse", branch])?.output_or("No sha found")
+    }
 }
 
 /// Get diff stats (additions, deletions) between two commits.
-/// Runs: git log --numstat --pretty="" <base>..<head>
+/// Uses git2 if available, otherwise runs: git log --numstat --pretty="" <base>..<head>
 pub(crate) fn git_diff_stats(base: &str, head: &str) -> Result<(usize, usize)> {
-    let start = std::time::Instant::now();
-    let range = format!("{}..{}", base, head);
-    let output = run_git(&["log", "--numstat", "--pretty=", &range])?;
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::diff_stats(base, head)
+    } else {
+        let start = std::time::Instant::now();
+        let range = format!("{}..{}", base, head);
+        let output = run_git(&["log", "--numstat", "--pretty=", &range])?;
 
-    let mut additions = 0usize;
-    let mut deletions = 0usize;
+        let mut additions = 0usize;
+        let mut deletions = 0usize;
 
-    for line in output.stdout.lines() {
-        // Format: "additions\tdeletions\tfilename" or "-\t-\tbinary"
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() >= 2
-            && let (Ok(add), Ok(del)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>())
-        {
-            additions += add;
-            deletions += del;
+        for line in output.stdout.lines() {
+            // Format: "additions\tdeletions\tfilename" or "-\t-\tbinary"
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 2
+                && let (Ok(add), Ok(del)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>())
+            {
+                additions += add;
+                deletions += del;
+            }
+            // Skip binary files (shown as "-\t-")
         }
-        // Skip binary files (shown as "-\t-")
-    }
 
-    tracing::debug!(
-        "git_diff_stats({}, {}) took {:?}",
-        base,
-        head,
-        start.elapsed()
-    );
-    Ok((additions, deletions))
+        tracing::debug!(
+            "git_diff_stats({}, {}) took {:?}",
+            base,
+            head,
+            start.elapsed()
+        );
+        Ok((additions, deletions))
+    }
 }
 
 pub(crate) fn git_branch_status(
@@ -195,7 +218,12 @@ pub(crate) fn git_branch_status(
     })
 }
 pub(crate) fn is_ancestor(parent: &str, branch: &str) -> Result<bool> {
-    Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch], None)?.success())
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::is_ancestor(parent, branch)
+    } else {
+        Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch], None)?.success())
+    }
 }
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
@@ -252,24 +280,34 @@ pub(crate) fn git_trunk() -> Result<GitTrunk> {
 }
 /// Returns a string of the form "origin/main".
 pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
-    run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
-        .output()
-        .map(|s| s.trim().to_string())
-        .ok_or(anyhow!("No remote main branch?"))
-        .and_then(|s| {
-            Ok(after_text(s.trim(), "refs/remotes/")
-                .ok_or(anyhow!("no refs/remotes/ prefix?"))?
-                .to_string())
-        })
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::remote_main(remote)
+    } else {
+        run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
+            .output()
+            .map(|s| s.trim().to_string())
+            .ok_or(anyhow!("No remote main branch?"))
+            .and_then(|s| {
+                Ok(after_text(s.trim(), "refs/remotes/")
+                    .ok_or(anyhow!("no refs/remotes/ prefix?"))?
+                    .to_string())
+            })
+    }
 }
 
 pub(crate) fn git_get_upstream(branch: &str) -> Option<String> {
-    run_git(&[
-        "rev-parse",
-        "--abbrev-ref",
-        "--symbolic-full-name",
-        &format!("{branch}@{{upstream}}"),
-    ])
-    .ok()
-    .and_then(|s| s.output())
+    // Use git2 if initialized, otherwise fall back to shell git
+    if git2_ops::is_initialized() {
+        git2_ops::get_upstream(branch)
+    } else {
+        run_git(&[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &format!("{branch}@{{upstream}}"),
+        ])
+        .ok()
+        .and_then(|s| s.output())
+    }
 }
