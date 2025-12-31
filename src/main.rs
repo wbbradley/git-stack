@@ -23,7 +23,7 @@ use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 
-use crate::{git::run_git, state::State}; //prelude::*;
+use crate::{git::run_git, state::State};
 
 mod git;
 mod state;
@@ -411,8 +411,14 @@ fn recur_tree(
         })
         .collect();
     branches_sorted.sort_by(|&a, &b| {
-        let a_is_ancestor = ancestor_cache.get(a.name.as_str()).copied().unwrap_or(false);
-        let b_is_ancestor = ancestor_cache.get(b.name.as_str()).copied().unwrap_or(false);
+        let a_is_ancestor = ancestor_cache
+            .get(a.name.as_str())
+            .copied()
+            .unwrap_or(false);
+        let b_is_ancestor = ancestor_cache
+            .get(b.name.as_str())
+            .copied()
+            .unwrap_or(false);
         match (a_is_ancestor, b_is_ancestor) {
             (true, true) => a.name.cmp(&b.name),
             (true, false) => std::cmp::Ordering::Less,
@@ -421,12 +427,24 @@ fn recur_tree(
         }
     });
     for child in branches_sorted {
-        recur_tree(child, depth + 1, orig_branch, Some(branch.name.as_ref()), verbose)?;
+        recur_tree(
+            child,
+            depth + 1,
+            orig_branch,
+            Some(branch.name.as_ref()),
+            verbose,
+        )?;
     }
     Ok(())
 }
 
-fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool, verbose: bool) -> Result<()> {
+fn status(
+    mut state: State,
+    repo: &str,
+    orig_branch: &str,
+    fetch: bool,
+    verbose: bool,
+) -> Result<()> {
     if fetch {
         git_fetch()?;
     }
@@ -436,7 +454,9 @@ fn status(mut state: State, repo: &str, orig_branch: &str, fetch: bool, verbose:
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(repo)?;
 
-    let tree = state.get_tree_mut(repo).expect("tree exists after ensure_trunk");
+    let tree = state
+        .get_tree_mut(repo)
+        .expect("tree exists after ensure_trunk");
     recur_tree(tree, 0, orig_branch, None, verbose)?;
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
@@ -508,40 +528,40 @@ fn restack(
                 StackMethod::ApplyMerge => {
                     // Check if we can use the fast format-patch/am approach:
                     // requires an LKG parent that is still an ancestor of the branch
-                    if let Some(lkg_parent) = branch.lkg_parent.as_deref() {
-                        if is_ancestor(lkg_parent, &source)? {
-                            tracing::info!("LKG parent: {}", lkg_parent);
-                            let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
-                            tracing::info!("Creating patch {}", &patch_rev);
-                            // The branch is still on top of the LKG parent. Let's create a format-patch of the
-                            // difference, and apply it on top of the new parent.
-                            let format_patch =
-                                run_git(&["format-patch", "--stdout", &patch_rev])?.output();
-                            run_git(&["checkout", "-B", &branch.name, &parent])?;
-                            let Some(format_patch) = format_patch else {
-                                tracing::debug!("No diff between LKG and branch?!");
-                                continue;
-                            };
-                            tracing::info!("Applying patch...");
-                            let rebased =
-                                run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
-                            if !rebased {
-                                eprintln!(
-                                    "{} did not complete successfully.",
-                                    "`git am`".green().bold()
-                                );
-                                eprintln!("Run `git mergetool` to resolve conflicts.");
-                                eprintln!(
-                                    "Once you have finished with {}, re-run `git stack restack`.",
-                                    "`git am --continue`".green().bold()
-                                );
-                                std::process::exit(1);
-                            }
-                            if push {
-                                git_push(&branch.name)?;
-                            }
+                    if let Some(lkg_parent) = branch.lkg_parent.as_deref()
+                        && is_ancestor(lkg_parent, &source)?
+                    {
+                        tracing::info!("LKG parent: {}", lkg_parent);
+                        let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
+                        tracing::info!("Creating patch {}", &patch_rev);
+                        // The branch is still on top of the LKG parent. Let's create a format-patch of the
+                        // difference, and apply it on top of the new parent.
+                        let format_patch =
+                            run_git(&["format-patch", "--stdout", &patch_rev])?.output();
+                        run_git(&["checkout", "-B", &branch.name, &parent])?;
+                        let Some(format_patch) = format_patch else {
+                            tracing::debug!("No diff between LKG and branch?!");
                             continue;
+                        };
+                        tracing::info!("Applying patch...");
+                        let rebased =
+                            run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
+                        if !rebased {
+                            eprintln!(
+                                "{} did not complete successfully.",
+                                "`git am`".green().bold()
+                            );
+                            eprintln!("Run `git mergetool` to resolve conflicts.");
+                            eprintln!(
+                                "Once you have finished with {}, re-run `git stack restack`.",
+                                "`git am --continue`".green().bold()
+                            );
+                            std::process::exit(1);
                         }
+                        if push {
+                            git_push(&branch.name)?;
+                        }
+                        continue;
                     }
 
                     // Fall back to regular rebase (no LKG parent, or branch diverged from LKG)
