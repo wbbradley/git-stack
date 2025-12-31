@@ -51,10 +51,13 @@ impl GitRepo {
             .repo
             .revparse_single(descendant)
             .with_context(|| format!("Failed to resolve descendant ref: {}", descendant))?;
-        let result = self
-            .repo
-            .graph_descendant_of(descendant_obj.id(), ancestor_obj.id())
-            .unwrap_or(false);
+
+        // A commit is considered an ancestor of itself (matches git behavior)
+        let result = ancestor_obj.id() == descendant_obj.id()
+            || self
+                .repo
+                .graph_descendant_of(descendant_obj.id(), ancestor_obj.id())
+                .unwrap_or(false);
         record_git_command(&["git2:merge-base", ancestor, descendant], start.elapsed());
         Ok(result)
     }
