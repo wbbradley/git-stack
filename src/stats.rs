@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, time::{Duration, Instant}};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use colored::Colorize;
 

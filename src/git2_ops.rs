@@ -3,7 +3,7 @@
 //! This module provides a `GitRepo` struct that wraps git2::Repository
 //! for fast read-only operations without spawning git processes.
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
@@ -17,6 +17,17 @@ pub(crate) struct UpstreamStatus {
     pub(crate) symbolic_name: String,
     pub(crate) synced: bool,
 }
+
+#[derive(Debug)]
+pub(crate) struct GitBranchStatus {
+    pub(crate) sha: String,
+    pub(crate) exists: bool,
+    pub(crate) is_descendent: bool,
+    pub(crate) parent_branch: String,
+    pub(crate) upstream_status: Option<UpstreamStatus>,
+}
+
+pub const DEFAULT_REMOTE: &str = "origin";
 
 #[derive(Debug)]
 pub(crate) struct GitBranchStatus {
@@ -80,6 +91,33 @@ impl GitRepo {
         // First try as a local branch, then try direct ref resolution
         self.repo.find_branch(branch, BranchType::Local).is_ok()
             || self.repo.revparse_single(branch).is_ok()
+    }
+
+    pub fn branch_status(
+        &self,
+        parent_branch: Option<&str>,
+        branch: &str,
+    ) -> Result<GitBranchStatus> {
+        let exists = self.branch_exists(branch);
+        let parent_branch = match parent_branch {
+            Some(parent_branch) => parent_branch.to_string(),
+            None => self.remote_main(DEFAULT_REMOTE)?,
+        };
+        let is_descendent = exists && self.is_ancestor(&parent_branch, branch)?;
+        let upstream_symbolic_name = self.get_upstream(branch);
+        let upstream_synced = upstream_symbolic_name
+            .as_ref()
+            .is_some_and(|upstream| self.shas_match(upstream, branch));
+        Ok(GitBranchStatus {
+            sha: self.sha(branch)?,
+            parent_branch,
+            exists,
+            is_descendent,
+            upstream_status: upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
+                symbolic_name,
+                synced: upstream_synced,
+            }),
+        })
     }
 
     pub fn branch_status(

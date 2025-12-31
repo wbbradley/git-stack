@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, git_checkout_main, git_fetch, run_git_status};
+use git::{after_text, git_checkout_main, git_fetch, run_git_status, shas_match};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -32,7 +32,11 @@ struct Args {
     #[arg(long, global = true, help = "Show git command performance stats")]
     benchmark: bool,
 
-    #[arg(long, global = true, help = "Output benchmark stats as JSON (implies --benchmark)")]
+    #[arg(
+        long,
+        global = true,
+        help = "Output benchmark stats as JSON (implies --benchmark)"
+    )]
     json: bool,
 
     /// Subcommand to run.
@@ -554,10 +558,7 @@ fn restack(
                 parent
             );
             if push
-                && !git_repo.shas_match(
-                    &format!("{DEFAULT_REMOTE}/{}", branch.name),
-                    &branch.name,
-                )
+                && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
                 run_git(&[
                     "push",

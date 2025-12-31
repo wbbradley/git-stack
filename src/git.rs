@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::{git2_ops::{GitRepo, DEFAULT_REMOTE}, stats::record_git_command};
+use crate::{
+    git2_ops::{DEFAULT_REMOTE, GitRepo},
+    stats::record_git_command,
+};
 
 pub struct GitOutput {
     pub(crate) stdout: String,
