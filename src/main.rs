@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, git_checkout_main, git_fetch, run_git_status, shas_match};
+use git::{after_text, git_checkout_main, git_fetch, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -31,6 +31,9 @@ struct Args {
 
     #[arg(long, global = true, help = "Show git command performance stats")]
     benchmark: bool,
+
+    #[arg(long, global = true, help = "Output benchmark stats as JSON (implies --benchmark)")]
+    json: bool,
 
     /// Subcommand to run.
     #[command(subcommand)]
@@ -149,10 +152,14 @@ fn inner_main() -> Result<()> {
     // Run from the git root directory.
     let args = Args::parse();
 
-    // Set env var if --benchmark flag was passed (for main() to check later)
-    if args.benchmark {
+    // Set env vars if benchmark flags were passed (for main() to check later)
+    if args.benchmark || args.json {
         // SAFETY: We're single-threaded at this point in startup
         unsafe { std::env::set_var("GIT_STACK_BENCHMARK", "1") };
+    }
+    if args.json {
+        // SAFETY: We're single-threaded at this point in startup
+        unsafe { std::env::set_var("GIT_STACK_BENCHMARK_JSON", "1") };
     }
 
     let repo = canonicalize(
@@ -547,8 +554,7 @@ fn restack(
                 parent
             );
             if push
-                && !shas_match(
-                    git_repo,
+                && !git_repo.shas_match(
                     &format!("{DEFAULT_REMOTE}/{}", branch.name),
                     &branch.name,
                 )

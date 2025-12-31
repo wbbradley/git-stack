@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::{git2_ops::GitRepo, stats::record_git_command};
+use crate::{git2_ops::{GitRepo, DEFAULT_REMOTE}, stats::record_git_command};
 
 pub struct GitOutput {
     pub(crate) stdout: String,
@@ -112,12 +112,6 @@ pub(crate) fn git_branch_exists(repo: &GitRepo, branch: &str) -> bool {
     repo.branch_exists(branch)
 }
 
-#[derive(Debug)]
-pub(crate) struct UpstreamStatus {
-    pub(crate) symbolic_name: String,
-    pub(crate) synced: bool,
-}
-
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
@@ -137,7 +131,7 @@ pub(crate) fn git_checkout_main(repo: &GitRepo, new_branch: Option<&str>) -> Res
     let trunk = git_trunk(repo)?;
 
     // Check that we don't orphan unpushed changes in the local `main` branch.
-    if !is_ancestor(repo, &trunk.main_branch, &trunk.remote_main)? {
+    if !repo.is_ancestor(&trunk.main_branch, &trunk.remote_main)? {
         bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
     }
 

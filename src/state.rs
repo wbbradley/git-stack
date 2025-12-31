@@ -150,7 +150,7 @@ impl State {
 
         branch.branches.push(Branch::new(
             branch_name.clone(),
-            git_sha(git_repo, &current_branch).ok(),
+            git_repo.sha(&current_branch).ok(),
         ));
 
         // Actually create the git branch.
@@ -516,7 +516,7 @@ impl State {
         if let Some(new_parent_branch) = new_parent_branch {
             new_parent_branch.branches.push(Branch::new(
                 branch_name.to_string(),
-                git_sha(git_repo, &parent_branch).ok(),
+                git_repo.sha(&parent_branch).ok(),
             ));
         } else {
             bail!("Parent branch {parent_branch} not found in the git-stack tree.");
@@ -560,14 +560,14 @@ impl State {
             if let Some(parent) = parent {
                 let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
                 if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
-                    if is_ancestor(git_repo, lkg_parent, &branch)? {
+                    if git_repo.is_ancestor(lkg_parent, &branch)? {
                         parent_lkgs.insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
                     } else {
                         parent_lkgs.insert(tree_branch.name.clone(), None);
                     }
                 }
-                if is_ancestor(git_repo, &parent, &branch).unwrap_or(false)
-                    && let Ok(new_lkg_parent) = git_sha(git_repo, &parent)
+                if git_repo.is_ancestor(&parent, &branch).unwrap_or(false)
+                    && let Ok(new_lkg_parent) = git_repo.sha(&parent)
                 {
                     tracing::debug!(
                         lkg_parent = ?new_lkg_parent,
@@ -681,7 +681,7 @@ impl State {
         // Find all mounted branches that are ancestors of the current branch
         let mut ancestor_branches = Vec::new();
         for mounted_branch in &all_branches {
-            if let Ok(true) = is_ancestor(git_repo, mounted_branch, branch_name) {
+            if let Ok(true) = git_repo.is_ancestor(mounted_branch, branch_name) {
                 ancestor_branches.push(mounted_branch.clone());
             }
         }

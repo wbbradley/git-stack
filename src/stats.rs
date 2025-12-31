@@ -1,6 +1,33 @@
-use std::{cell::RefCell, collections::HashMap, time::Duration};
+use std::{cell::RefCell, collections::HashMap, time::{Duration, Instant}};
 
 use colored::Colorize;
+
+/// RAII guard for timing git commands. Records timing on drop.
+pub struct GitBenchmark {
+    command: &'static str,
+    start: Instant,
+}
+
+impl GitBenchmark {
+    pub fn start(command: &'static str) -> Self {
+        Self {
+            command,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for GitBenchmark {
+    fn drop(&mut self) {
+        record_git_command_internal(self.command, self.start.elapsed());
+    }
+}
+
+fn record_git_command_internal(command: &str, duration: Duration) {
+    GIT_STATS.with(|stats| {
+        stats.borrow_mut().record(command, duration);
+    });
+}
 
 /// Statistics for a single type of git command
 #[derive(Debug, Default, Clone)]
