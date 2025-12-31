@@ -1,6 +1,9 @@
 use std::process::{Command, ExitStatus};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::stats::record_git_command;
 pub const DEFAULT_REMOTE: &str = "origin";
 
 pub struct GitOutput {
@@ -43,19 +46,24 @@ pub(crate) fn shas_match(ref1: &str, ref2: &str) -> bool {
 
 /// Run a git command and return the output. If the git command fails, this will return an error.
 pub(crate) fn run_git_passthrough(args: &[&str]) -> Result<ExitStatus> {
+    let start = Instant::now();
     tracing::debug!("Running `git {}`", args.join(" "));
     let mut child = Command::new("git").args(args).spawn()?;
-    Ok(child.wait()?)
+    let result = child.wait()?;
+    record_git_command(args, start.elapsed());
+    Ok(result)
 }
 
 /// Run a git command and return the output. If the git command fails, this will return an error.
 pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
+    let start = Instant::now();
     tracing::debug!("Running `git {}`", args.join(" "));
     let out = Command::new("git")
         .args(args)
         .stderr(std::process::Stdio::piped())
         .output()
         .with_context(|| format!("running git {args:?}"))?;
+    record_git_command(args, start.elapsed());
     if !out.status.success() {
         tracing::debug!(
             ?args,
@@ -74,15 +82,16 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
 }
 
 pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitStatus> {
+    let start = Instant::now();
     tracing::debug!("Running `git {}`", args.join(" "));
-    if let Some(stdin_text) = stdin {
+    let status = if let Some(stdin_text) = stdin {
         let mut child = Command::new("git")
             .args(args)
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         let stdin = child.stdin.as_mut().context("Failed to open stdin")?;
         std::io::Write::write_all(stdin, stdin_text.as_bytes())?;
-        Ok(child.wait()?)
+        child.wait()?
     } else {
         let output = Command::new("git")
             .args(args)
@@ -95,8 +104,10 @@ pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitS
                 std::str::from_utf8(&output.stderr).unwrap_or("")
             );
         }
-        Ok(output.status)
-    }
+        output.status
+    };
+    record_git_command(args, start.elapsed());
+    Ok(status)
 }
 
 pub(crate) fn git_fetch() -> Result<()> {

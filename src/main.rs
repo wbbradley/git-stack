@@ -27,6 +27,7 @@ use crate::{git::run_git, state::State};
 
 mod git;
 mod state;
+mod stats;
 
 const CREATE_BACKUP: bool = false;
 
@@ -36,6 +37,9 @@ const CREATE_BACKUP: bool = false;
 struct Args {
     #[arg(long, short, global = true, help = "Enable verbose output")]
     verbose: bool,
+
+    #[arg(long, global = true, help = "Show git command performance stats")]
+    benchmark: bool,
 
     /// Subcommand to run.
     #[command(subcommand)]
@@ -129,7 +133,21 @@ fn main() {
                 .from_env_lossy(),
         )
         .init();
-    if let Err(e) = inner_main() {
+
+    let result = inner_main();
+
+    // Check if benchmarking was requested via flag or environment variable
+    // Note: We check env var here since Args is consumed by inner_main
+    let show_benchmark = std::env::var("GIT_STACK_BENCHMARK").is_ok();
+    if show_benchmark {
+        if std::env::var("GIT_STACK_BENCHMARK_JSON").is_ok() {
+            stats::print_json();
+        } else {
+            stats::print_summary();
+        }
+    }
+
+    if let Err(e) = result {
         tracing::error!(error = ?e);
         std::process::exit(1);
     }
@@ -139,6 +157,12 @@ fn main() {
 fn inner_main() -> Result<()> {
     // Run from the git root directory.
     let args = Args::parse();
+
+    // Set env var if --benchmark flag was passed (for main() to check later)
+    if args.benchmark {
+        // SAFETY: We're single-threaded at this point in startup
+        unsafe { std::env::set_var("GIT_STACK_BENCHMARK", "1") };
+    }
 
     let repo = canonicalize(
         run_git(&["rev-parse", "--show-toplevel"])?.output_or("No git directory found")?,
