@@ -23,7 +23,7 @@ use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 
-use crate::{git::run_git, state::State};
+use crate::{git::run_git, git2_ops::GitRepo, state::State};
 
 mod git;
 mod git2_ops;
@@ -172,24 +172,22 @@ fn inner_main() -> Result<()> {
     .into_string()
     .map_err(|error| anyhow!("Invalid git directory: '{}'", error.to_string_lossy()))?;
 
-    // Initialize git2 for fast read-only operations
-    git2_ops::init_repo(&repo)?;
+    // Open git2 repository for fast read-only operations
+    let git = GitRepo::open(&repo)?;
 
     let mut state = State::load_state().context("loading state")?;
-    state.refresh_lkgs(&repo)?;
+    state.refresh_lkgs(&git, &repo)?;
 
     tracing::debug!("Current directory: {}", repo);
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
-    let current_branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?
-        .output()
-        .ok_or(anyhow!("No current branch?"))?;
-    let current_upstream = git_get_upstream("");
+    let current_branch = git.current_branch()?;
+    let current_upstream = git_get_upstream(&git, "");
     tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
         Some(Command::Checkout { branch_name }) => {
-            state.checkout(&repo, current_branch, current_upstream, branch_name)
+            state.checkout(&git, &repo, current_branch, current_upstream, branch_name)
         }
         Some(Command::Edit) => state.edit_config(),
         Some(Command::Restack {
@@ -198,8 +196,9 @@ fn inner_main() -> Result<()> {
             push,
         }) => {
             let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
-            state.try_auto_mount(&repo, &restack_branch)?;
+            state.try_auto_mount(&git, &repo, &restack_branch)?;
             restack(
+                &git,
                 state,
                 &repo,
                 run_version,
@@ -210,29 +209,29 @@ fn inner_main() -> Result<()> {
             )
         }
         Some(Command::Mount { parent_branch }) => {
-            state.mount(&repo, &current_branch, parent_branch)
+            state.mount(&git, &repo, &current_branch, parent_branch)
         }
         Some(Command::Status { fetch }) => {
-            state.try_auto_mount(&repo, &current_branch)?;
-            status(state, &repo, &current_branch, fetch, args.verbose)
+            state.try_auto_mount(&git, &repo, &current_branch)?;
+            status(&git, state, &repo, &current_branch, fetch, args.verbose)
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
-            state.cleanup_missing_branches(&repo, dry_run, all)
+            state.cleanup_missing_branches(&git, &repo, dry_run, all)
         }
         Some(Command::Diff { branch }) => {
             let branch_to_diff = branch.clone().unwrap_or_else(|| current_branch.clone());
-            state.try_auto_mount(&repo, &branch_to_diff)?;
+            state.try_auto_mount(&git, &repo, &branch_to_diff)?;
             diff(state, &repo, &branch.unwrap_or(current_branch))
         }
         Some(Command::Log { branch }) => {
             let branch_to_log = branch.clone().unwrap_or_else(|| current_branch.clone());
-            state.try_auto_mount(&repo, &branch_to_log)?;
+            state.try_auto_mount(&git, &repo, &branch_to_log)?;
             show_log(state, &repo, &branch.unwrap_or(current_branch))
         }
         Some(Command::Note { edit, branch }) => {
             let branch = branch.unwrap_or(current_branch);
-            state.try_auto_mount(&repo, &branch)?;
+            state.try_auto_mount(&git, &repo, &branch)?;
             if edit {
                 state.edit_note(&repo, &branch)
             } else {
@@ -240,8 +239,8 @@ fn inner_main() -> Result<()> {
             }
         }
         None => {
-            state.try_auto_mount(&repo, &current_branch)?;
-            status(state, &repo, &current_branch, false, args.verbose)
+            state.try_auto_mount(&git, &repo, &current_branch)?;
+            status(&git, state, &repo, &current_branch, false, args.verbose)
         }
     }
 }
@@ -304,13 +303,14 @@ fn selection_marker() -> &'static str {
 }
 
 fn recur_tree(
+    git: &GitRepo,
     branch: &Branch,
     depth: usize,
     orig_branch: &str,
     parent_branch: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let Ok(branch_status) = git_branch_status(parent_branch, &branch.name).with_context(|| {
+    let Ok(branch_status) = git_branch_status(git, parent_branch, &branch.name).with_context(|| {
         format!(
             "attempting to fetch the branch status of {}",
             branch.name.red()
@@ -341,7 +341,7 @@ fn recur_tree(
 
     // Get diff stats from LKG ancestor to current branch
     let diff_stats = if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
-        match git_diff_stats(lkg_parent, &branch_status.sha) {
+        match git_diff_stats(git, lkg_parent, &branch_status.sha) {
             Ok((adds, dels)) => format!(
                 " {} {}",
                 format!("+{}", adds).green(),
@@ -434,7 +434,7 @@ fn recur_tree(
         .map(|b| {
             (
                 b.name.as_str(),
-                is_ancestor(&b.name, orig_branch).unwrap_or(false),
+                is_ancestor(git, &b.name, orig_branch).unwrap_or(false),
             )
         })
         .collect();
@@ -456,6 +456,7 @@ fn recur_tree(
     });
     for child in branches_sorted {
         recur_tree(
+            git,
             child,
             depth + 1,
             orig_branch,
@@ -467,6 +468,7 @@ fn recur_tree(
 }
 
 fn status(
+    git: &GitRepo,
     mut state: State,
     repo: &str,
     orig_branch: &str,
@@ -477,15 +479,15 @@ fn status(
         git_fetch()?;
     }
     // ensure_trunk creates the tree if it doesn't exist
-    let _trunk = state.ensure_trunk(repo)?;
+    let _trunk = state.ensure_trunk(git, repo)?;
 
     // Auto-cleanup any missing branches before displaying the tree
-    state.auto_cleanup_missing_branches(repo)?;
+    state.auto_cleanup_missing_branches(git, repo)?;
 
     let tree = state
         .get_tree_mut(repo)
         .expect("tree exists after ensure_trunk");
-    recur_tree(tree, 0, orig_branch, None, verbose)?;
+    recur_tree(git, tree, 0, orig_branch, None, verbose)?;
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
             "The current branch {} is not in the stack tree.",
@@ -498,6 +500,7 @@ fn status(
 }
 
 fn restack(
+    git: &GitRepo,
     mut state: State,
     repo: &str,
     run_version: String,
@@ -513,25 +516,25 @@ fn restack(
     }
 
     // Find starting_branch in the stacks of branches to determine which stack to use.
-    let plan = state.plan_restack(repo, &restack_branch)?;
+    let plan = state.plan_restack(git, repo, &restack_branch)?;
 
     tracing::debug!(?plan, "Restacking branches with plan. Checking out main...");
-    git_checkout_main(None)?;
+    git_checkout_main(git, None)?;
     for RestackStep { parent, branch } in plan {
         tracing::debug!(
             "Starting branch: {} [pwd={}]",
             restack_branch,
             env::current_dir()?.display()
         );
-        let source = git_sha(&branch.name)?;
+        let source = git_sha(git, &branch.name)?;
 
-        if is_ancestor(&parent, &branch.name)? {
+        if is_ancestor(git, &parent, &branch.name)? {
             tracing::debug!(
                 "Branch '{}' is already stacked on '{}'.",
                 branch.name,
                 parent
             );
-            if push && !shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name) {
+            if push && !shas_match(git, &format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name) {
                 run_git(&[
                     "push",
                     match branch.stack_method {
@@ -557,7 +560,7 @@ fn restack(
                     // Check if we can use the fast format-patch/am approach:
                     // requires an LKG parent that is still an ancestor of the branch
                     if let Some(lkg_parent) = branch.lkg_parent.as_deref()
-                        && is_ancestor(lkg_parent, &source)?
+                        && is_ancestor(git, lkg_parent, &source)?
                     {
                         tracing::info!("LKG parent: {}", lkg_parent);
                         let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
@@ -587,7 +590,7 @@ fn restack(
                             std::process::exit(1);
                         }
                         if push {
-                            git_push(&branch.name)?;
+                            git_push(git, &branch.name)?;
                         }
                         continue;
                     }
@@ -607,7 +610,7 @@ fn restack(
                         std::process::exit(1);
                     }
                     if push {
-                        git_push(&branch.name)?;
+                        git_push(git, &branch.name)?;
                     }
                     tracing::info!("Rebase completed successfully. Continuing...");
                 }
@@ -627,12 +630,12 @@ fn restack(
         restack_branch
     );
     tracing::info!("Done.");
-    state.refresh_lkgs(repo)?;
+    state.refresh_lkgs(git, repo)?;
     Ok(())
 }
 
-fn git_push(branch: &str) -> Result<()> {
-    if !shas_match(&format!("{DEFAULT_REMOTE}/{}", branch), branch) {
+fn git_push(git: &GitRepo, branch: &str) -> Result<()> {
+    if !shas_match(git, &format!("{DEFAULT_REMOTE}/{}", branch), branch) {
         run_git(&[
             "push",
             "-fu",

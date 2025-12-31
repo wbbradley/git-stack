@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::git2_ops;
+use crate::git2_ops::GitRepo;
 use crate::stats::record_git_command;
+
 pub const DEFAULT_REMOTE: &str = "origin";
 
 pub struct GitOutput {
@@ -38,18 +39,8 @@ impl AsRef<str> for GitOutput {
 }
 
 /// Return whether two git references point to the same commit.
-pub(crate) fn shas_match(ref1: &str, ref2: &str) -> bool {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::shas_match(ref1, ref2)
-    } else {
-        match (run_git(&["rev-parse", ref1]), run_git(&["rev-parse", ref2])) {
-            (Ok(output1), Ok(output2)) => {
-                !output1.is_empty() && output1.output() == output2.output()
-            }
-            _ => false,
-        }
-    }
+pub(crate) fn shas_match(repo: &GitRepo, ref1: &str, ref2: &str) -> bool {
+    repo.shas_match(ref1, ref2)
 }
 
 /// Run a git command and return the output. If the git command fails, this will return an error.
@@ -123,13 +114,8 @@ pub(crate) fn git_fetch() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn git_branch_exists(branch: &str) -> bool {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::branch_exists(branch).unwrap_or(false)
-    } else {
-        run_git(&["rev-parse", "--verify", branch]).is_ok_and(|out| !out.is_empty())
-    }
+pub(crate) fn git_branch_exists(repo: &GitRepo, branch: &str) -> bool {
+    repo.branch_exists(branch)
 }
 
 #[derive(Debug)]
@@ -147,67 +133,32 @@ pub(crate) struct GitBranchStatus {
     pub(crate) upstream_status: Option<UpstreamStatus>,
 }
 
-pub(crate) fn git_sha(branch: &str) -> Result<String> {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::git_sha(branch)
-    } else {
-        run_git(&["rev-parse", branch])?.output_or("No sha found")
-    }
+pub(crate) fn git_sha(repo: &GitRepo, branch: &str) -> Result<String> {
+    repo.sha(branch)
 }
 
 /// Get diff stats (additions, deletions) between two commits.
-/// Uses git2 if available, otherwise runs: git log --numstat --pretty="" <base>..<head>
-pub(crate) fn git_diff_stats(base: &str, head: &str) -> Result<(usize, usize)> {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::diff_stats(base, head)
-    } else {
-        let start = std::time::Instant::now();
-        let range = format!("{}..{}", base, head);
-        let output = run_git(&["log", "--numstat", "--pretty=", &range])?;
-
-        let mut additions = 0usize;
-        let mut deletions = 0usize;
-
-        for line in output.stdout.lines() {
-            // Format: "additions\tdeletions\tfilename" or "-\t-\tbinary"
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 2
-                && let (Ok(add), Ok(del)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>())
-            {
-                additions += add;
-                deletions += del;
-            }
-            // Skip binary files (shown as "-\t-")
-        }
-
-        tracing::debug!(
-            "git_diff_stats({}, {}) took {:?}",
-            base,
-            head,
-            start.elapsed()
-        );
-        Ok((additions, deletions))
-    }
+pub(crate) fn git_diff_stats(repo: &GitRepo, base: &str, head: &str) -> Result<(usize, usize)> {
+    repo.diff_stats(base, head)
 }
 
 pub(crate) fn git_branch_status(
+    repo: &GitRepo,
     parent_branch: Option<&str>,
     branch: &str,
 ) -> Result<GitBranchStatus> {
-    let exists = git_branch_exists(branch);
+    let exists = git_branch_exists(repo, branch);
     let parent_branch = match parent_branch {
         Some(parent_branch) => parent_branch.to_string(),
-        None => git_remote_main(DEFAULT_REMOTE)?,
+        None => git_remote_main(repo, DEFAULT_REMOTE)?,
     };
-    let is_descendent = exists && is_ancestor(&parent_branch, branch)?;
-    let upstream_symbolic_name = git_get_upstream(branch);
+    let is_descendent = exists && is_ancestor(repo, &parent_branch, branch)?;
+    let upstream_symbolic_name = git_get_upstream(repo, branch);
     let upstream_synced = upstream_symbolic_name
         .as_ref()
-        .is_some_and(|upstream| shas_match(upstream, branch));
+        .is_some_and(|upstream| shas_match(repo, upstream, branch));
     Ok(GitBranchStatus {
-        sha: git_sha(branch)?,
+        sha: git_sha(repo, branch)?,
         parent_branch,
         exists,
         is_descendent,
@@ -217,14 +168,11 @@ pub(crate) fn git_branch_status(
         }),
     })
 }
-pub(crate) fn is_ancestor(parent: &str, branch: &str) -> Result<bool> {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::is_ancestor(parent, branch)
-    } else {
-        Ok(run_git_status(&["merge-base", "--is-ancestor", parent, branch], None)?.success())
-    }
+
+pub(crate) fn is_ancestor(repo: &GitRepo, parent: &str, branch: &str) -> Result<bool> {
+    repo.is_ancestor(parent, branch)
 }
+
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
@@ -235,18 +183,16 @@ pub(crate) fn after_text(s: &str, needle: impl AsRef<str>) -> Option<&str> {
         .map(|pos| &s[pos + needle.chars().fold(0, |x, y| x + y.len_utf8())..])
 }
 
-pub(crate) fn git_checkout_main(new_branch: Option<&str>) -> Result<()> {
+pub(crate) fn git_checkout_main(repo: &GitRepo, new_branch: Option<&str>) -> Result<()> {
     if !run_git_status_clean()? {
         bail!("git status is not clean, please commit or stash your changes.")
     }
     git_fetch()?;
-    // Assuming the dominant remote is "origin".
-    // TODO: add support for different remotes.
     let remote = DEFAULT_REMOTE;
-    let trunk = git_trunk()?;
+    let trunk = git_trunk(repo)?;
 
     // Check that we don't orphan unpushed changes in the local `main` branch.
-    if !is_ancestor(&trunk.main_branch, &trunk.remote_main)? {
+    if !is_ancestor(repo, &trunk.main_branch, &trunk.remote_main)? {
         bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
     }
 
@@ -268,8 +214,8 @@ pub(crate) struct GitTrunk {
     pub(crate) main_branch: String,
 }
 
-pub(crate) fn git_trunk() -> Result<GitTrunk> {
-    let remote_main = git_remote_main(DEFAULT_REMOTE)?;
+pub(crate) fn git_trunk(repo: &GitRepo) -> Result<GitTrunk> {
+    let remote_main = git_remote_main(repo, DEFAULT_REMOTE)?;
     let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
         .ok_or(anyhow!("no branch?"))?
         .to_string();
@@ -278,36 +224,12 @@ pub(crate) fn git_trunk() -> Result<GitTrunk> {
         main_branch,
     })
 }
+
 /// Returns a string of the form "origin/main".
-pub(crate) fn git_remote_main(remote: &str) -> Result<String> {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::remote_main(remote)
-    } else {
-        run_git(&["symbolic-ref", &format!("refs/remotes/{}/HEAD", remote)])?
-            .output()
-            .map(|s| s.trim().to_string())
-            .ok_or(anyhow!("No remote main branch?"))
-            .and_then(|s| {
-                Ok(after_text(s.trim(), "refs/remotes/")
-                    .ok_or(anyhow!("no refs/remotes/ prefix?"))?
-                    .to_string())
-            })
-    }
+pub(crate) fn git_remote_main(repo: &GitRepo, remote: &str) -> Result<String> {
+    repo.remote_main(remote)
 }
 
-pub(crate) fn git_get_upstream(branch: &str) -> Option<String> {
-    // Use git2 if initialized, otherwise fall back to shell git
-    if git2_ops::is_initialized() {
-        git2_ops::get_upstream(branch)
-    } else {
-        run_git(&[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            &format!("{branch}@{{upstream}}"),
-        ])
-        .ok()
-        .and_then(|s| s.output())
-    }
+pub(crate) fn git_get_upstream(repo: &GitRepo, branch: &str) -> Option<String> {
+    repo.get_upstream(branch)
 }

@@ -1,9 +1,8 @@
 //! git2 wrapper module for fast read-only git operations.
 //!
-//! This module provides git2-based implementations of common read-only git operations
-//! to avoid the overhead of spawning git processes.
+//! This module provides a `GitRepo` struct that wraps git2::Repository
+//! for fast read-only operations without spawning git processes.
 
-use std::cell::RefCell;
 use std::path::Path;
 use std::time::Instant;
 
@@ -12,115 +11,79 @@ use git2::{BranchType, Repository};
 
 use crate::stats::record_git_command;
 
-// Thread-local repository instance - opened once per invocation
-thread_local! {
-    static REPO: RefCell<Option<Repository>> = const { RefCell::new(None) };
+/// Wrapper around git2::Repository for fast read-only git operations.
+pub struct GitRepo {
+    repo: Repository,
 }
 
-/// Initialize the git2 repository for the given path.
-/// Must be called early in main() before using other git2_ops functions.
-pub fn init_repo(path: &str) -> Result<()> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let repo = Repository::open(path).context("Failed to open repository with git2")?;
-        *r.borrow_mut() = Some(repo);
+impl GitRepo {
+    /// Open a repository at the given path.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let start = Instant::now();
+        let repo = Repository::open(path.as_ref())
+            .with_context(|| format!("Failed to open repository at {:?}", path.as_ref()))?;
         record_git_command(&["git2:open"], start.elapsed());
-        Ok(())
-    })
-}
+        Ok(Self { repo })
+    }
 
-/// Check if git2 repo is initialized
-pub fn is_initialized() -> bool {
-    REPO.with(|r| r.borrow().is_some())
-}
-
-/// Get the SHA of a reference (branch name, tag, or other ref).
-/// Equivalent to `git rev-parse <ref>`
-pub fn git_sha(ref_name: &str) -> Result<String> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        let obj = repo
+    /// Get the SHA of a reference (branch name, tag, or other ref).
+    /// Equivalent to `git rev-parse <ref>`
+    pub fn sha(&self, ref_name: &str) -> Result<String> {
+        let start = Instant::now();
+        let obj = self
+            .repo
             .revparse_single(ref_name)
             .with_context(|| format!("Failed to resolve ref: {}", ref_name))?;
-
         let sha = obj.id().to_string();
         record_git_command(&["git2:rev-parse", ref_name], start.elapsed());
         Ok(sha)
-    })
-}
+    }
 
-/// Check if ancestor_ref is an ancestor of descendant_ref.
-/// Equivalent to `git merge-base --is-ancestor <ancestor> <descendant>`
-pub fn is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        let ancestor_obj = repo
+    /// Check if ancestor_ref is an ancestor of descendant_ref.
+    /// Equivalent to `git merge-base --is-ancestor <ancestor> <descendant>`
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let start = Instant::now();
+        let ancestor_obj = self
+            .repo
             .revparse_single(ancestor)
             .with_context(|| format!("Failed to resolve ancestor ref: {}", ancestor))?;
-        let descendant_obj = repo
+        let descendant_obj = self
+            .repo
             .revparse_single(descendant)
             .with_context(|| format!("Failed to resolve descendant ref: {}", descendant))?;
-
-        let result = repo
+        let result = self
+            .repo
             .graph_descendant_of(descendant_obj.id(), ancestor_obj.id())
             .unwrap_or(false);
-
         record_git_command(&["git2:merge-base", ancestor, descendant], start.elapsed());
         Ok(result)
-    })
-}
+    }
 
-/// Check if a local branch exists.
-/// Equivalent to `git rev-parse --verify <branch>`
-pub fn branch_exists(branch: &str) -> Result<bool> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        // First try as a local branch
-        let exists = repo.find_branch(branch, BranchType::Local).is_ok()
-            // Also try direct ref resolution (handles detached HEAD, tags, etc.)
-            || repo.revparse_single(branch).is_ok();
-
+    /// Check if a local branch exists.
+    /// Equivalent to `git rev-parse --verify <branch>`
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        let start = Instant::now();
+        // First try as a local branch, then try direct ref resolution
+        let exists = self.repo.find_branch(branch, BranchType::Local).is_ok()
+            || self.repo.revparse_single(branch).is_ok();
         record_git_command(&["git2:branch-exists", branch], start.elapsed());
-        Ok(exists)
-    })
-}
+        exists
+    }
 
-/// Get the remote main branch name (e.g., "origin/main").
-/// Equivalent to `git symbolic-ref refs/remotes/<remote>/HEAD`
-pub fn remote_main(remote: &str) -> Result<String> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
+    /// Get the remote main branch name (e.g., "origin/main").
+    /// Equivalent to `git symbolic-ref refs/remotes/<remote>/HEAD`
+    pub fn remote_main(&self, remote: &str) -> Result<String> {
+        let start = Instant::now();
         let ref_name = format!("refs/remotes/{}/HEAD", remote);
-        let reference = repo
+        let reference = self
+            .repo
             .find_reference(&ref_name)
             .with_context(|| format!("Failed to find remote HEAD: {}", ref_name))?;
 
-        // Resolve symbolic reference to its target
         let target = reference
             .symbolic_target()
             .ok_or_else(|| anyhow!("{} is not a symbolic reference", ref_name))?;
 
-        // Strip "refs/remotes/" prefix
         let result = target
             .strip_prefix("refs/remotes/")
             .unwrap_or(target)
@@ -128,63 +91,44 @@ pub fn remote_main(remote: &str) -> Result<String> {
 
         record_git_command(&["git2:symbolic-ref", remote], start.elapsed());
         Ok(result)
-    })
-}
+    }
 
-/// Check if two refs point to the same commit.
-/// Equivalent to comparing `git rev-parse <ref1>` and `git rev-parse <ref2>`
-pub fn shas_match(ref1: &str, ref2: &str) -> bool {
-    let start = Instant::now();
-    let result = REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding.as_ref()?;
+    /// Check if two refs point to the same commit.
+    /// Equivalent to comparing `git rev-parse <ref1>` and `git rev-parse <ref2>`
+    pub fn shas_match(&self, ref1: &str, ref2: &str) -> bool {
+        let start = Instant::now();
+        let result = (|| {
+            let obj1 = self.repo.revparse_single(ref1).ok()?;
+            let obj2 = self.repo.revparse_single(ref2).ok()?;
+            Some(obj1.id() == obj2.id())
+        })()
+        .unwrap_or(false);
+        record_git_command(&["git2:shas-match", ref1, ref2], start.elapsed());
+        result
+    }
 
-        let obj1 = repo.revparse_single(ref1).ok()?;
-        let obj2 = repo.revparse_single(ref2).ok()?;
-
-        Some(obj1.id() == obj2.id())
-    });
-    record_git_command(&["git2:shas-match", ref1, ref2], start.elapsed());
-    result.unwrap_or(false)
-}
-
-/// Get the repo root path.
-/// Equivalent to `git rev-parse --show-toplevel`
-pub fn repo_root() -> Result<String> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        let workdir = repo
+    /// Get the repo root path.
+    /// Equivalent to `git rev-parse --show-toplevel`
+    pub fn root(&self) -> Result<String> {
+        let start = Instant::now();
+        let workdir = self
+            .repo
             .workdir()
             .ok_or_else(|| anyhow!("Repository has no working directory"))?;
-
         let result = workdir
             .to_str()
             .ok_or_else(|| anyhow!("Invalid path encoding"))?
             .trim_end_matches('/')
             .to_string();
-
         record_git_command(&["git2:show-toplevel"], start.elapsed());
         Ok(result)
-    })
-}
+    }
 
-/// Get current branch name.
-/// Equivalent to `git rev-parse --abbrev-ref HEAD`
-pub fn current_branch() -> Result<String> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        let head = repo.head().context("Failed to get HEAD")?;
-
+    /// Get current branch name.
+    /// Equivalent to `git rev-parse --abbrev-ref HEAD`
+    pub fn current_branch(&self) -> Result<String> {
+        let start = Instant::now();
+        let head = self.repo.head().context("Failed to get HEAD")?;
         let branch_name = if head.is_branch() {
             head.shorthand()
                 .ok_or_else(|| anyhow!("HEAD has no shorthand name"))?
@@ -195,45 +139,35 @@ pub fn current_branch() -> Result<String> {
                 .ok_or_else(|| anyhow!("HEAD has no target"))?
                 .to_string()
         };
-
         record_git_command(&["git2:current-branch"], start.elapsed());
         Ok(branch_name)
-    })
-}
+    }
 
-/// Get the upstream tracking branch for a local branch.
-/// Equivalent to `git rev-parse --abbrev-ref --symbolic-full-name <branch>@{upstream}`
-pub fn get_upstream(branch: &str) -> Option<String> {
-    let start = Instant::now();
-    let result = REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding.as_ref()?;
+    /// Get the upstream tracking branch for a local branch.
+    /// Equivalent to `git rev-parse --abbrev-ref --symbolic-full-name <branch>@{upstream}`
+    pub fn get_upstream(&self, branch: &str) -> Option<String> {
+        let start = Instant::now();
+        let result = (|| {
+            let local_branch = self.repo.find_branch(branch, BranchType::Local).ok()?;
+            let upstream = local_branch.upstream().ok()?;
+            let name = upstream.name().ok()??;
+            Some(name.to_string())
+        })();
+        record_git_command(&["git2:get-upstream", branch], start.elapsed());
+        result
+    }
 
-        let local_branch = repo.find_branch(branch, BranchType::Local).ok()?;
-        let upstream = local_branch.upstream().ok()?;
-        let name = upstream.name().ok()??;
+    /// Get diff stats (additions, deletions) between two commits.
+    /// Equivalent to parsing `git log --numstat --pretty="" <base>..<head>`
+    pub fn diff_stats(&self, base: &str, head: &str) -> Result<(usize, usize)> {
+        let start = Instant::now();
 
-        Some(name.to_string())
-    });
-    record_git_command(&["git2:get-upstream", branch], start.elapsed());
-    result
-}
-
-/// Get diff stats (additions, deletions) between two commits.
-/// Equivalent to parsing `git log --numstat --pretty="" <base>..<head>`
-pub fn diff_stats(base: &str, head: &str) -> Result<(usize, usize)> {
-    let start = Instant::now();
-    REPO.with(|r| {
-        let binding = r.borrow();
-        let repo = binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("git2 repo not initialized"))?;
-
-        // Resolve refs to commits
-        let base_obj = repo
+        let base_obj = self
+            .repo
             .revparse_single(base)
             .with_context(|| format!("Failed to resolve base ref: {}", base))?;
-        let head_obj = repo
+        let head_obj = self
+            .repo
             .revparse_single(head)
             .with_context(|| format!("Failed to resolve head ref: {}", head))?;
 
@@ -247,15 +181,15 @@ pub fn diff_stats(base: &str, head: &str) -> Result<(usize, usize)> {
         let base_tree = base_commit.tree()?;
         let head_tree = head_commit.tree()?;
 
-        // Create diff between the two trees
-        let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
+        let diff = self
+            .repo
+            .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), None)?;
 
-        // Get diff stats
         let stats = diff.stats()?;
         let additions = stats.insertions();
         let deletions = stats.deletions();
 
         record_git_command(&["git2:diff-stats", base, head], start.elapsed());
         Ok((additions, deletions))
-    })
+    }
 }
