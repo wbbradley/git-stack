@@ -18,7 +18,6 @@ use crate::{
         GitTrunk,
         after_text,
         git_branch_exists,
-        git_remote_main,
         git_sha,
         git_trunk,
         is_ancestor,
@@ -258,7 +257,11 @@ impl State {
 
     /// Auto-cleanup missing branches silently during status display.
     /// Returns true if any branches were cleaned up.
-    pub(crate) fn auto_cleanup_missing_branches(&mut self, git: &GitRepo, repo: &str) -> Result<bool> {
+    pub(crate) fn auto_cleanup_missing_branches(
+        &mut self,
+        git: &GitRepo,
+        repo: &str,
+    ) -> Result<bool> {
         let Some(tree) = self.trees.get_mut(repo) else {
             return Ok(false);
         };
@@ -397,7 +400,12 @@ impl State {
             let mut removed_branches = Vec::new();
             let mut remounted_branches = Vec::new();
 
-            cleanup_tree_recursive(&repo_git, tree, &mut removed_branches, &mut remounted_branches);
+            cleanup_tree_recursive(
+                &repo_git,
+                tree,
+                &mut removed_branches,
+                &mut remounted_branches,
+            );
 
             std::env::set_current_dir(original_dir)?;
 
@@ -642,7 +650,12 @@ impl State {
     /// Try to auto-mount the current branch if it's not in the tree.
     /// Returns Ok(true) if the branch was auto-mounted, Ok(false) if it was already in the tree,
     /// or Err if auto-mount failed.
-    pub(crate) fn try_auto_mount(&mut self, git: &GitRepo, repo: &str, branch_name: &str) -> Result<bool> {
+    pub(crate) fn try_auto_mount(
+        &mut self,
+        git: &GitRepo,
+        repo: &str,
+        branch_name: &str,
+    ) -> Result<bool> {
         // Ensure the tree exists for this repo
         self.ensure_trunk(git, repo)?;
 

@@ -1,10 +1,11 @@
-use std::process::{Command, ExitStatus};
-use std::time::Instant;
+use std::{
+    process::{Command, ExitStatus},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::git2_ops::GitRepo;
-use crate::stats::record_git_command;
+use crate::{git2_ops::GitRepo, stats::record_git_command};
 
 pub const DEFAULT_REMOTE: &str = "origin";
 
@@ -150,10 +151,10 @@ pub(crate) fn git_branch_status(
     let exists = git_branch_exists(repo, branch);
     let parent_branch = match parent_branch {
         Some(parent_branch) => parent_branch.to_string(),
-        None => git_remote_main(repo, DEFAULT_REMOTE)?,
+        None => repo.remote_main(DEFAULT_REMOTE)?,
     };
     let is_descendent = exists && is_ancestor(repo, &parent_branch, branch)?;
-    let upstream_symbolic_name = git_get_upstream(repo, branch);
+    let upstream_symbolic_name = repo.get_upstream(branch);
     let upstream_synced = upstream_symbolic_name
         .as_ref()
         .is_some_and(|upstream| shas_match(repo, upstream, branch));
@@ -214,8 +215,8 @@ pub(crate) struct GitTrunk {
     pub(crate) main_branch: String,
 }
 
-pub(crate) fn git_trunk(repo: &GitRepo) -> Result<GitTrunk> {
-    let remote_main = git_remote_main(repo, DEFAULT_REMOTE)?;
+pub(crate) fn git_trunk(git_repo: &GitRepo) -> Result<GitTrunk> {
+    let remote_main = git_repo.remote_main(DEFAULT_REMOTE)?;
     let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
         .ok_or(anyhow!("no branch?"))?
         .to_string();
@@ -223,13 +224,4 @@ pub(crate) fn git_trunk(repo: &GitRepo) -> Result<GitTrunk> {
         remote_main,
         main_branch,
     })
-}
-
-/// Returns a string of the form "origin/main".
-pub(crate) fn git_remote_main(repo: &GitRepo, remote: &str) -> Result<String> {
-    repo.remote_main(remote)
-}
-
-pub(crate) fn git_get_upstream(repo: &GitRepo, branch: &str) -> Option<String> {
-    repo.get_upstream(branch)
 }

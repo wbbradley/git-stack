@@ -12,8 +12,6 @@ use git::{
     git_checkout_main,
     git_diff_stats,
     git_fetch,
-    git_get_upstream,
-    git_remote_main,
     git_sha,
     is_ancestor,
     run_git_status,
@@ -182,7 +180,7 @@ fn inner_main() -> Result<()> {
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
     let current_branch = git.current_branch()?;
-    let current_upstream = git_get_upstream(&git, "");
+    let current_upstream = git.get_upstream("");
     tracing::debug!(run_version, current_branch, current_upstream);
 
     match args.command {
@@ -310,12 +308,14 @@ fn recur_tree(
     parent_branch: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let Ok(branch_status) = git_branch_status(git, parent_branch, &branch.name).with_context(|| {
-        format!(
-            "attempting to fetch the branch status of {}",
-            branch.name.red()
-        )
-    }) else {
+    let Ok(branch_status) =
+        git_branch_status(git, parent_branch, &branch.name).with_context(|| {
+            format!(
+                "attempting to fetch the branch status of {}",
+                branch.name.red()
+            )
+        })
+    else {
         tracing::warn!("Branch {} does not exist", branch.name);
         return Ok(());
     };
@@ -499,6 +499,7 @@ fn status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restack(
     git: &GitRepo,
     mut state: State,
@@ -534,7 +535,13 @@ fn restack(
                 branch.name,
                 parent
             );
-            if push && !shas_match(git, &format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name) {
+            if push
+                && !shas_match(
+                    git,
+                    &format!("{DEFAULT_REMOTE}/{}", branch.name),
+                    &branch.name,
+                )
+            {
                 run_git(&[
                     "push",
                     match branch.stack_method {
