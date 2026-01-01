@@ -779,8 +779,9 @@ fn restack(
 }
 
 /// Sync PR bases to match git-stack parents after restack (graceful degradation)
+/// Uses a bottom-up traversal (leaves first) so each parent is processed once.
 fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) -> Result<()> {
-    use github::{GitHubClient, UpdatePrRequest, get_repo_identifier};
+    use github::{GitHubClient, PrDisplayState, UpdatePrRequest, get_repo_identifier};
 
     let repo_id = get_repo_identifier(git_repo)?;
     let client = GitHubClient::from_env(&repo_id)?;
@@ -790,50 +791,174 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
         .get_tree(repo)
         .ok_or_else(|| anyhow!("No stack tree found"))?;
 
-    // Collect all branches with their parents
-    let branches_with_parents = collect_branches_with_parents(tree, &tree.name);
-
     let trunk = crate::git::git_trunk(git_repo)?;
 
-    for (branch_name, expected_base) in branches_with_parents {
+    // Collect branches with depth for bottom-up processing
+    let branches_with_depth = collect_branches_with_depth(tree, &tree.name, 0);
+
+    // Sort by depth descending (leaves first) for bottom-up processing
+    let mut sorted_branches = branches_with_depth;
+    sorted_branches.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Track which parents we've already processed/created
+    let mut processed_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    processed_parents.insert(trunk.main_branch.clone()); // Trunk is always "processed"
+
+    // Fetch all open PRs once
+    let mut all_prs = client.list_open_prs(&repo_id)?;
+
+    for (branch_name, expected_base, _depth) in sorted_branches {
         // Skip trunk
         if branch_name == trunk.main_branch {
             continue;
         }
 
-        // Find PR for this branch
-        let pr = match client.find_pr_for_branch(&repo_id, &branch_name)? {
-            Some(pr) => pr,
-            None => continue,
-        };
-
-        // Check if base matches expected
-        let current_base = &pr.base.ref_name;
-        if current_base == &expected_base {
-            continue;
+        // First, ensure parent is ready (if not trunk and not already processed)
+        if expected_base != trunk.main_branch && !processed_parents.contains(&expected_base) {
+            ensure_parent_pr_ready(
+                git_repo,
+                &client,
+                &repo_id,
+                &mut all_prs,
+                &expected_base,
+                &trunk.main_branch,
+                state,
+                repo,
+            )?;
+            processed_parents.insert(expected_base.clone());
         }
 
-        // Base mismatch - retarget PR
-        println!(
-            "Retargeting PR #{} for '{}': {} → {}",
-            pr.number.to_string().green(),
-            branch_name.yellow(),
-            current_base.red(),
-            expected_base.green()
-        );
+        // Now sync this branch's PR
+        if let Some(pr) = all_prs.get(&branch_name) {
+            if pr.base.ref_name != expected_base {
+                println!(
+                    "Retargeting PR #{} for '{}': {} → {}",
+                    pr.number.to_string().green(),
+                    branch_name.yellow(),
+                    pr.base.ref_name.red(),
+                    expected_base.green()
+                );
 
-        client.update_pr(
-            &repo_id,
-            pr.number,
-            UpdatePrRequest {
-                base: Some(&expected_base),
-                title: None,
-                body: None,
-            },
-        )?;
+                client.update_pr(
+                    &repo_id,
+                    pr.number,
+                    UpdatePrRequest {
+                        base: Some(&expected_base),
+                        title: None,
+                        body: None,
+                    },
+                )?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Ensure a parent branch has a ready PR (create if missing, warn if merged)
+fn ensure_parent_pr_ready(
+    git_repo: &GitRepo,
+    client: &github::GitHubClient,
+    repo_id: &github::RepoIdentifier,
+    all_prs: &mut std::collections::HashMap<String, github::PullRequest>,
+    parent_branch: &str,
+    trunk: &str,
+    state: &State,
+    repo: &str,
+) -> Result<()> {
+    use github::{CreatePrRequest, PrDisplayState};
+
+    // Check if parent already has an open PR
+    if all_prs.contains_key(parent_branch) {
+        return Ok(()); // Parent PR exists and is open
+    }
+
+    // Check if parent branch exists on remote
+    let remote_ref = format!("{DEFAULT_REMOTE}/{}", parent_branch);
+    if !git_repo.branch_exists(&remote_ref) {
+        // Parent branch doesn't exist - likely merged
+        println!(
+            "{} Parent branch '{}' no longer exists on remote (likely merged).",
+            "Note:".cyan().bold(),
+            parent_branch.yellow()
+        );
+        println!(
+            "  Run `git stack unmount {}` to update your stack tree.",
+            parent_branch
+        );
+        return Ok(());
+    }
+
+    // Parent branch exists but has no open PR - check if there's a closed/merged one
+    if let Some(pr) = client.find_pr_for_branch(repo_id, parent_branch)? {
+        // This shouldn't happen since list_open_prs should have found it
+        // But handle it anyway
+        all_prs.insert(parent_branch.to_string(), pr);
+        return Ok(());
+    }
+
+    // No PR at all for parent - need to create one
+    // Get parent's parent (grandparent) from the tree
+    let grandparent = state
+        .get_parent_branch_of(repo, parent_branch)
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| trunk.to_string());
+
+    println!(
+        "Creating PR for parent '{}' with base '{}'...",
+        parent_branch.yellow(),
+        grandparent.green()
+    );
+
+    // Generate title from first commit
+    let title = git::run_git(&["log", "--format=%s", "-1", parent_branch])
+        .ok()
+        .and_then(|r| r.output())
+        .unwrap_or_else(|| parent_branch.to_string());
+
+    let pr = client.create_pr(
+        repo_id,
+        CreatePrRequest {
+            title: &title,
+            body: "",
+            head: parent_branch,
+            base: &grandparent,
+            draft: Some(true), // Create as draft since it might need review
+        },
+    )?;
+
+    println!(
+        "Created PR #{} for '{}': {}",
+        pr.number.to_string().green(),
+        parent_branch.yellow(),
+        pr.html_url.blue()
+    );
+
+    // Add to our cache
+    all_prs.insert(parent_branch.to_string(), pr);
+
+    Ok(())
+}
+
+/// Collect branches with their parent and depth for bottom-up processing
+fn collect_branches_with_depth(
+    branch: &Branch,
+    parent_name: &str,
+    depth: usize,
+) -> Vec<(String, String, usize)> {
+    let mut result = Vec::new();
+
+    // Add this branch (unless it's the root/trunk)
+    if branch.name != parent_name {
+        result.push((branch.name.clone(), parent_name.to_string(), depth));
+    }
+
+    // Recurse into children
+    for child in &branch.branches {
+        result.extend(collect_branches_with_depth(child, &branch.name, depth + 1));
+    }
+
+    result
 }
 
 fn git_push(git_repo: &GitRepo, branch: &str) -> Result<()> {
