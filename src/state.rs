@@ -561,6 +561,12 @@ impl State {
         let mut queue: VecDeque<(Option<String>, String)> = VecDeque::new();
         queue.push_back((None, trunk.main_branch.clone()));
         while let Some((parent, branch)) = queue.pop_front() {
+            // Skip branches that don't exist locally
+            if !git_branch_exists(git_repo, &branch) {
+                tracing::debug!("Skipping non-existent branch {} in refresh_lkgs", branch);
+                continue;
+            }
+
             if let Some(parent) = parent {
                 let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
                 if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
