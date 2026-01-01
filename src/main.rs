@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, git_checkout_main, git_fetch, run_git_status, shas_match};
+use git::{after_text, git_checkout_main, git_fetch, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -17,6 +17,7 @@ use crate::{
 
 mod git;
 mod git2_ops;
+mod github;
 mod state;
 mod stats;
 
@@ -113,6 +114,53 @@ enum Command {
         #[arg(long, short, default_value_t = false)]
         all: bool,
     },
+    /// Manage GitHub Pull Requests for stacked branches.
+    Pr {
+        #[command(subcommand)]
+        action: PrAction,
+    },
+    /// Manage GitHub authentication.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrAction {
+    /// Create a PR for the current branch with git-stack parent as base.
+    Create {
+        /// Branch to create PR for (defaults to current branch)
+        #[arg(long, short)]
+        branch: Option<String>,
+        /// PR title (defaults to first commit message)
+        #[arg(long, short)]
+        title: Option<String>,
+        /// PR body/description
+        #[arg(long, short = 'm')]
+        body: Option<String>,
+        /// Create as draft PR
+        #[arg(long)]
+        draft: bool,
+        /// Open PR in browser after creation
+        #[arg(long)]
+        web: bool,
+    },
+    /// Open PR in web browser.
+    View {
+        /// Branch whose PR to view (defaults to current)
+        branch: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Set up GitHub authentication interactively.
+    Login,
+    /// Show current auth status.
+    Status,
+    /// Remove stored authentication.
+    Logout,
 }
 
 fn main() {
@@ -250,6 +298,10 @@ fn inner_main() -> Result<()> {
                 state.show_note(&repo, &branch)
             }
         }
+        Some(Command::Pr { action }) => {
+            handle_pr_command(&git_repo, &mut state, &repo, &current_branch, action)
+        }
+        Some(Command::Auth { action }) => handle_auth_command(&git_repo, action),
         None => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
@@ -685,4 +737,248 @@ fn make_backup(run_version: &String, branch: &Branch, source: &str) -> Result<()
         tracing::warn!("failed to create backup branch {}", backup_branch);
     }
     Ok(())
+}
+
+// ============== GitHub PR Commands ==============
+
+fn handle_pr_command(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    current_branch: &str,
+    action: PrAction,
+) -> Result<()> {
+    use github::{
+        CreatePrRequest,
+        GitHubClient,
+        get_repo_identifier,
+        has_github_token,
+        open_in_browser,
+        setup_github_token_interactive,
+    };
+
+    let repo_id = get_repo_identifier(git_repo)?;
+
+    // Ensure we have auth configured
+    if !has_github_token(&repo_id.host) {
+        println!("{}", "GitHub authentication required.".yellow());
+        setup_github_token_interactive()?;
+    }
+
+    let client = GitHubClient::from_env(&repo_id)?;
+
+    match action {
+        PrAction::Create {
+            branch,
+            title,
+            body,
+            draft,
+            web,
+        } => {
+            let branch_name = branch.unwrap_or_else(|| current_branch.to_string());
+
+            // Ensure branch is in the tree
+            state.try_auto_mount(git_repo, repo, &branch_name)?;
+
+            // Get parent branch from git-stack tree
+            let parent = state
+                .get_parent_branch_of(repo, &branch_name)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Branch '{}' not found in git-stack tree. Run `git stack mount <parent>` first.",
+                        branch_name
+                    )
+                })?;
+
+            let base_branch = &parent.name;
+
+            // Check if this is the trunk branch (can't create PR for main)
+            let trunk = crate::git::git_trunk(git_repo)?;
+            if branch_name == trunk.main_branch {
+                bail!(
+                    "Cannot create a PR for the trunk branch '{}'.",
+                    branch_name.yellow()
+                );
+            }
+
+            // Check if branch exists on remote, push if not
+            let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch_name);
+            if !git_repo.branch_exists(&remote_ref) {
+                println!(
+                    "Branch '{}' is not on remote. Pushing...",
+                    branch_name.yellow()
+                );
+                git::run_git(&[
+                    "push",
+                    "-u",
+                    DEFAULT_REMOTE,
+                    &format!("{}:{}", branch_name, branch_name),
+                ])?;
+            }
+
+            // Check if PR already exists
+            if let Some(existing_pr) = client.find_pr_for_branch(&repo_id, &branch_name)? {
+                println!(
+                    "PR #{} already exists for branch '{}': {}",
+                    existing_pr.number.to_string().green(),
+                    branch_name.yellow(),
+                    existing_pr.html_url.blue()
+                );
+
+                // Update stored PR number if not already set
+                if let Some(branch) = state.get_tree_branch(repo, &branch_name) {
+                    if branch.pr_number.is_none() {
+                        if let Some(branch) =
+                            find_branch_by_name_mut(state.get_tree_mut(repo).unwrap(), &branch_name)
+                        {
+                            branch.pr_number = Some(existing_pr.number);
+                            state.save_state()?;
+                        }
+                    }
+                }
+
+                if web {
+                    open_in_browser(&existing_pr.html_url)?;
+                }
+                return Ok(());
+            }
+
+            // Generate title from first commit if not provided
+            let title = title.unwrap_or_else(|| {
+                // Get commit message of the branch's first unique commit
+                let commit_msg = git::run_git(&["log", "--format=%s", "-1", &branch_name])
+                    .ok()
+                    .and_then(|r| r.output())
+                    .unwrap_or_else(|| branch_name.clone());
+                commit_msg
+            });
+
+            let body = body.unwrap_or_default();
+
+            println!(
+                "Creating PR for '{}' with base '{}'...",
+                branch_name.yellow(),
+                base_branch.green()
+            );
+
+            let pr = client.create_pr(
+                &repo_id,
+                CreatePrRequest {
+                    title: &title,
+                    body: &body,
+                    head: &branch_name,
+                    base: base_branch,
+                    draft: if draft { Some(true) } else { None },
+                },
+            )?;
+
+            println!(
+                "Created PR #{}: {}",
+                pr.number.to_string().green(),
+                pr.html_url.blue()
+            );
+
+            // Store PR number in state
+            if let Some(branch) =
+                find_branch_by_name_mut(state.get_tree_mut(repo).unwrap(), &branch_name)
+            {
+                branch.pr_number = Some(pr.number);
+                state.save_state()?;
+            }
+
+            if web {
+                open_in_browser(&pr.html_url)?;
+            }
+
+            Ok(())
+        }
+        PrAction::View { branch } => {
+            let branch_name = branch.unwrap_or_else(|| current_branch.to_string());
+
+            // Check if we have a stored PR number
+            let pr_number = state
+                .get_tree_branch(repo, &branch_name)
+                .and_then(|b| b.pr_number);
+
+            let pr = if let Some(pr_number) = pr_number {
+                client.get_pr(&repo_id, pr_number)?
+            } else {
+                // Try to find PR by branch name
+                client
+                    .find_pr_for_branch(&repo_id, &branch_name)?
+                    .ok_or_else(|| anyhow!("No PR found for branch '{}'", branch_name))?
+            };
+
+            println!("Opening PR #{}: {}", pr.number, pr.html_url);
+            open_in_browser(&pr.html_url)?;
+            Ok(())
+        }
+    }
+}
+
+fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
+    if tree.name == name {
+        Some(tree)
+    } else {
+        for child in &mut tree.branches {
+            if let Some(found) = find_branch_by_name_mut(child, name) {
+                return Some(found);
+            }
+        }
+        None
+    }
+}
+
+// ============== GitHub Auth Commands ==============
+
+fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
+    use github::{
+        get_repo_identifier,
+        has_github_token,
+        save_github_token,
+        setup_github_token_interactive,
+    };
+
+    match action {
+        AuthAction::Login => {
+            setup_github_token_interactive()?;
+            println!(
+                "{}",
+                "GitHub authentication configured successfully.".green()
+            );
+            Ok(())
+        }
+        AuthAction::Status => {
+            // Try to get repo identifier for host-specific check
+            let host = get_repo_identifier(git_repo)
+                .map(|r| r.host)
+                .unwrap_or_else(|_| "github.com".to_string());
+
+            if has_github_token(&host) {
+                println!("{}", "GitHub token is configured.".green());
+            } else {
+                println!("{}", "No GitHub token configured.".yellow());
+                println!("Run `git stack auth login` to set up authentication.");
+            }
+            Ok(())
+        }
+        AuthAction::Logout => {
+            // Remove the config file
+            let base_dirs = xdg::BaseDirectories::with_prefix("git-stack");
+            if let Ok(config_path) = base_dirs.get_config_file("github.yaml").ok_or(()) {
+                if config_path.exists() {
+                    std::fs::remove_file(&config_path)?;
+                    println!("GitHub token removed from {}", config_path.display());
+                } else {
+                    println!("No stored GitHub token found.");
+                }
+            } else {
+                println!("No stored GitHub token found.");
+            }
+            println!(
+                "Note: Tokens in environment variables (GITHUB_TOKEN, GH_TOKEN) or git config are not affected."
+            );
+            Ok(())
+        }
+    }
 }

@@ -42,6 +42,9 @@ pub struct Branch {
     pub note: Option<String>,
     /// The last-known-good parent of the branch. For use in restacking or moving branches.
     pub lkg_parent: Option<String>,
+    /// The GitHub PR number associated with this branch, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
     /// The upstream branch reference.
     pub branches: Vec<Branch>,
 }
@@ -53,6 +56,7 @@ impl Branch {
             note: None,
             stack_method: StackMethod::default(),
             lkg_parent,
+            pr_number: None,
             branches: vec![],
         }
     }
@@ -96,7 +100,7 @@ impl State {
 
     pub fn save_state(&self) -> Result<()> {
         let config_path = get_xdg_path()?;
-        tracing::debug!(?self, ?config_path, "Saving state to config file");
+        tracing::trace!(?self, ?config_path, "Saving state to config file");
         Ok(fs::write(config_path, serde_yaml::to_string(&self)?)?)
     }
 
@@ -911,6 +915,7 @@ mod tests {
                     stack_method: super::StackMethod::ApplyMerge,
                     note: None,
                     lkg_parent: None,
+                    pr_number: None,
                     branches: vec![],
                 },
             )]
@@ -932,5 +937,6 @@ mod tests {
         let tree = state.trees.get("/tmp/foo").unwrap();
         assert_eq!(tree.name, "main");
         assert_eq!(tree.stack_method, super::StackMethod::ApplyMerge);
+        assert_eq!(tree.pr_number, None);
     }
 }
