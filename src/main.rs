@@ -767,6 +767,72 @@ fn restack(
     );
     tracing::info!("Done.");
     state.refresh_lkgs(git_repo, repo)?;
+
+    // Sync PR bases when pushing (graceful degradation on failure)
+    if push {
+        if let Err(e) = sync_pr_bases_after_restack(git_repo, &state, repo) {
+            tracing::debug!("PR sync skipped: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Sync PR bases to match git-stack parents after restack (graceful degradation)
+fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) -> Result<()> {
+    use github::{GitHubClient, UpdatePrRequest, get_repo_identifier};
+
+    let repo_id = get_repo_identifier(git_repo)?;
+    let client = GitHubClient::from_env(&repo_id)?;
+
+    // Get the tree
+    let tree = state
+        .get_tree(repo)
+        .ok_or_else(|| anyhow!("No stack tree found"))?;
+
+    // Collect all branches with their parents
+    let branches_with_parents = collect_branches_with_parents(tree, &tree.name);
+
+    let trunk = crate::git::git_trunk(git_repo)?;
+
+    for (branch_name, expected_base) in branches_with_parents {
+        // Skip trunk
+        if branch_name == trunk.main_branch {
+            continue;
+        }
+
+        // Find PR for this branch
+        let pr = match client.find_pr_for_branch(&repo_id, &branch_name)? {
+            Some(pr) => pr,
+            None => continue,
+        };
+
+        // Check if base matches expected
+        let current_base = &pr.base.ref_name;
+        if current_base == &expected_base {
+            continue;
+        }
+
+        // Base mismatch - retarget PR
+        println!(
+            "Retargeting PR #{} for '{}': {} → {}",
+            pr.number.to_string().green(),
+            branch_name.yellow(),
+            current_base.red(),
+            expected_base.green()
+        );
+
+        client.update_pr(
+            &repo_id,
+            pr.number,
+            UpdatePrRequest {
+                base: Some(&expected_base),
+                title: None,
+                body: None,
+            },
+        )?;
+    }
+
     Ok(())
 }
 
@@ -972,7 +1038,126 @@ fn handle_pr_command(
             open_in_browser(&pr.html_url)?;
             Ok(())
         }
+        PrAction::Sync { all, dry_run } => {
+            use github::UpdatePrRequest;
+
+            // Get branches to sync
+            let branches_to_sync: Vec<(String, String)> = if all {
+                // Collect all branches and their parents from the tree
+                let tree = state
+                    .get_tree(repo)
+                    .ok_or_else(|| anyhow!("No stack tree found for repo"))?;
+                collect_branches_with_parents(tree, &tree.name)
+            } else {
+                // Just current branch
+                let parent = state
+                    .get_parent_branch_of(repo, current_branch)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Branch '{}' not found in git-stack tree",
+                            current_branch
+                        )
+                    })?;
+                vec![(current_branch.to_string(), parent.name.clone())]
+            };
+
+            let mut synced_count = 0;
+            let mut skipped_count = 0;
+
+            for (branch_name, expected_base) in branches_to_sync {
+                // Skip trunk branch
+                let trunk = crate::git::git_trunk(git_repo)?;
+                if branch_name == trunk.main_branch {
+                    continue;
+                }
+
+                // Find PR for this branch
+                let pr = match client.find_pr_for_branch(&repo_id, &branch_name)? {
+                    Some(pr) => pr,
+                    None => {
+                        tracing::debug!("No PR found for branch '{}'", branch_name);
+                        continue;
+                    }
+                };
+
+                // Check if base matches expected
+                let current_base = &pr.base.ref_name;
+                if current_base == &expected_base {
+                    tracing::debug!(
+                        "PR #{} for '{}' already has correct base '{}'",
+                        pr.number,
+                        branch_name,
+                        expected_base
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+
+                // Base mismatch - need to retarget
+                if dry_run {
+                    println!(
+                        "[dry-run] Would retarget PR #{} for '{}': {} → {}",
+                        pr.number.to_string().green(),
+                        branch_name.yellow(),
+                        current_base.red(),
+                        expected_base.green()
+                    );
+                } else {
+                    println!(
+                        "Retargeting PR #{} for '{}': {} → {}",
+                        pr.number.to_string().green(),
+                        branch_name.yellow(),
+                        current_base.red(),
+                        expected_base.green()
+                    );
+
+                    client.update_pr(
+                        &repo_id,
+                        pr.number,
+                        UpdatePrRequest {
+                            base: Some(&expected_base),
+                            title: None,
+                            body: None,
+                        },
+                    )?;
+                }
+                synced_count += 1;
+            }
+
+            if dry_run {
+                println!(
+                    "\n[dry-run] Would sync {} PR(s), {} already correct",
+                    synced_count, skipped_count
+                );
+            } else if synced_count > 0 {
+                println!(
+                    "\nSynced {} PR(s), {} already correct",
+                    synced_count, skipped_count
+                );
+            } else {
+                println!("All PRs already have correct bases");
+            }
+
+            Ok(())
+        }
     }
+}
+
+/// Collect all branches with their parent branch names from the tree
+fn collect_branches_with_parents(branch: &Branch, parent_name: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    // Add this branch (unless it's the root/trunk)
+    if branch.name != parent_name {
+        result.push((branch.name.clone(), parent_name.to_string()));
+    }
+
+    // Recurse into children
+    for child in &branch.branches {
+        result.extend(collect_branches_with_parents(child, &branch.name));
+    }
+
+    result
 }
 
 fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a mut Branch> {
