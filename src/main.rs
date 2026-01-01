@@ -815,7 +815,7 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
 
         // First, ensure parent is ready (if not trunk and not already processed)
         if expected_base != trunk.main_branch && !processed_parents.contains(&expected_base) {
-            ensure_parent_pr_ready(
+            ensure_branch_pr(
                 git_repo,
                 &client,
                 &repo_id,
@@ -824,6 +824,7 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
                 &trunk.main_branch,
                 state,
                 repo,
+                false, // Don't push - if not on remote, likely merged
             )?;
             processed_parents.insert(expected_base.clone());
         }
@@ -855,88 +856,99 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
     Ok(())
 }
 
-/// Ensure a parent branch has a ready PR (create if missing, warn if merged)
-fn ensure_parent_pr_ready(
+/// Ensure a branch has a PR, optionally pushing if not on remote.
+/// - `push_if_missing`: if true, push the branch if not on remote; if false, warn about likely merge
+fn ensure_branch_pr(
     git_repo: &GitRepo,
     client: &github::GitHubClient,
     repo_id: &github::RepoIdentifier,
     all_prs: &mut std::collections::HashMap<String, github::PullRequest>,
-    parent_branch: &str,
+    branch_name: &str,
     trunk: &str,
     state: &State,
     repo: &str,
+    push_if_missing: bool,
 ) -> Result<()> {
     use github::CreatePrRequest;
 
-    // Check if parent already has an open PR
-    if all_prs.contains_key(parent_branch) {
-        return Ok(()); // Parent PR exists and is open
-    }
-
-    // Check if parent branch exists on remote
-    let remote_ref = format!("{DEFAULT_REMOTE}/{}", parent_branch);
-    if !git_repo.branch_exists(&remote_ref) {
-        // Parent branch doesn't exist - likely merged
-        println!(
-            "{} Parent branch '{}' no longer exists on remote (likely merged).",
-            "Note:".cyan().bold(),
-            parent_branch.yellow()
-        );
-        println!(
-            "  Run `git stack unmount {}` to update your stack tree.",
-            parent_branch
-        );
+    // Check if already has an open PR
+    if all_prs.contains_key(branch_name) {
         return Ok(());
     }
 
-    // Parent branch exists but has no open PR - check if there's a closed/merged one
-    if let Some(pr) = client.find_pr_for_branch(repo_id, parent_branch)? {
-        // This shouldn't happen since list_open_prs should have found it
-        // But handle it anyway
-        all_prs.insert(parent_branch.to_string(), pr);
+    // Check if branch exists on remote
+    let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch_name);
+    if !git_repo.ref_exists(&remote_ref) {
+        if push_if_missing {
+            // Push the branch
+            println!(
+                "Branch '{}' is not on remote. Pushing...",
+                branch_name.yellow()
+            );
+            git::run_git(&[
+                "push",
+                "-u",
+                DEFAULT_REMOTE,
+                &format!("{}:{}", branch_name, branch_name),
+            ])?;
+        } else {
+            // Branch doesn't exist - likely merged
+            println!(
+                "{} Branch '{}' no longer exists on remote (likely merged).",
+                "Note:".cyan().bold(),
+                branch_name.yellow()
+            );
+            println!(
+                "  Run `git stack unmount {}` to update your stack tree.",
+                branch_name
+            );
+            return Ok(());
+        }
+    }
+
+    // Check if there's an existing PR we didn't see
+    if let Some(pr) = client.find_pr_for_branch(repo_id, branch_name)? {
+        all_prs.insert(branch_name.to_string(), pr);
         return Ok(());
     }
 
-    // No PR at all for parent - need to create one
-    // Get parent's parent (grandparent) from the tree
-    let grandparent = state
-        .get_parent_branch_of(repo, parent_branch)
+    // No PR - create one
+    let parent = state
+        .get_parent_branch_of(repo, branch_name)
         .map(|b| b.name.clone())
         .unwrap_or_else(|| trunk.to_string());
 
     println!(
-        "Creating PR for parent '{}' with base '{}'...",
-        parent_branch.yellow(),
-        grandparent.green()
+        "Creating PR for '{}' with base '{}'...",
+        branch_name.yellow(),
+        parent.green()
     );
 
     // Generate title from first commit
-    let title = git::run_git(&["log", "--format=%s", "-1", parent_branch])
+    let title = git::run_git(&["log", "--format=%s", "-1", branch_name])
         .ok()
         .and_then(|r| r.output())
-        .unwrap_or_else(|| parent_branch.to_string());
+        .unwrap_or_else(|| branch_name.to_string());
 
     let pr = client.create_pr(
         repo_id,
         CreatePrRequest {
             title: &title,
             body: "",
-            head: parent_branch,
-            base: &grandparent,
-            draft: Some(true), // Create as draft since it might need review
+            head: branch_name,
+            base: &parent,
+            draft: Some(true),
         },
     )?;
 
     println!(
         "Created PR #{} for '{}': {}",
         pr.number.to_string().green(),
-        parent_branch.yellow(),
+        branch_name.yellow(),
         pr.html_url.blue()
     );
 
-    // Add to our cache
-    all_prs.insert(parent_branch.to_string(), pr);
-
+    all_prs.insert(branch_name.to_string(), pr);
     Ok(())
 }
 
@@ -1057,15 +1069,16 @@ fn handle_pr_command(
 
             // Ensure all ancestors have PRs (recursive creation)
             for ancestor in &ancestor_chain {
-                ensure_branch_has_pr(
+                ensure_branch_pr(
                     git_repo,
                     &client,
                     &repo_id,
                     &mut all_prs,
-                    state,
-                    repo,
                     ancestor,
                     &trunk.main_branch,
+                    state,
+                    repo,
+                    true, // Push if not on remote
                 )?;
             }
 
@@ -1149,7 +1162,7 @@ fn handle_pr_command(
                     title: &title,
                     body: &body,
                     head: &branch_name,
-                    base: base_branch,
+                    base: &base_branch,
                     draft: if draft { Some(true) } else { None },
                 },
             )?;
@@ -1256,7 +1269,7 @@ fn handle_pr_command(
                         }
                     } else {
                         let before_count = all_prs.len();
-                        ensure_parent_pr_ready(
+                        ensure_branch_pr(
                             git_repo,
                             &client,
                             &repo_id,
@@ -1265,6 +1278,7 @@ fn handle_pr_command(
                             &trunk.main_branch,
                             state,
                             repo,
+                            false, // Don't push - if not on remote, likely merged
                         )?;
                         if all_prs.len() > before_count {
                             created_count += 1;
