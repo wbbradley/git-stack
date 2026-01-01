@@ -70,6 +70,41 @@ pub enum PrState {
     Closed,
 }
 
+/// Display-friendly PR state (computed from API fields)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrDisplayState {
+    Draft,
+    Open,
+    Merged,
+    Closed,
+}
+
+impl std::fmt::Display for PrDisplayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "draft"),
+            Self::Open => write!(f, "open"),
+            Self::Merged => write!(f, "merged"),
+            Self::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+impl PullRequest {
+    /// Get the display state for this PR
+    pub fn display_state(&self) -> PrDisplayState {
+        if self.merged {
+            PrDisplayState::Merged
+        } else if self.state == PrState::Closed {
+            PrDisplayState::Closed
+        } else if self.draft {
+            PrDisplayState::Draft
+        } else {
+            PrDisplayState::Open
+        }
+    }
+}
+
 /// PR creation request
 #[derive(Debug, Serialize)]
 pub struct CreatePrRequest<'a> {
@@ -229,6 +264,53 @@ impl GitHubClient {
             .body_mut()
             .read_json()
             .map_err(|e| GitHubError::Network(e.to_string()))
+    }
+
+    /// List all open PRs for a repository
+    /// Returns a map of head branch name -> PullRequest for easy lookup
+    pub fn list_open_prs(
+        &self,
+        repo: &RepoIdentifier,
+    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+        let mut all_prs = Vec::new();
+        let mut page = 1;
+        let per_page = 100;
+
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/pulls?state=open&per_page={}&page={}",
+                self.config.api_base, repo.owner, repo.repo, per_page, page
+            );
+
+            let mut response = ureq::get(&url)
+                .header("Authorization", &format!("Bearer {}", self.config.token))
+                .header("Accept", "application/vnd.github.v3+json")
+                .header("User-Agent", "git-stack")
+                .call()
+                .map_err(|e| self.handle_ureq_error(e))?;
+
+            let prs: Vec<PullRequest> = response
+                .body_mut()
+                .read_json()
+                .map_err(|e| GitHubError::Network(e.to_string()))?;
+
+            let count = prs.len();
+            all_prs.extend(prs);
+
+            // If we got fewer than per_page results, we've reached the end
+            if count < per_page {
+                break;
+            }
+            page += 1;
+        }
+
+        // Build map of head branch name -> PR
+        let pr_map: std::collections::HashMap<String, PullRequest> = all_prs
+            .into_iter()
+            .map(|pr| (pr.head.ref_name.clone(), pr))
+            .collect();
+
+        Ok(pr_map)
     }
 
     /// Update PR (e.g., to retarget base)

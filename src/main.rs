@@ -380,6 +380,7 @@ fn recur_tree(
     orig_branch: &str,
     parent_branch: Option<&str>,
     verbose: bool,
+    pr_cache: Option<&std::collections::HashMap<String, github::PullRequest>>,
 ) -> Result<()> {
     let Ok(branch_status) = git_repo
         .branch_status(parent_branch, &branch.name)
@@ -498,7 +499,24 @@ fn recur_tree(
             );
         }
     } else {
-        println!("{}{}", branch_name_colored, diff_stats);
+        // Format PR info for display
+        let pr_info = if let Some(cache) = pr_cache {
+            if let Some(pr) = cache.get(&branch.name) {
+                let state = pr.display_state();
+                let state_colored = match state {
+                    github::PrDisplayState::Draft => format!("[{}]", state).truecolor(128, 128, 128),
+                    github::PrDisplayState::Open => format!("[{}]", state).truecolor(142, 192, 124),
+                    github::PrDisplayState::Merged => format!("[{}]", state).truecolor(180, 142, 173),
+                    github::PrDisplayState::Closed => format!("[{}]", state).truecolor(204, 36, 29),
+                };
+                format!("  #{} {}", pr.number, state_colored)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        println!("{}{}{}", branch_name_colored, diff_stats, pr_info);
     }
 
     let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
@@ -536,9 +554,30 @@ fn recur_tree(
             orig_branch,
             Some(branch.name.as_ref()),
             verbose,
+            pr_cache,
         )?;
     }
     Ok(())
+}
+
+/// Fetch PR cache from GitHub, returning None on any error (graceful degradation)
+fn fetch_pr_cache(
+    git_repo: &GitRepo,
+) -> Option<std::collections::HashMap<String, github::PullRequest>> {
+    // Try to get repo identifier from remote URL
+    let repo_id = github::get_repo_identifier(git_repo).ok()?;
+
+    // Try to get GitHub client (may fail if no token configured)
+    let client = github::GitHubClient::from_env(&repo_id).ok()?;
+
+    // Try to fetch all open PRs
+    match client.list_open_prs(&repo_id) {
+        Ok(prs) => Some(prs),
+        Err(e) => {
+            tracing::debug!("Failed to fetch PR info: {}", e);
+            None
+        }
+    }
 }
 
 fn status(
@@ -558,10 +597,21 @@ fn status(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
+    // Try to fetch PR info from GitHub (graceful degradation on failure)
+    let pr_cache = fetch_pr_cache(git_repo);
+
     let tree = state
         .get_tree_mut(repo)
         .expect("tree exists after ensure_trunk");
-    recur_tree(git_repo, tree, 0, orig_branch, None, verbose)?;
+    recur_tree(
+        git_repo,
+        tree,
+        0,
+        orig_branch,
+        None,
+        verbose,
+        pr_cache.as_ref(),
+    )?;
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
             "The current branch {} is not in the stack tree.",
