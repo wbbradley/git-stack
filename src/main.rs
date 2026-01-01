@@ -151,6 +151,15 @@ enum PrAction {
         /// Branch whose PR to view (defaults to current)
         branch: Option<String>,
     },
+    /// Sync PR bases to match git-stack parent branches.
+    Sync {
+        /// Sync all PRs in stack (defaults to current branch only)
+        #[arg(long, short)]
+        all: bool,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
