@@ -124,6 +124,16 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Import branch stack from existing GitHub PRs.
+    /// Reconstructs the git-stack tree by walking the PR base chain.
+    Import {
+        /// Branch to import (defaults to current branch)
+        #[arg(long, short)]
+        branch: Option<String>,
+        /// Import all open PRs for the repo, not just the current branch's chain
+        #[arg(long, short)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -150,6 +160,15 @@ enum PrAction {
     View {
         /// Branch whose PR to view (defaults to current)
         branch: Option<String>,
+    },
+    /// Sync PR bases to match git-stack parent branches.
+    Sync {
+        /// Sync all PRs in stack (defaults to current branch only)
+        #[arg(long, short)]
+        all: bool,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -302,6 +321,10 @@ fn inner_main() -> Result<()> {
             handle_pr_command(&git_repo, &mut state, &repo, &current_branch, action)
         }
         Some(Command::Auth { action }) => handle_auth_command(&git_repo, action),
+        Some(Command::Import { branch, all }) => {
+            let branch = branch.unwrap_or(current_branch);
+            handle_import_command(&git_repo, &mut state, &repo, &branch, all)
+        }
         None => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
@@ -758,7 +781,210 @@ fn restack(
     );
     tracing::info!("Done.");
     state.refresh_lkgs(git_repo, repo)?;
+
+    // Sync PR bases when pushing (graceful degradation on failure)
+    if push {
+        if let Err(e) = sync_pr_bases_after_restack(git_repo, &state, repo) {
+            tracing::debug!("PR sync skipped: {}", e);
+        }
+    }
+
     Ok(())
+}
+
+/// Sync PR bases to match git-stack parents after restack (graceful degradation)
+/// Uses a bottom-up traversal (leaves first) so each parent is processed once.
+fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) -> Result<()> {
+    use github::{GitHubClient, UpdatePrRequest, get_repo_identifier};
+
+    let repo_id = get_repo_identifier(git_repo)?;
+    let client = GitHubClient::from_env(&repo_id)?;
+
+    // Get the tree
+    let tree = state
+        .get_tree(repo)
+        .ok_or_else(|| anyhow!("No stack tree found"))?;
+
+    let trunk = crate::git::git_trunk(git_repo)?;
+
+    // Collect branches with depth for bottom-up processing
+    let branches_with_depth = collect_branches_with_depth(tree, &tree.name, 0);
+
+    // Sort by depth descending (leaves first) for bottom-up processing
+    let mut sorted_branches = branches_with_depth;
+    sorted_branches.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Track which parents we've already processed/created
+    let mut processed_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    processed_parents.insert(trunk.main_branch.clone()); // Trunk is always "processed"
+
+    // Fetch all open PRs once
+    let mut all_prs = client.list_open_prs(&repo_id)?;
+
+    for (branch_name, expected_base, _depth) in sorted_branches {
+        // Skip trunk
+        if branch_name == trunk.main_branch {
+            continue;
+        }
+
+        // First, ensure parent is ready (if not trunk and not already processed)
+        if expected_base != trunk.main_branch && !processed_parents.contains(&expected_base) {
+            ensure_branch_pr(
+                git_repo,
+                &client,
+                &repo_id,
+                &mut all_prs,
+                &expected_base,
+                &trunk.main_branch,
+                state,
+                repo,
+                false, // Don't push - if not on remote, likely merged
+            )?;
+            processed_parents.insert(expected_base.clone());
+        }
+
+        // Now sync this branch's PR
+        if let Some(pr) = all_prs.get(&branch_name) {
+            if pr.base.ref_name != expected_base {
+                println!(
+                    "Retargeting PR #{} for '{}': {} → {}",
+                    pr.number.to_string().green(),
+                    branch_name.yellow(),
+                    pr.base.ref_name.red(),
+                    expected_base.green()
+                );
+
+                client.update_pr(
+                    &repo_id,
+                    pr.number,
+                    UpdatePrRequest {
+                        base: Some(&expected_base),
+                        title: None,
+                        body: None,
+                    },
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensure a branch has a PR, optionally pushing if not on remote.
+/// - `push_if_missing`: if true, push the branch if not on remote; if false, warn about likely merge
+fn ensure_branch_pr(
+    git_repo: &GitRepo,
+    client: &github::GitHubClient,
+    repo_id: &github::RepoIdentifier,
+    all_prs: &mut std::collections::HashMap<String, github::PullRequest>,
+    branch_name: &str,
+    trunk: &str,
+    state: &State,
+    repo: &str,
+    push_if_missing: bool,
+) -> Result<()> {
+    use github::CreatePrRequest;
+
+    // Check if already has an open PR
+    if all_prs.contains_key(branch_name) {
+        return Ok(());
+    }
+
+    // Check if branch exists on remote
+    let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch_name);
+    if !git_repo.ref_exists(&remote_ref) {
+        if push_if_missing {
+            // Push the branch
+            println!(
+                "Branch '{}' is not on remote. Pushing...",
+                branch_name.yellow()
+            );
+            git::run_git(&[
+                "push",
+                "-u",
+                DEFAULT_REMOTE,
+                &format!("{}:{}", branch_name, branch_name),
+            ])?;
+        } else {
+            // Branch doesn't exist - likely merged
+            println!(
+                "{} Branch '{}' no longer exists on remote (likely merged).",
+                "Note:".cyan().bold(),
+                branch_name.yellow()
+            );
+            println!(
+                "  Run `git stack unmount {}` to update your stack tree.",
+                branch_name
+            );
+            return Ok(());
+        }
+    }
+
+    // Check if there's an existing PR we didn't see
+    if let Some(pr) = client.find_pr_for_branch(repo_id, branch_name)? {
+        all_prs.insert(branch_name.to_string(), pr);
+        return Ok(());
+    }
+
+    // No PR - create one
+    let parent = state
+        .get_parent_branch_of(repo, branch_name)
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| trunk.to_string());
+
+    println!(
+        "Creating PR for '{}' with base '{}'...",
+        branch_name.yellow(),
+        parent.green()
+    );
+
+    // Generate title from first commit
+    let title = git::run_git(&["log", "--format=%s", "-1", branch_name])
+        .ok()
+        .and_then(|r| r.output())
+        .unwrap_or_else(|| branch_name.to_string());
+
+    let pr = client.create_pr(
+        repo_id,
+        CreatePrRequest {
+            title: &title,
+            body: "",
+            head: branch_name,
+            base: &parent,
+            draft: Some(true),
+        },
+    )?;
+
+    println!(
+        "Created PR #{} for '{}': {}",
+        pr.number.to_string().green(),
+        branch_name.yellow(),
+        pr.html_url.blue()
+    );
+
+    all_prs.insert(branch_name.to_string(), pr);
+    Ok(())
+}
+
+/// Collect branches with their parent and depth for bottom-up processing
+fn collect_branches_with_depth(
+    branch: &Branch,
+    parent_name: &str,
+    depth: usize,
+) -> Vec<(String, String, usize)> {
+    let mut result = Vec::new();
+
+    // Add this branch (unless it's the root/trunk)
+    if branch.name != parent_name {
+        result.push((branch.name.clone(), parent_name.to_string(), depth));
+    }
+
+    // Recurse into children
+    for child in &branch.branches {
+        result.extend(collect_branches_with_depth(child, &branch.name, depth + 1));
+    }
+
+    result
 }
 
 fn git_push(git_repo: &GitRepo, branch: &str) -> Result<()> {
@@ -786,6 +1012,276 @@ fn make_backup(run_version: &String, branch: &Branch, source: &str) -> Result<()
     if !run_git_status(&["branch", &backup_branch, source], None)?.success() {
         tracing::warn!("failed to create backup branch {}", backup_branch);
     }
+    Ok(())
+}
+
+// ============== GitHub Import Command ==============
+
+fn handle_import_command(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    branch: &str,
+    import_all: bool,
+) -> Result<()> {
+    use github::{GitHubClient, get_repo_identifier, has_github_token, setup_github_token_interactive};
+
+    let repo_id = get_repo_identifier(git_repo)?;
+
+    // Ensure we have auth configured
+    if !has_github_token(&repo_id.host) {
+        println!("{}", "GitHub authentication required.".yellow());
+        setup_github_token_interactive()?;
+    }
+
+    let client = GitHubClient::from_env(&repo_id)?;
+    let trunk = crate::git::git_trunk(git_repo)?;
+
+    // Ensure trunk exists in tree
+    state.ensure_trunk(git_repo, repo)?;
+
+    if import_all {
+        // Import all open PRs
+        import_all_prs(git_repo, &client, &repo_id, state, repo, &trunk.main_branch)?;
+    } else {
+        // Import just this branch's chain
+        import_branch_chain(git_repo, &client, &repo_id, state, repo, branch, &trunk.main_branch)?;
+    }
+
+    state.save_state()?;
+    println!("\n{}", "Import complete!".green().bold());
+
+    // Show the tree
+    println!();
+    let tree = state.get_tree(repo).expect("tree exists after import");
+    let pr_cache = fetch_pr_cache(git_repo);
+    recur_tree(git_repo, tree, 0, branch, None, false, pr_cache.as_ref())?;
+
+    Ok(())
+}
+
+/// Import a single branch's PR chain back to trunk
+fn import_branch_chain(
+    git_repo: &GitRepo,
+    client: &github::GitHubClient,
+    repo_id: &github::RepoIdentifier,
+    state: &mut State,
+    repo: &str,
+    branch: &str,
+    trunk: &str,
+) -> Result<()> {
+    // Find PR for this branch
+    let pr = client
+        .find_pr_for_branch(repo_id, branch)?
+        .ok_or_else(|| anyhow!("No open PR found for branch '{}'. Nothing to import.", branch))?;
+
+    println!(
+        "Found PR #{} for '{}' (base: '{}')",
+        pr.number.to_string().green(),
+        branch.yellow(),
+        pr.base.ref_name.cyan()
+    );
+
+    // Build the chain from this branch up to trunk
+    let mut chain: Vec<(String, Option<github::PullRequest>)> = vec![(branch.to_string(), Some(pr.clone()))];
+    let mut current_base = pr.base.ref_name.clone();
+
+    while current_base != trunk {
+        // Check if we already have this branch in our chain (cycle detection)
+        if chain.iter().any(|(b, _)| b == &current_base) {
+            println!(
+                "{} Detected cycle at '{}', stopping chain walk",
+                "Warning:".yellow().bold(),
+                current_base
+            );
+            break;
+        }
+
+        // Find PR for the base branch
+        match client.find_pr_for_branch(repo_id, &current_base)? {
+            Some(base_pr) => {
+                println!(
+                    "Found PR #{} for '{}' (base: '{}')",
+                    base_pr.number.to_string().green(),
+                    current_base.yellow(),
+                    base_pr.base.ref_name.cyan()
+                );
+                let next_base = base_pr.base.ref_name.clone();
+                chain.push((current_base.clone(), Some(base_pr)));
+                current_base = next_base;
+            }
+            None => {
+                // No PR for this base - it might be an intermediate branch or already merged
+                // Check if it's the trunk
+                if current_base == trunk {
+                    break;
+                }
+                println!(
+                    "{} No PR found for '{}', assuming it's an intermediate branch",
+                    "Note:".cyan().bold(),
+                    current_base.yellow()
+                );
+                chain.push((current_base.clone(), None));
+                // We can't walk further without a PR, assume parent is trunk
+                break;
+            }
+        }
+    }
+
+    // Reverse to process from trunk-side down
+    chain.reverse();
+
+    // Mount each branch in order
+    let mut parent = trunk.to_string();
+    for (branch_name, pr_opt) in chain {
+        // Check if branch exists locally
+        if !git_repo.branch_exists(&branch_name) {
+            println!(
+                "{} Branch '{}' doesn't exist locally, skipping",
+                "Note:".cyan().bold(),
+                branch_name.yellow()
+            );
+            continue;
+        }
+
+        // Mount this branch under the parent
+        if !state.branch_exists_in_tree(repo, &branch_name) {
+            println!(
+                "Mounting '{}' on '{}'",
+                branch_name.yellow(),
+                parent.green()
+            );
+            state.mount(git_repo, repo, &branch_name, Some(parent.clone()))?;
+        } else {
+            println!(
+                "'{}' already in tree",
+                branch_name.yellow()
+            );
+        }
+
+        // Store PR number if we have one
+        if let Some(pr) = pr_opt {
+            if let Some(tree_branch) = find_branch_by_name_mut(
+                state.get_tree_mut(repo).unwrap(),
+                &branch_name,
+            ) {
+                if tree_branch.pr_number.is_none() {
+                    tree_branch.pr_number = Some(pr.number);
+                }
+            }
+        }
+
+        parent = branch_name;
+    }
+
+    Ok(())
+}
+
+/// Import all open PRs for the repo
+fn import_all_prs(
+    git_repo: &GitRepo,
+    client: &github::GitHubClient,
+    repo_id: &github::RepoIdentifier,
+    state: &mut State,
+    repo: &str,
+    trunk: &str,
+) -> Result<()> {
+    let all_prs = client.list_open_prs(repo_id)?;
+
+    if all_prs.is_empty() {
+        println!("No open PRs found for this repository.");
+        return Ok(());
+    }
+
+    println!("Found {} open PR(s)", all_prs.len().to_string().green());
+
+    // Build a map of branch -> (parent, pr_number)
+    let mut branch_parents: std::collections::HashMap<String, (String, u64)> =
+        std::collections::HashMap::new();
+
+    for (branch_name, pr) in &all_prs {
+        branch_parents.insert(
+            branch_name.clone(),
+            (pr.base.ref_name.clone(), pr.number),
+        );
+    }
+
+    // Find branches whose parent is trunk or another PR branch (roots of stacks)
+    // Then build each stack
+    let mut imported = std::collections::HashSet::new();
+
+    // Process in order: first branches based on trunk, then their children, etc.
+    let mut to_process: Vec<String> = branch_parents
+        .iter()
+        .filter(|(_, (parent, _))| parent == trunk)
+        .map(|(branch, _)| branch.clone())
+        .collect();
+
+    while !to_process.is_empty() {
+        let branch_name = to_process.remove(0);
+
+        if imported.contains(&branch_name) {
+            continue;
+        }
+
+        // Get parent and PR number
+        let (parent, pr_number) = match branch_parents.get(&branch_name) {
+            Some((p, n)) => (p.clone(), *n),
+            None => continue,
+        };
+
+        // Determine actual parent (could be trunk or another imported branch)
+        let actual_parent = if parent == trunk || imported.contains(&parent) {
+            parent.clone()
+        } else {
+            // Parent not yet imported - skip for now, will process later
+            to_process.push(branch_name);
+            continue;
+        };
+
+        // Check if branch exists locally
+        if !git_repo.branch_exists(&branch_name) {
+            println!(
+                "{} Branch '{}' doesn't exist locally (PR #{}), skipping",
+                "Note:".cyan().bold(),
+                branch_name.yellow(),
+                pr_number
+            );
+            imported.insert(branch_name.clone());
+            continue;
+        }
+
+        // Mount this branch
+        if !state.branch_exists_in_tree(repo, &branch_name) {
+            println!(
+                "Mounting '{}' on '{}' (PR #{})",
+                branch_name.yellow(),
+                actual_parent.green(),
+                pr_number
+            );
+            state.mount(git_repo, repo, &branch_name, Some(actual_parent.clone()))?;
+        }
+
+        // Store PR number
+        if let Some(tree_branch) = find_branch_by_name_mut(
+            state.get_tree_mut(repo).unwrap(),
+            &branch_name,
+        ) {
+            if tree_branch.pr_number.is_none() {
+                tree_branch.pr_number = Some(pr_number);
+            }
+        }
+
+        imported.insert(branch_name.clone());
+
+        // Add children of this branch to process list
+        for (child, (child_parent, _)) in &branch_parents {
+            if child_parent == &branch_name && !imported.contains(child) {
+                to_process.push(child.clone());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -830,6 +1326,46 @@ fn handle_pr_command(
             // Ensure branch is in the tree
             state.try_auto_mount(git_repo, repo, &branch_name)?;
 
+            // Check if this is the trunk branch (can't create PR for main)
+            let trunk = crate::git::git_trunk(git_repo)?;
+            if branch_name == trunk.main_branch {
+                bail!(
+                    "Cannot create a PR for the trunk branch '{}'.",
+                    branch_name.yellow()
+                );
+            }
+
+            // Collect ancestor chain from branch up to trunk (for recursive PR creation)
+            let mut ancestor_chain = Vec::new();
+            let mut current = branch_name.clone();
+            while let Some(parent) = state.get_parent_branch_of(repo, &current) {
+                if parent.name == trunk.main_branch {
+                    break;
+                }
+                ancestor_chain.push(parent.name.clone());
+                current = parent.name.clone();
+            }
+            // Reverse to process from trunk-side down
+            ancestor_chain.reverse();
+
+            // Fetch all open PRs once for efficiency
+            let mut all_prs = client.list_open_prs(&repo_id)?;
+
+            // Ensure all ancestors have PRs (recursive creation)
+            for ancestor in &ancestor_chain {
+                ensure_branch_pr(
+                    git_repo,
+                    &client,
+                    &repo_id,
+                    &mut all_prs,
+                    ancestor,
+                    &trunk.main_branch,
+                    state,
+                    repo,
+                    true, // Push if not on remote
+                )?;
+            }
+
             // Get parent branch from git-stack tree
             let parent = state
                 .get_parent_branch_of(repo, &branch_name)
@@ -840,20 +1376,11 @@ fn handle_pr_command(
                     )
                 })?;
 
-            let base_branch = &parent.name;
-
-            // Check if this is the trunk branch (can't create PR for main)
-            let trunk = crate::git::git_trunk(git_repo)?;
-            if branch_name == trunk.main_branch {
-                bail!(
-                    "Cannot create a PR for the trunk branch '{}'.",
-                    branch_name.yellow()
-                );
-            }
+            let base_branch = parent.name.clone();
 
             // Check if branch exists on remote, push if not
             let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch_name);
-            if !git_repo.branch_exists(&remote_ref) {
+            if !git_repo.ref_exists(&remote_ref) {
                 println!(
                     "Branch '{}' is not on remote. Pushing...",
                     branch_name.yellow()
@@ -867,7 +1394,9 @@ fn handle_pr_command(
             }
 
             // Check if PR already exists
-            if let Some(existing_pr) = client.find_pr_for_branch(&repo_id, &branch_name)? {
+            if let Some(existing_pr) = all_prs.get(&branch_name).or(
+                client.find_pr_for_branch(&repo_id, &branch_name)?.as_ref()
+            ) {
                 println!(
                     "PR #{} already exists for branch '{}': {}",
                     existing_pr.number.to_string().green(),
@@ -917,7 +1446,7 @@ fn handle_pr_command(
                     title: &title,
                     body: &body,
                     head: &branch_name,
-                    base: base_branch,
+                    base: &base_branch,
                     draft: if draft { Some(true) } else { None },
                 },
             )?;
@@ -961,6 +1490,143 @@ fn handle_pr_command(
 
             println!("Opening PR #{}: {}", pr.number, pr.html_url);
             open_in_browser(&pr.html_url)?;
+            Ok(())
+        }
+        PrAction::Sync { all, dry_run } => {
+            use github::UpdatePrRequest;
+
+            let trunk = crate::git::git_trunk(git_repo)?;
+
+            // Get branches to sync with depth for bottom-up processing
+            let branches_to_sync: Vec<(String, String, usize)> = if all {
+                let tree = state
+                    .get_tree(repo)
+                    .ok_or_else(|| anyhow!("No stack tree found for repo"))?;
+                collect_branches_with_depth(tree, &tree.name, 0)
+            } else {
+                let parent = state
+                    .get_parent_branch_of(repo, current_branch)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Branch '{}' not found in git-stack tree",
+                            current_branch
+                        )
+                    })?;
+                vec![(current_branch.to_string(), parent.name.clone(), 1)]
+            };
+
+            // Sort by depth descending (leaves first) for bottom-up processing
+            let mut sorted_branches = branches_to_sync;
+            sorted_branches.sort_by(|a, b| b.2.cmp(&a.2));
+
+            // Track which parents we've already processed/created
+            let mut processed_parents: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            processed_parents.insert(trunk.main_branch.clone());
+
+            // Fetch all open PRs once
+            let mut all_prs = client.list_open_prs(&repo_id)?;
+
+            let mut synced_count = 0;
+            let mut created_count = 0;
+            let mut skipped_count = 0;
+
+            for (branch_name, expected_base, _depth) in sorted_branches {
+                if branch_name == trunk.main_branch {
+                    continue;
+                }
+
+                // First, ensure parent is ready (if not trunk and not already processed)
+                if expected_base != trunk.main_branch
+                    && !processed_parents.contains(&expected_base)
+                {
+                    if dry_run {
+                        if !all_prs.contains_key(&expected_base) {
+                            let remote_ref = format!("{DEFAULT_REMOTE}/{}", expected_base);
+                            if git_repo.branch_exists(&remote_ref) {
+                                println!(
+                                    "[dry-run] Would create PR for parent '{}'",
+                                    expected_base.yellow()
+                                );
+                                created_count += 1;
+                            }
+                        }
+                    } else {
+                        let before_count = all_prs.len();
+                        ensure_branch_pr(
+                            git_repo,
+                            &client,
+                            &repo_id,
+                            &mut all_prs,
+                            &expected_base,
+                            &trunk.main_branch,
+                            state,
+                            repo,
+                            false, // Don't push - if not on remote, likely merged
+                        )?;
+                        if all_prs.len() > before_count {
+                            created_count += 1;
+                        }
+                    }
+                    processed_parents.insert(expected_base.clone());
+                }
+
+                // Now sync this branch's PR
+                let pr = match all_prs.get(&branch_name) {
+                    Some(pr) => pr,
+                    None => {
+                        tracing::debug!("No PR found for branch '{}'", branch_name);
+                        continue;
+                    }
+                };
+
+                if pr.base.ref_name == expected_base {
+                    skipped_count += 1;
+                    continue;
+                }
+
+                // Base mismatch - need to retarget
+                if dry_run {
+                    println!(
+                        "[dry-run] Would retarget PR #{} for '{}': {} → {}",
+                        pr.number.to_string().green(),
+                        branch_name.yellow(),
+                        pr.base.ref_name.red(),
+                        expected_base.green()
+                    );
+                } else {
+                    println!(
+                        "Retargeting PR #{} for '{}': {} → {}",
+                        pr.number.to_string().green(),
+                        branch_name.yellow(),
+                        pr.base.ref_name.red(),
+                        expected_base.green()
+                    );
+
+                    client.update_pr(
+                        &repo_id,
+                        pr.number,
+                        UpdatePrRequest {
+                            base: Some(&expected_base),
+                            title: None,
+                            body: None,
+                        },
+                    )?;
+                }
+                synced_count += 1;
+            }
+
+            // Summary
+            let prefix = if dry_run { "[dry-run] " } else { "" };
+            if created_count > 0 || synced_count > 0 {
+                println!(
+                    "\n{}Created {} PR(s), synced {} PR(s), {} already correct",
+                    prefix, created_count, synced_count, skipped_count
+                );
+            } else {
+                println!("{}All PRs already have correct bases", prefix);
+            }
+
             Ok(())
         }
     }

@@ -74,12 +74,17 @@ impl GitRepo {
     }
 
     /// Check if a local branch exists.
-    /// Equivalent to `git rev-parse --verify <branch>`
+    /// Only checks for local branches, not remote refs.
     pub fn branch_exists(&self, branch: &str) -> bool {
         let _bench = GitBenchmark::start("git2:branch-exists");
-        // First try as a local branch, then try direct ref resolution
+        // Only check for local branches to avoid false positives from remote refs
         self.repo.find_branch(branch, BranchType::Local).is_ok()
-            || self.repo.revparse_single(branch).is_ok()
+    }
+
+    /// Check if a ref exists (local branch, remote ref, or any resolvable ref).
+    pub fn ref_exists(&self, ref_name: &str) -> bool {
+        let _bench = GitBenchmark::start("git2:ref-exists");
+        self.repo.revparse_single(ref_name).is_ok()
     }
 
     pub fn branch_status(
@@ -92,20 +97,32 @@ impl GitRepo {
             Some(parent_branch) => parent_branch.to_string(),
             None => self.remote_main(DEFAULT_REMOTE)?,
         };
-        let is_descendent = exists && self.is_ancestor(&parent_branch, branch)?;
-        let upstream_symbolic_name = self.get_upstream(branch);
-        let upstream_synced = upstream_symbolic_name
-            .as_ref()
-            .is_some_and(|upstream| self.shas_match(upstream, branch));
+
+        // Only compute these if the branch exists
+        let (sha, is_descendent, upstream_status) = if exists {
+            let sha = self.sha(branch)?;
+            let is_descendent = self.is_ancestor(&parent_branch, branch)?;
+            let upstream_symbolic_name = self.get_upstream(branch);
+            let upstream_synced = upstream_symbolic_name
+                .as_ref()
+                .is_some_and(|upstream| self.shas_match(upstream, branch));
+            let upstream_status =
+                upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
+                    symbolic_name,
+                    synced: upstream_synced,
+                });
+            (sha, is_descendent, upstream_status)
+        } else {
+            // Branch doesn't exist - use placeholder values
+            (String::new(), false, None)
+        };
+
         Ok(GitBranchStatus {
-            sha: self.sha(branch)?,
+            sha,
             parent_branch,
             exists,
             is_descendent,
-            upstream_status: upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
-                symbolic_name,
-                synced: upstream_synced,
-            }),
+            upstream_status,
         })
     }
 
