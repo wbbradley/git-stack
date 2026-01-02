@@ -54,6 +54,9 @@ pub struct PullRequest {
     pub draft: bool,
     #[serde(default)]
     pub merged: bool,
+    /// Timestamp when PR was merged (present in list endpoint, unlike `merged` field)
+    #[serde(default)]
+    pub merged_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,9 +94,14 @@ impl std::fmt::Display for PrDisplayState {
 }
 
 impl PullRequest {
+    /// Check if this PR was merged (handles both `merged` field and `merged_at` field)
+    pub fn is_merged(&self) -> bool {
+        self.merged || self.merged_at.is_some()
+    }
+
     /// Get the display state for this PR
     pub fn display_state(&self) -> PrDisplayState {
-        if self.merged {
+        if self.is_merged() {
             PrDisplayState::Merged
         } else if self.state == PrState::Closed {
             PrDisplayState::Closed
@@ -266,11 +274,12 @@ impl GitHubClient {
             .map_err(|e| GitHubError::Network(e.to_string()))
     }
 
-    /// List all open PRs for a repository
+    /// List PRs for a repository with a given state filter
     /// Returns a map of head branch name -> PullRequest for easy lookup
-    pub fn list_open_prs(
+    pub fn list_prs(
         &self,
         repo: &RepoIdentifier,
+        state: &str, // "open", "closed", or "all"
     ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
         let mut all_prs = Vec::new();
         let mut page = 1;
@@ -278,8 +287,8 @@ impl GitHubClient {
 
         loop {
             let url = format!(
-                "{}/repos/{}/{}/pulls?state=open&per_page={}&page={}",
-                self.config.api_base, repo.owner, repo.repo, per_page, page
+                "{}/repos/{}/{}/pulls?state={}&per_page={}&page={}",
+                self.config.api_base, repo.owner, repo.repo, state, per_page, page
             );
 
             let mut response = ureq::get(&url)
@@ -311,6 +320,14 @@ impl GitHubClient {
             .collect();
 
         Ok(pr_map)
+    }
+
+    /// List all open PRs for a repository (convenience wrapper)
+    pub fn list_open_prs(
+        &self,
+        repo: &RepoIdentifier,
+    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+        self.list_prs(repo, "open")
     }
 
     /// Update PR (e.g., to retarget base)
