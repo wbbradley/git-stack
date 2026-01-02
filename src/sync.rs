@@ -27,6 +27,8 @@ use crate::{
         RepoIdentifier,
         UpdatePrRequest,
         get_repo_identifier,
+        load_pr_cache,
+        save_pr_cache,
     },
     state::{Branch, State},
 };
@@ -414,7 +416,7 @@ fn read_remote_state(
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
         .collect();
 
-    // Fetch closed PRs (includes merged)
+    // Fetch closed PRs (includes merged) with caching
     if let Some(s) = &spinner {
         s.set_message("Fetching closed PRs...");
     }
@@ -423,9 +425,18 @@ fn read_remote_state(
             s.set_message(format!("Fetching closed PRs... ({count} loaded)"));
         }
     };
+
+    // Load PR cache
+    let mut pr_cache = load_pr_cache().unwrap_or_default();
+
     let closed_prs_map = client
-        .list_prs(repo_id, "closed", Some(&closed_progress))
+        .list_closed_prs_with_cache(repo_id, &mut pr_cache, Some(&closed_progress))
         .map_err(|e| anyhow!("{}", e))?;
+
+    // Save updated cache (ignore errors - caching is best-effort)
+    if let Err(e) = save_pr_cache(&pr_cache) {
+        tracing::warn!("Failed to save PR cache: {}", e);
+    }
 
     let closed_prs: HashMap<String, RemotePr> = closed_prs_map
         .iter()

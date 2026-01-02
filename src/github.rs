@@ -63,6 +63,8 @@ pub struct PullRequest {
     /// Timestamp when PR was merged (present in list endpoint, unlike `merged` field)
     #[serde(default)]
     pub merged_at: Option<String>,
+    /// Timestamp when PR was last updated (ISO 8601 format)
+    pub updated_at: String,
 }
 
 /// Minimal user info for PR author
@@ -170,6 +172,70 @@ pub struct UpdatePrRequest<'a> {
     pub title: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<&'a str>,
+}
+
+// ============== PR Cache Types ==============
+
+/// Cache for closed PR data, keyed by repo full name (e.g., "owner/repo")
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct PrCache {
+    /// Version for cache format migrations
+    #[serde(default)]
+    pub version: u32,
+    /// Per-repo PR caches
+    #[serde(default)]
+    pub repos: std::collections::HashMap<String, RepoPrCache>,
+}
+
+/// Cache for a single repository's closed PRs
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoPrCache {
+    /// Watermark: the `updated_at` timestamp of the most recently updated PR we've seen
+    /// Format: ISO 8601 string (e.g., "2025-01-02T15:30:00Z")
+    #[serde(default)]
+    pub watermark: String,
+    /// Cached closed PRs, keyed by head branch name
+    #[serde(default)]
+    pub closed_prs: std::collections::HashMap<String, CachedPullRequest>,
+}
+
+/// Full PR metadata for caching (mirrors PullRequest with Serialize)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPullRequest {
+    pub number: u64,
+    pub state: PrState,
+    pub title: String,
+    pub html_url: String,
+    pub base: CachedPrBranchRef,
+    pub head: CachedPrBranchRef,
+    pub user: CachedPrUser,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub merged: bool,
+    #[serde(default)]
+    pub merged_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// Cached branch reference (mirrors PrBranchRef with Serialize)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPrBranchRef {
+    pub ref_name: String,
+    pub sha: String,
+    pub repo: Option<CachedPrRepoRef>,
+}
+
+/// Cached repo reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPrRepoRef {
+    pub full_name: String,
+}
+
+/// Cached user reference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPrUser {
+    pub login: String,
 }
 
 // ============== Error Types ==============
@@ -407,6 +473,154 @@ impl GitHubClient {
         on_progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
         self.list_prs(repo, "open", on_progress)
+    }
+
+    /// List closed PRs with caching support.
+    ///
+    /// Uses a watermark timestamp strategy:
+    /// 1. Loads cached closed PRs from the provided cache
+    /// 2. Fetches PRs from API sorted by `updated_at` descending
+    /// 3. Stops fetching when encountering a PR older than the watermark
+    /// 4. Merges fresh data with cache (fresh data wins for any branch name)
+    /// 5. Updates watermark to most recent `updated_at` seen
+    pub fn list_closed_prs_with_cache(
+        &self,
+        repo: &RepoIdentifier,
+        cache: &mut PrCache,
+        on_progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+        let repo_key = repo.full_name();
+
+        // Get existing cache for this repo
+        let repo_cache = cache
+            .repos
+            .entry(repo_key.clone())
+            .or_insert_with(RepoPrCache::default);
+
+        let watermark = if repo_cache.watermark.is_empty() {
+            None
+        } else {
+            Some(repo_cache.watermark.clone())
+        };
+
+        // Fetch PRs with early termination based on watermark
+        let fresh_prs =
+            self.list_prs_until_watermark(repo, "closed", watermark.as_deref(), on_progress)?;
+
+        // Track the newest updated_at for new watermark
+        let mut newest_updated_at: Option<String> = None;
+
+        // Merge fresh PRs into cache
+        for (branch_name, pr) in &fresh_prs {
+            // Track newest timestamp
+            if newest_updated_at
+                .as_ref()
+                .map_or(true, |ts| pr.updated_at > *ts)
+            {
+                newest_updated_at = Some(pr.updated_at.clone());
+            }
+
+            // Update cache with fresh data
+            repo_cache
+                .closed_prs
+                .insert(branch_name.clone(), CachedPullRequest::from(pr));
+        }
+
+        // Update watermark if we saw newer data
+        if let Some(ts) = newest_updated_at {
+            if repo_cache.watermark.is_empty() || ts > repo_cache.watermark {
+                repo_cache.watermark = ts;
+            }
+        }
+
+        // Convert cache to return type, applying filters
+        let result: std::collections::HashMap<String, PullRequest> = repo_cache
+            .closed_prs
+            .iter()
+            .map(|(k, v)| (k.clone(), PullRequest::from(v)))
+            .filter(|(_, pr)| self.should_include_pr(pr))
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Check if a PR should be included based on sync_authors and fork filtering
+    fn should_include_pr(&self, pr: &PullRequest) -> bool {
+        // If sync_authors is configured, only include PRs from those authors
+        if !self.config.sync_authors.is_empty() {
+            return self.config.sync_authors.contains(&pr.user.login);
+        }
+
+        // Otherwise, filter out PRs from forks
+        !pr.is_from_fork()
+    }
+
+    /// Fetch PRs with early termination when hitting the watermark
+    fn list_prs_until_watermark(
+        &self,
+        repo: &RepoIdentifier,
+        state: &str,
+        watermark: Option<&str>,
+        on_progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+        let mut all_prs = Vec::new();
+        let mut page = 1;
+        let per_page = 100;
+        let mut hit_watermark = false;
+
+        loop {
+            // Use sort=updated and direction=desc for watermark strategy
+            let url = format!(
+                "{}/repos/{}/{}/pulls?state={}&sort=updated&direction=desc&per_page={}&page={}",
+                self.config.api_base, repo.owner, repo.repo, state, per_page, page
+            );
+
+            let mut response = ureq::get(&url)
+                .header("Authorization", &format!("Bearer {}", self.config.token))
+                .header("Accept", "application/vnd.github.v3+json")
+                .header("User-Agent", "git-stack")
+                .call()
+                .map_err(|e| self.handle_ureq_error(e))?;
+
+            let prs: Vec<PullRequest> = response
+                .body_mut()
+                .read_json()
+                .map_err(|e| GitHubError::Network(e.to_string()))?;
+
+            let count = prs.len();
+
+            // Check each PR against watermark
+            for pr in prs {
+                // If we have a watermark and this PR's updated_at is older or equal, we can stop
+                // after this page (still include PRs on this page to handle edge cases)
+                if let Some(wm) = watermark {
+                    if pr.updated_at.as_str() <= wm {
+                        hit_watermark = true;
+                    }
+                }
+                all_prs.push(pr);
+            }
+
+            // Report progress if callback provided
+            if let Some(callback) = on_progress {
+                callback(page, all_prs.len());
+            }
+
+            // Stop if we hit the watermark or reached the end
+            if hit_watermark || count < per_page {
+                break;
+            }
+            page += 1;
+        }
+
+        // Build map of head branch name -> PR, filtering out irrelevant PRs
+        let pr_map: std::collections::HashMap<String, PullRequest> = all_prs
+            .into_iter()
+            .filter(|pr| self.should_include_pr(pr))
+            .map(|pr| (pr.head.ref_name.clone(), pr))
+            .collect();
+
+        Ok(pr_map)
     }
 
     /// Update PR (e.g., to retarget base)
@@ -686,6 +900,100 @@ pub fn open_in_browser(url: &str) -> Result<()> {
         Command::new("cmd").args(["/c", "start", url]).spawn()?;
     }
     Ok(())
+}
+
+// ============== PR Cache Functions ==============
+
+/// Get path to PR cache file
+fn get_pr_cache_path() -> Result<PathBuf> {
+    let base_dirs = xdg::BaseDirectories::with_prefix(env!("CARGO_PKG_NAME"));
+    base_dirs
+        .place_state_file("pr_cache.yaml")
+        .context("Failed to determine PR cache file path")
+}
+
+/// Load PR cache from disk
+pub fn load_pr_cache() -> Result<PrCache> {
+    let cache_path = get_pr_cache_path()?;
+    if !cache_path.exists() {
+        return Ok(PrCache::default());
+    }
+    let contents = fs::read_to_string(&cache_path).context("Failed to read PR cache file")?;
+    serde_yaml::from_str(&contents).context("Failed to parse PR cache file")
+}
+
+/// Save PR cache to disk
+pub fn save_pr_cache(cache: &PrCache) -> Result<()> {
+    let cache_path = get_pr_cache_path()?;
+    let contents = serde_yaml::to_string(cache)?;
+    fs::write(&cache_path, contents)?;
+    Ok(())
+}
+
+// ============== Cache Conversion Traits ==============
+
+impl From<&PullRequest> for CachedPullRequest {
+    fn from(pr: &PullRequest) -> Self {
+        Self {
+            number: pr.number,
+            state: pr.state,
+            title: pr.title.clone(),
+            html_url: pr.html_url.clone(),
+            base: CachedPrBranchRef {
+                ref_name: pr.base.ref_name.clone(),
+                sha: pr.base.sha.clone(),
+                repo: pr.base.repo.as_ref().map(|r| CachedPrRepoRef {
+                    full_name: r.full_name.clone(),
+                }),
+            },
+            head: CachedPrBranchRef {
+                ref_name: pr.head.ref_name.clone(),
+                sha: pr.head.sha.clone(),
+                repo: pr.head.repo.as_ref().map(|r| CachedPrRepoRef {
+                    full_name: r.full_name.clone(),
+                }),
+            },
+            user: CachedPrUser {
+                login: pr.user.login.clone(),
+            },
+            draft: pr.draft,
+            merged: pr.merged,
+            merged_at: pr.merged_at.clone(),
+            updated_at: pr.updated_at.clone(),
+        }
+    }
+}
+
+impl From<&CachedPullRequest> for PullRequest {
+    fn from(cached: &CachedPullRequest) -> Self {
+        Self {
+            number: cached.number,
+            state: cached.state,
+            title: cached.title.clone(),
+            html_url: cached.html_url.clone(),
+            base: PrBranchRef {
+                ref_name: cached.base.ref_name.clone(),
+                sha: cached.base.sha.clone(),
+                repo: cached.base.repo.as_ref().map(|r| PrRepoRef {
+                    full_name: r.full_name.clone(),
+                }),
+            },
+            head: PrBranchRef {
+                ref_name: cached.head.ref_name.clone(),
+                sha: cached.head.sha.clone(),
+                repo: cached.head.repo.as_ref().map(|r| PrRepoRef {
+                    full_name: r.full_name.clone(),
+                }),
+            },
+            user: PrUser {
+                login: cached.user.login.clone(),
+            },
+            draft: cached.draft,
+            merged: cached.merged,
+            merged_at: cached.merged_at.clone(),
+            updated_at: cached.updated_at.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
