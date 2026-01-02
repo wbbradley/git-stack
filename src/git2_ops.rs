@@ -27,17 +27,6 @@ pub(crate) struct GitBranchStatus {
     pub(crate) upstream_status: Option<UpstreamStatus>,
 }
 
-pub const DEFAULT_REMOTE: &str = "origin";
-
-#[derive(Debug)]
-pub(crate) struct GitBranchStatus {
-    pub(crate) sha: String,
-    pub(crate) exists: bool,
-    pub(crate) is_descendent: bool,
-    pub(crate) parent_branch: String,
-    pub(crate) upstream_status: Option<UpstreamStatus>,
-}
-
 /// Wrapper around git2::Repository for fast read-only git operations.
 pub struct GitRepo {
     repo: Repository,
@@ -91,33 +80,6 @@ impl GitRepo {
         // First try as a local branch, then try direct ref resolution
         self.repo.find_branch(branch, BranchType::Local).is_ok()
             || self.repo.revparse_single(branch).is_ok()
-    }
-
-    pub fn branch_status(
-        &self,
-        parent_branch: Option<&str>,
-        branch: &str,
-    ) -> Result<GitBranchStatus> {
-        let exists = self.branch_exists(branch);
-        let parent_branch = match parent_branch {
-            Some(parent_branch) => parent_branch.to_string(),
-            None => self.remote_main(DEFAULT_REMOTE)?,
-        };
-        let is_descendent = exists && self.is_ancestor(&parent_branch, branch)?;
-        let upstream_symbolic_name = self.get_upstream(branch);
-        let upstream_synced = upstream_symbolic_name
-            .as_ref()
-            .is_some_and(|upstream| self.shas_match(upstream, branch));
-        Ok(GitBranchStatus {
-            sha: self.sha(branch)?,
-            parent_branch,
-            exists,
-            is_descendent,
-            upstream_status: upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
-                symbolic_name,
-                synced: upstream_synced,
-            }),
-        })
     }
 
     pub fn branch_status(
@@ -254,5 +216,19 @@ impl GitRepo {
 
         let stats = diff.stats()?;
         Ok((stats.insertions(), stats.deletions()))
+    }
+
+    /// Get the URL of a remote.
+    /// Equivalent to `git remote get-url <remote>`
+    pub fn get_remote_url(&self, remote: &str) -> Result<String> {
+        let _bench = GitBenchmark::start("git2:remote-url");
+        let remote = self
+            .repo
+            .find_remote(remote)
+            .with_context(|| format!("Failed to find remote: {}", remote))?;
+        remote
+            .url()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("Remote has no URL"))
     }
 }
