@@ -16,7 +16,12 @@ use crate::{
     git::{git_trunk, run_git},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
-        CreatePrRequest, GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest,
+        CreatePrRequest,
+        GitHubClient,
+        PrState,
+        PullRequest,
+        RepoIdentifier,
+        UpdatePrRequest,
         get_repo_identifier,
     },
     state::{Branch, State},
@@ -171,7 +176,7 @@ impl SyncPlan {
 
 // ============== Sync Options ==============
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SyncOptions {
     /// Only push local changes to remote (no pull)
     pub push_only: bool,
@@ -181,25 +186,10 @@ pub struct SyncOptions {
     pub dry_run: bool,
 }
 
-impl Default for SyncOptions {
-    fn default() -> Self {
-        Self {
-            push_only: false,
-            pull_only: false,
-            dry_run: false,
-        }
-    }
-}
-
 // ============== Implementation ==============
 
 /// Main sync entry point
-pub fn sync(
-    git_repo: &GitRepo,
-    state: &mut State,
-    repo: &str,
-    options: SyncOptions,
-) -> Result<()> {
+pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOptions) -> Result<()> {
     // Get repo identifier for GitHub API
     let repo_id = get_repo_identifier(git_repo)?;
     let client = GitHubClient::from_env(&repo_id)?;
@@ -213,7 +203,7 @@ pub fn sync(
 
     // Stage 2: Build target state
     println!("Building target model...");
-    let target_state = build_target_state(&local_state, &remote_state);
+    let target_state = build_target_state(git_repo, &local_state, &remote_state);
 
     // Stage 3: Compute diffs
     let plan = compute_sync_plan(&local_state, &remote_state, &target_state, &options);
@@ -296,7 +286,9 @@ fn collect_local_branches(
 
 /// Read current remote state from GitHub
 fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<RemoteState> {
-    let prs_map = client.list_open_prs(repo_id).map_err(|e| anyhow!("{}", e))?;
+    let prs_map = client
+        .list_open_prs(repo_id)
+        .map_err(|e| anyhow!("{}", e))?;
 
     let prs: HashMap<String, RemotePr> = prs_map
         .iter()
@@ -309,23 +301,44 @@ fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<
 // ============== Stage 2: Model Functions ==============
 
 /// Build target state by merging local and remote
-fn build_target_state(local: &LocalState, remote: &RemoteState) -> TargetState {
+fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteState) -> TargetState {
     let mut branches = HashMap::new();
 
-    // Process all local branches (local is authoritative for structure)
-    for (name, local_branch) in &local.branches {
-        let pr_number = remote
-            .prs
-            .get(name)
-            .map(|pr| pr.number)
-            .or(local_branch.pr_number);
+    // First, collect all branches from remote PRs to know what's being pulled
+    let remote_branches: HashSet<&str> = remote.prs.keys().map(|s| s.as_str()).collect();
 
-        let expected_pr_base = local_branch.parent.clone();
+    // Process all local branches
+    for (name, local_branch) in &local.branches {
+        let pr = remote.prs.get(name);
+        let pr_number = pr.map(|pr| pr.number).or(local_branch.pr_number);
+
+        // Determine the correct parent:
+        // - If there's a PR and its base is being pulled in (or already in local), use PR base
+        // - Otherwise use local parent (local wins)
+        let (parent, expected_pr_base) = if let Some(pr) = pr {
+            // Check if the PR's base is in the set of branches we're pulling
+            // or if it's the trunk
+            let pr_base_is_available = pr.base == local.trunk
+                || local.branches.contains_key(&pr.base)
+                || remote_branches.contains(pr.base.as_str());
+
+            if pr_base_is_available && local_branch.parent.as_ref() != Some(&pr.base) {
+                // PR base is available and differs from local - prefer PR base
+                // This handles the case where we're reconstructing from GitHub
+                (Some(pr.base.clone()), Some(pr.base.clone()))
+            } else {
+                // Use local parent
+                (local_branch.parent.clone(), local_branch.parent.clone())
+            }
+        } else {
+            // No PR - use local parent
+            (local_branch.parent.clone(), local_branch.parent.clone())
+        };
 
         branches.insert(
             name.clone(),
             TargetBranch {
-                parent: local_branch.parent.clone(),
+                parent,
                 pr_number,
                 expected_pr_base,
                 exists_locally: local_branch.exists_locally,
@@ -338,15 +351,19 @@ fn build_target_state(local: &LocalState, remote: &RemoteState) -> TargetState {
     for (branch_name, pr) in &remote.prs {
         if !branches.contains_key(branch_name) {
             // This PR's branch is not in our local tree
-            // The parent should be the PR's base
+            // Check if the branch exists locally (even if not in tree)
+            let exists_locally = git_repo.branch_exists(branch_name);
+            let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+            let pushed_to_remote = git_repo.ref_exists(&remote_ref);
+
             branches.insert(
                 branch_name.clone(),
                 TargetBranch {
                     parent: Some(pr.base.clone()),
                     pr_number: Some(pr.number),
                     expected_pr_base: Some(pr.base.clone()),
-                    exists_locally: false, // We'll need to checkout
-                    pushed_to_remote: true,
+                    exists_locally,
+                    pushed_to_remote,
                 },
             );
         }
@@ -373,6 +390,11 @@ fn compute_sync_plan(
 
     // Compute local changes (pull direction)
     if !options.push_only {
+        // Collect branches that need to be mounted, then topologically sort them
+        let mut branches_to_mount: Vec<(String, String)> = Vec::new(); // (branch, parent)
+        let mut branches_to_checkout: HashSet<String> = HashSet::new();
+        let mut pr_updates: Vec<(String, u64)> = Vec::new();
+
         for (branch_name, target_branch) in &target.branches {
             // Skip trunk
             if branch_name == &local.trunk {
@@ -385,31 +407,52 @@ fn compute_sync_plan(
             if local_branch.is_none() && target_branch.pr_number.is_some() {
                 // Branch has a PR but isn't in our local tree
                 if let Some(parent) = &target_branch.parent {
-                    local_changes.push(LocalChange::MountBranch {
-                        name: branch_name.clone(),
-                        parent: parent.clone(),
-                    });
+                    branches_to_mount.push((branch_name.clone(), parent.clone()));
                 }
 
                 // Check if we need to checkout the branch
                 if !target_branch.exists_locally {
-                    local_changes.push(LocalChange::CheckoutBranch {
-                        name: branch_name.clone(),
-                    });
+                    branches_to_checkout.insert(branch_name.clone());
                 }
             }
 
             // Check if we need to update cached PR number
             if let Some(local_branch) = local_branch {
-                if let Some(pr_number) = target_branch.pr_number {
-                    if local_branch.pr_number != Some(pr_number) {
-                        local_changes.push(LocalChange::UpdatePrNumber {
-                            branch: branch_name.clone(),
-                            pr_number,
-                        });
-                    }
+                if let Some(pr_number) = target_branch.pr_number
+                    && local_branch.pr_number != Some(pr_number)
+                {
+                    pr_updates.push((branch_name.clone(), pr_number));
+                }
+
+                // Check if we need to re-mount (local parent differs from target parent)
+                if local_branch.parent != target_branch.parent
+                    && let Some(parent) = &target_branch.parent
+                {
+                    branches_to_mount.push((branch_name.clone(), parent.clone()));
                 }
             }
+        }
+
+        // Topologically sort branches to mount (parents before children)
+        let sorted_branches = topological_sort_branches(&branches_to_mount, &local.trunk);
+
+        // Add mount and checkout changes in topological order
+        for (branch_name, parent) in sorted_branches {
+            // Checkout first if needed (need the ref before mounting)
+            if branches_to_checkout.contains(&branch_name) {
+                local_changes.push(LocalChange::CheckoutBranch {
+                    name: branch_name.clone(),
+                });
+            }
+            local_changes.push(LocalChange::MountBranch {
+                name: branch_name,
+                parent,
+            });
+        }
+
+        // Add PR number updates (order doesn't matter for these)
+        for (branch, pr_number) in pr_updates {
+            local_changes.push(LocalChange::UpdatePrNumber { branch, pr_number });
         }
     }
 
@@ -467,6 +510,67 @@ fn compute_sync_plan(
     }
 }
 
+/// Topologically sort branches so parents come before children.
+/// Uses Kahn's algorithm for topological sorting.
+fn topological_sort_branches(branches: &[(String, String)], trunk: &str) -> Vec<(String, String)> {
+    if branches.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a map of branch -> parent
+    let branch_to_parent: HashMap<&str, &str> = branches
+        .iter()
+        .map(|(b, p)| (b.as_str(), p.as_str()))
+        .collect();
+
+    // Build set of all branches we're mounting
+    let branches_set: HashSet<&str> = branches.iter().map(|(b, _)| b.as_str()).collect();
+
+    // Compute in-degree for each branch (how many branches depend on it being mounted first)
+    // A branch has in-degree > 0 if its parent is also in the set of branches to mount
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    for (branch, parent) in branches {
+        in_degree.entry(branch.as_str()).or_insert(0);
+        if branches_set.contains(parent.as_str()) {
+            *in_degree.entry(branch.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    // Start with branches whose parent is trunk or already mounted (in-degree 0)
+    let mut queue: Vec<&str> = in_degree
+        .iter()
+        .filter(|(_, deg)| **deg == 0)
+        .map(|(b, _)| *b)
+        .collect();
+
+    // Sort for deterministic output
+    queue.sort();
+
+    let mut result = Vec::new();
+
+    while let Some(branch) = queue.pop() {
+        // Add this branch to result
+        if let Some(&parent) = branch_to_parent.get(branch) {
+            result.push((branch.to_string(), parent.to_string()));
+        }
+
+        // Decrease in-degree for branches that depend on this one
+        for (child, parent) in branches {
+            if parent == branch
+                && let Some(deg) = in_degree.get_mut(child.as_str())
+            {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push(child.as_str());
+                    queue.sort(); // Keep sorted for determinism
+                }
+            }
+        }
+    }
+
+    result
+}
+
 // ============== Stage 4: Validate Functions ==============
 
 /// Validate the sync plan for safety
@@ -515,11 +619,7 @@ fn apply_local_change(
 ) -> Result<()> {
     match change {
         LocalChange::MountBranch { name, parent } => {
-            println!(
-                "  Mounting '{}' on '{}'",
-                name.yellow(),
-                parent.green()
-            );
+            println!("  Mounting '{}' on '{}'", name.yellow(), parent.green());
             state.mount(git_repo, repo, name, Some(parent.clone()))?;
         }
         LocalChange::UnmountBranch {
@@ -540,16 +640,27 @@ fn apply_local_change(
                 branch.yellow(),
                 pr_number.to_string().green()
             );
-            if let Some(tree) = state.get_tree_mut(repo) {
-                if let Some(b) = find_branch_by_name_mut(tree, branch) {
-                    b.pr_number = Some(*pr_number);
-                }
+            if let Some(tree) = state.get_tree_mut(repo)
+                && let Some(b) = find_branch_by_name_mut(tree, branch)
+            {
+                b.pr_number = Some(*pr_number);
             }
         }
         LocalChange::CheckoutBranch { name } => {
             println!("  Checking out '{}'", name.yellow());
-            // Checkout the branch from remote
-            run_git(&["checkout", "-b", name, &format!("{}/{}", DEFAULT_REMOTE, name)])?;
+            // Check if branch already exists locally
+            if git_repo.branch_exists(name) {
+                // Branch exists, just checkout
+                run_git(&["checkout", name])?;
+            } else {
+                // Checkout the branch from remote
+                run_git(&[
+                    "checkout",
+                    "-b",
+                    name,
+                    &format!("{}/{}", DEFAULT_REMOTE, name),
+                ])?;
+            }
         }
     }
     Ok(())
@@ -578,10 +689,11 @@ fn apply_remote_change(
 
             // Get a better title from the first commit
             // Use --no-show-signature to avoid GPG signature output polluting the title
-            let commit_title = run_git(&["log", "--no-show-signature", "--format=%s", "-1", branch])
-                .ok()
-                .and_then(|r| r.output())
-                .unwrap_or_else(|| title.clone());
+            let commit_title =
+                run_git(&["log", "--no-show-signature", "--format=%s", "-1", branch])
+                    .ok()
+                    .and_then(|r| r.output())
+                    .unwrap_or_else(|| title.clone());
 
             let pr = client
                 .create_pr(
@@ -603,10 +715,10 @@ fn apply_remote_change(
             );
 
             // Update the cached PR number
-            if let Some(tree) = state.get_tree_mut(repo) {
-                if let Some(b) = find_branch_by_name_mut(tree, branch) {
-                    b.pr_number = Some(pr.number);
-                }
+            if let Some(tree) = state.get_tree_mut(repo)
+                && let Some(b) = find_branch_by_name_mut(tree, branch)
+            {
+                b.pr_number = Some(pr.number);
             }
         }
         RemoteChange::RetargetPr {
