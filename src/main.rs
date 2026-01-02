@@ -698,6 +698,10 @@ fn restack(
 
     tracing::debug!(?plan, "Restacking branches with plan. Checking out main...");
     git_checkout_main(git_repo, None)?;
+
+    // Track pushed branches to record SHAs after the loop (avoids borrow issues with plan)
+    let mut pushed_branches: Vec<String> = Vec::new();
+
     for RestackStep { parent, branch } in plan {
         tracing::debug!(
             "Starting branch: {} [pwd={}]",
@@ -730,6 +734,7 @@ fn restack(
                     DEFAULT_REMOTE,
                     &format!("{branch_name}:{branch_name}", branch_name = branch.name),
                 ])?;
+                pushed_branches.push(branch.name.clone());
             }
         } else {
             tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
@@ -771,6 +776,7 @@ fn restack(
                         }
                         if push {
                             git_push(git_repo, &branch.name)?;
+                            pushed_branches.push(branch.name.clone());
                         }
                         continue;
                     }
@@ -791,6 +797,7 @@ fn restack(
                     }
                     if push {
                         git_push(git_repo, &branch.name)?;
+                        pushed_branches.push(branch.name.clone());
                     }
                     tracing::info!("Rebase completed successfully. Continuing...");
                 }
@@ -803,6 +810,14 @@ fn restack(
             }
         }
     }
+
+    // Record pushed SHAs as seen on remote (for safe branch deletion)
+    for branch_name in pushed_branches {
+        if let Ok(sha) = git_repo.sha(&branch_name) {
+            state.add_seen_sha(repo, sha);
+        }
+    }
+
     tracing::debug!("Restoring starting branch '{}'...", restack_branch);
     ensure!(
         run_git_status(&["checkout", "-q", &orig_branch], None)?.success(),

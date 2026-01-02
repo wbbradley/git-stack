@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, Ref, RefCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     default,
     fs,
     path::PathBuf,
@@ -62,11 +62,32 @@ impl Branch {
     }
 }
 
+/// Per-repository state including the branch tree and seen remote SHAs.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoState {
+    /// The root of the branch tree (usually trunk/main).
+    #[serde(flatten)]
+    pub tree: Branch,
+    /// SHAs that have been seen on the remote. Used to safely determine if a local
+    /// branch can be deleted (no unpushed work would be lost).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub seen_remote_shas: HashSet<String>,
+}
+
+impl RepoState {
+    pub fn new(tree: Branch) -> Self {
+        Self {
+            tree,
+            seen_remote_shas: HashSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
-    /// The directory name is the key, and the value is a vector of stacks.
+    /// The directory name is the key, and the value is the repo state.
     #[serde(flatten, default)]
-    pub trees: BTreeMap<String, Branch>,
+    pub repos: BTreeMap<String, RepoState>,
 }
 
 impl State {
@@ -105,10 +126,26 @@ impl State {
     }
 
     pub fn get_tree(&self, repo: &str) -> Option<&Branch> {
-        self.trees.get(repo)
+        self.repos.get(repo).map(|r| &r.tree)
     }
     pub fn get_tree_mut(&mut self, repo: &str) -> Option<&mut Branch> {
-        self.trees.get_mut(repo)
+        self.repos.get_mut(repo).map(|r| &mut r.tree)
+    }
+    pub fn get_repo_state(&self, repo: &str) -> Option<&RepoState> {
+        self.repos.get(repo)
+    }
+    pub fn get_repo_state_mut(&mut self, repo: &str) -> Option<&mut RepoState> {
+        self.repos.get_mut(repo)
+    }
+    /// Record a SHA as having been seen on the remote for a given repo.
+    pub fn add_seen_sha(&mut self, repo: &str, sha: String) {
+        if let Some(repo_state) = self.repos.get_mut(repo) {
+            repo_state.seen_remote_shas.insert(sha);
+        }
+    }
+    /// Get all seen SHAs for a repo.
+    pub fn get_seen_shas(&self, repo: &str) -> Option<&HashSet<String>> {
+        self.repos.get(repo).map(|r| &r.seen_remote_shas)
     }
     /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
     /// then check whether the branch exists in the git repo. If it does, then let the user know
@@ -125,9 +162,9 @@ impl State {
         let trunk = git_trunk(git_repo)?;
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
         // added it yet.
-        self.trees
+        self.repos
             .entry(repo.to_string())
-            .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
+            .or_insert_with(|| RepoState::new(Branch::new(trunk.main_branch.clone(), None)));
         self.save_state()?;
 
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
@@ -172,16 +209,16 @@ impl State {
     }
 
     pub fn branch_exists_in_tree(&self, repo: &str, branch_name: &str) -> bool {
-        let Some(branch) = self.trees.get(repo) else {
+        let Some(repo_state) = self.repos.get(repo) else {
             return false;
         };
-        is_branch_mentioned_in_tree(branch_name, branch)
+        is_branch_mentioned_in_tree(branch_name, &repo_state.tree)
     }
 
     pub fn get_tree_branch<'a>(&'a self, repo: &str, branch_name: &str) -> Option<&'a Branch> {
-        self.trees
+        self.repos
             .get(repo)
-            .and_then(|tree| find_branch_by_name(tree, branch_name))
+            .and_then(|r| find_branch_by_name(&r.tree, branch_name))
     }
 
     fn get_tree_branch_mut<'a>(
@@ -189,9 +226,9 @@ impl State {
         repo: &str,
         branch_name: &str,
     ) -> Option<&'a mut Branch> {
-        self.trees
+        self.repos
             .get_mut(repo)
-            .and_then(|tree| find_branch_by_name_mut(tree, branch_name))
+            .and_then(|r| find_branch_by_name_mut(&mut r.tree, branch_name))
     }
 
     pub(crate) fn plan_restack(
@@ -205,7 +242,8 @@ impl State {
         // Find all the descendents of the starting branch.
         // Traverse the tree from the starting branch to the root,
         let mut path: Vec<&Branch> = vec![];
-        if !get_path(self.trees.get(repo).unwrap(), starting_branch, &mut path) {
+        let repo_state = self.repos.get(repo).ok_or_else(|| anyhow!("Repo not found"))?;
+        if !get_path(&repo_state.tree, starting_branch, &mut path) {
             bail!("Branch {starting_branch} not found in the git-stack tree.");
         }
         Ok(path
@@ -219,14 +257,14 @@ impl State {
     }
 
     pub(crate) fn delete_branch(&mut self, repo: &str, branch_name: &str) -> Result<()> {
-        let Some(tree) = self
-            .trees
+        let Some(parent) = self
+            .repos
             .get_mut(repo)
-            .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
+            .and_then(|r| find_parent_of_branch_mut(&mut r.tree, branch_name))
         else {
             bail!("Branch {branch_name} not found in the git-stack tree.");
         };
-        tree.branches.retain(|branch| branch.name != branch_name);
+        parent.branches.retain(|branch| branch.name != branch_name);
         println!(
             "Branch {branch_name} removed from git-stack tree.",
             branch_name = branch_name.yellow()
@@ -258,7 +296,7 @@ impl State {
         git_repo: &GitRepo,
         repo: &str,
     ) -> Result<bool> {
-        let Some(tree) = self.trees.get_mut(repo) else {
+        let Some(repo_state) = self.repos.get_mut(repo) else {
             return Ok(false);
         };
 
@@ -267,7 +305,7 @@ impl State {
 
         cleanup_tree_recursive(
             git_repo,
-            tree,
+            &mut repo_state.tree,
             &mut removed_branches,
             &mut remounted_branches,
         );
@@ -299,7 +337,7 @@ impl State {
     }
 
     fn cleanup_single_tree(&mut self, git_repo: &GitRepo, repo: &str, dry_run: bool) -> Result<()> {
-        let Some(tree) = self.trees.get_mut(repo) else {
+        let Some(repo_state) = self.repos.get_mut(repo) else {
             println!("No stack tree found for repo {}", repo.yellow());
             return Ok(());
         };
@@ -310,7 +348,7 @@ impl State {
         // Recursively cleanup the tree
         cleanup_tree_recursive(
             git_repo,
-            tree,
+            &mut repo_state.tree,
             &mut removed_branches,
             &mut remounted_branches,
         );
@@ -359,7 +397,7 @@ impl State {
         let mut total_remounted_branches = 0;
 
         // Collect all repo paths first to avoid borrow checker issues
-        let repo_paths: Vec<String> = self.trees.keys().cloned().collect();
+        let repo_paths: Vec<String> = self.repos.keys().cloned().collect();
 
         println!("Scanning {} repositories...", repo_paths.len());
         println!();
@@ -402,13 +440,13 @@ impl State {
                 continue;
             };
 
-            let tree = self.trees.get_mut(repo_path).unwrap();
+            let repo_state = self.repos.get_mut(repo_path).unwrap();
             let mut removed_branches = Vec::new();
             let mut remounted_branches = Vec::new();
 
             cleanup_tree_recursive(
                 &repo_git,
-                tree,
+                &mut repo_state.tree,
                 &mut removed_branches,
                 &mut remounted_branches,
             );
@@ -435,7 +473,7 @@ impl State {
             println!("Removing {} invalid repositories:", repos_to_remove.len());
             for repo_path in &repos_to_remove {
                 println!("  - {}", repo_path.red());
-                self.trees.remove(repo_path);
+                self.repos.remove(repo_path);
             }
         }
 
@@ -463,9 +501,9 @@ impl State {
         // The branch might not exist in git, let's create it, and add it to the tree.
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
         // added it yet.
-        self.trees
+        self.repos
             .entry(repo.to_string())
-            .or_insert_with(|| Branch::new(trunk.main_branch.clone(), None));
+            .or_insert_with(|| RepoState::new(Branch::new(trunk.main_branch.clone(), None)));
         Ok(trunk)
     }
 
@@ -544,18 +582,18 @@ impl State {
         Ok(())
     }
     pub fn get_parent_branch_of(&self, repo: &str, branch_name: &str) -> Option<&Branch> {
-        self.trees
+        self.repos
             .get(repo)
-            .and_then(|tree| find_parent_of_branch(tree, branch_name))
+            .and_then(|r| find_parent_of_branch(&r.tree, branch_name))
     }
     pub fn get_parent_branch_of_mut(
         &mut self,
         repo: &str,
         branch_name: &str,
     ) -> Option<&mut Branch> {
-        self.trees
+        self.repos
             .get_mut(repo)
-            .and_then(|tree| find_parent_of_branch_mut(tree, branch_name))
+            .and_then(|r| find_parent_of_branch_mut(&mut r.tree, branch_name))
     }
 
     pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
@@ -920,19 +958,21 @@ fn get_xdg_path() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_state_write() {
-        let state = super::State {
-            trees: vec![(
+        let state = State {
+            repos: vec![(
                 "/tmp/foo".to_string(),
-                super::Branch {
+                RepoState::new(Branch {
                     name: "main".to_string(),
-                    stack_method: super::StackMethod::ApplyMerge,
+                    stack_method: StackMethod::ApplyMerge,
                     note: None,
                     lkg_parent: None,
                     pr_number: None,
                     branches: vec![],
-                },
+                }),
             )]
             .into_iter()
             .collect(),
@@ -946,12 +986,12 @@ mod tests {
     #[test]
     fn test_state_read() {
         let state = "/tmp/foo:\n  name: main\n  stack_method: apply_merge\n  lkg_parent: null\n  branches: []\n";
-        let state: super::State = serde_yaml::from_str(state).unwrap();
-        assert_eq!(state.trees.len(), 1);
-        assert!(state.trees.contains_key("/tmp/foo"));
-        let tree = state.trees.get("/tmp/foo").unwrap();
-        assert_eq!(tree.name, "main");
-        assert_eq!(tree.stack_method, super::StackMethod::ApplyMerge);
-        assert_eq!(tree.pr_number, None);
+        let state: State = serde_yaml::from_str(state).unwrap();
+        assert_eq!(state.repos.len(), 1);
+        assert!(state.repos.contains_key("/tmp/foo"));
+        let repo_state = state.repos.get("/tmp/foo").unwrap();
+        assert_eq!(repo_state.tree.name, "main");
+        assert_eq!(repo_state.tree.stack_method, StackMethod::ApplyMerge);
+        assert_eq!(repo_state.tree.pr_number, None);
     }
 }

@@ -130,6 +130,15 @@ pub struct TargetBranch {
 
 // ============== Stage 3: Change Types ==============
 
+/// Reason for deleting a local branch
+#[derive(Debug, Clone)]
+pub enum DeleteReason {
+    /// SHA was seen on remote, safe to delete (squash/rebase merges)
+    SeenOnRemote { verified_sha: String },
+    /// Branch is fully merged into main (git branch --merged)
+    MergedIntoMain,
+}
+
 /// Changes to apply to local state
 #[derive(Debug, Clone)]
 pub enum LocalChange {
@@ -144,6 +153,8 @@ pub enum LocalChange {
     UpdatePrNumber { branch: String, pr_number: u64 },
     /// Checkout a branch from remote (branch exists on remote but not locally)
     CheckoutBranch { name: String },
+    /// Delete a local branch that has been merged
+    DeleteLocalBranch { name: String, reason: DeleteReason },
 }
 
 /// Changes to apply to remote state (GitHub)
@@ -200,19 +211,39 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     let repo_id = get_repo_identifier(git_repo)?;
     let client = GitHubClient::from_env(&repo_id)?;
 
+    // Fetch with prune to ensure remote tracking refs are up-to-date
+    println!("Fetching from remote...");
+    run_git(&["fetch", "--tags", "-f", "--prune", DEFAULT_REMOTE])?;
+
     // Stage 1: Read current state
     println!("Reading local state...");
     let local_state = read_local_state(git_repo, state, repo)?;
 
     println!("Reading remote state...");
-    let remote_state = read_remote_state(&client, &repo_id)?;
+    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
+
+    // Record all PR head SHAs as seen
+    for sha in seen_shas {
+        state.add_seen_sha(repo, sha);
+    }
+
+    // Garbage collect old seen SHAs
+    gc_seen_shas(git_repo, state, repo, &local_state.trunk);
 
     // Stage 2: Build target state
     println!("Building target model...");
     let target_state = build_target_state(git_repo, &local_state, &remote_state);
 
     // Stage 3: Compute diffs
-    let plan = compute_sync_plan(&local_state, &remote_state, &target_state, &options);
+    let plan = compute_sync_plan(
+        git_repo,
+        state,
+        repo,
+        &local_state,
+        &remote_state,
+        &target_state,
+        &options,
+    );
 
     // Stage 4: Validate
     validate_plan(&plan)?;
@@ -241,6 +272,62 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
 }
 
 // ============== Stage 1: Read Functions ==============
+
+/// Garbage collect seen SHAs that are no longer needed.
+/// Prunes SHAs that are:
+/// - Ancestors of origin/trunk (already merged)
+/// - Not reachable from any tracked branch
+fn gc_seen_shas(git_repo: &GitRepo, state: &mut State, repo: &str, trunk: &str) {
+    let Some(repo_state) = state.get_repo_state_mut(repo) else {
+        return;
+    };
+
+    // Collect all tracked branch HEADs
+    let tracked_shas: Vec<String> = collect_tracked_branch_shas(git_repo, &repo_state.tree);
+
+    let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, trunk);
+
+    repo_state.seen_remote_shas.retain(|sha| {
+        // Prune if merged to main
+        if git_repo.is_ancestor(sha, &origin_trunk).unwrap_or(false) {
+            return false;
+        }
+
+        // Keep if reachable from any tracked branch
+        tracked_shas.iter().any(|branch_sha| {
+            git_repo.is_ancestor(sha, branch_sha).unwrap_or(false)
+        })
+    });
+}
+
+/// Get all local branches that are fully merged into origin/trunk.
+/// These branches are safe to delete unconditionally (Strategy B).
+fn get_merged_branches(trunk: &str) -> Result<HashSet<String>> {
+    let output = run_git(&["branch", "--merged", &format!("{}/{}", DEFAULT_REMOTE, trunk)])?;
+    Ok(output
+        .stdout
+        .lines()
+        .map(|line| line.trim().trim_start_matches("* ").to_string())
+        .filter(|name| !name.is_empty() && name != trunk)
+        .collect())
+}
+
+/// Collect SHAs of all tracked branch HEADs
+fn collect_tracked_branch_shas(git_repo: &GitRepo, branch: &Branch) -> Vec<String> {
+    let mut shas = Vec::new();
+
+    // Add this branch's SHA if it exists
+    if let Ok(sha) = git_repo.sha(&branch.name) {
+        shas.push(sha);
+    }
+
+    // Recurse into children
+    for child in &branch.branches {
+        shas.extend(collect_tracked_branch_shas(git_repo, child));
+    }
+
+    shas
+}
 
 /// Read current local state from git-stack and git
 fn read_local_state(git_repo: &GitRepo, state: &State, repo: &str) -> Result<LocalState> {
@@ -291,7 +378,10 @@ fn collect_local_branches(
 }
 
 /// Read current remote state from GitHub
-fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<RemoteState> {
+fn read_remote_state(
+    client: &GitHubClient,
+    repo_id: &RepoIdentifier,
+) -> Result<(RemoteState, HashSet<String>)> {
     // Only show spinner if stderr is a TTY
     let spinner = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new_spinner();
@@ -345,7 +435,12 @@ fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<
     if let Some(s) = spinner {
         s.finish_and_clear();
     }
-    Ok(RemoteState { prs, closed_prs })
+
+    // Collect all PR head SHAs for seen tracking
+    let mut seen_shas: HashSet<String> = open_prs_map.values().map(|pr| pr.head.sha.clone()).collect();
+    seen_shas.extend(closed_prs_map.values().map(|pr| pr.head.sha.clone()));
+
+    Ok((RemoteState { prs, closed_prs }, seen_shas))
 }
 
 // ============== Stage 2: Model Functions ==============
@@ -429,6 +524,9 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
 
 /// Compute the sync plan by diffing current state against target
 fn compute_sync_plan(
+    git_repo: &GitRepo,
+    state: &State,
+    repo: &str,
     local: &LocalState,
     remote: &RemoteState,
     target: &TargetState,
@@ -636,6 +734,83 @@ fn compute_sync_plan(
         }
     }
 
+    // Compute branch deletions (both strategies)
+    if !options.push_only {
+        let current_branch = git_repo.current_branch().unwrap_or_default();
+        let seen_shas = state.get_seen_shas(repo);
+
+        // Get branches fully merged into origin/trunk (Strategy B)
+        let merged_into_main = get_merged_branches(&local.trunk).unwrap_or_default();
+
+        // Track which branches we're already deleting to avoid duplicates
+        let mut branches_to_delete: HashSet<String> = HashSet::new();
+
+        // Strategy A: PR-based deletion with seen SHA verification
+        // For squash/rebase merged PRs where the branch tip won't be an ancestor of main
+        for (branch_name, _local_branch) in &local.branches {
+            // Skip trunk
+            if branch_name == &local.trunk {
+                continue;
+            }
+
+            // Skip if currently checked out
+            if branch_name == &current_branch {
+                continue;
+            }
+
+            // Check if this branch has a merged PR
+            if let Some(closed_pr) = remote.closed_prs.get(branch_name) {
+                if closed_pr.state == RemotePrState::Merged {
+                    // Check if remote branch is deleted (fetch --prune already ran)
+                    let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+                    if !git_repo.ref_exists(&remote_ref) {
+                        // Check if local HEAD SHA is in seen set
+                        if let Ok(local_sha) = git_repo.sha(branch_name) {
+                            if let Some(seen) = seen_shas {
+                                if seen.contains(&local_sha) {
+                                    branches_to_delete.insert(branch_name.clone());
+                                    local_changes.push(LocalChange::DeleteLocalBranch {
+                                        name: branch_name.clone(),
+                                        reason: DeleteReason::SeenOnRemote {
+                                            verified_sha: local_sha,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Strategy B: Git merge-based deletion
+        // For merge-commit merges where branch tip IS an ancestor of main
+        for branch_name in &merged_into_main {
+            // Skip trunk
+            if branch_name == &local.trunk {
+                continue;
+            }
+
+            // Skip if currently checked out
+            if branch_name == &current_branch {
+                continue;
+            }
+
+            // Skip if already marked for deletion by Strategy A
+            if branches_to_delete.contains(branch_name) {
+                continue;
+            }
+
+            // Only delete if it's a tracked branch (in our local state)
+            if local.branches.contains_key(branch_name) {
+                local_changes.push(LocalChange::DeleteLocalBranch {
+                    name: branch_name.clone(),
+                    reason: DeleteReason::MergedIntoMain,
+                });
+            }
+        }
+    }
+
     SyncPlan {
         local_changes,
         remote_changes,
@@ -743,6 +918,40 @@ fn apply_plan(
     Ok(())
 }
 
+/// Remove a branch from the git-stack tree, repointing its children to the given parent.
+fn unmount_branch_from_tree(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    name: &str,
+    repoint_children_to: &str,
+) -> Result<()> {
+    // Find all children of this branch and repoint them
+    let children: Vec<String> = if let Some(tree) = state.get_tree(repo) {
+        if let Some(branch) = find_branch_by_name(tree, name) {
+            branch.branches.iter().map(|b| b.name.clone()).collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Repoint each child to the new parent
+    for child in children {
+        println!(
+            "    Repointing '{}' → '{}'",
+            child.yellow(),
+            repoint_children_to.green()
+        );
+        state.mount(git_repo, repo, &child, Some(repoint_children_to.to_string()))?;
+    }
+
+    // Delete the branch from the tree
+    state.delete_branch(repo, name)?;
+    Ok(())
+}
+
 /// Apply a single local change
 fn apply_local_change(
     git_repo: &GitRepo,
@@ -764,29 +973,7 @@ fn apply_local_change(
                 name.yellow(),
                 repoint_children_to.green()
             );
-            // First, find all children of this branch and repoint them
-            let children: Vec<String> = if let Some(tree) = state.get_tree(repo) {
-                if let Some(branch) = find_branch_by_name(tree, name) {
-                    branch.branches.iter().map(|b| b.name.clone()).collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            // Repoint each child to the new parent
-            for child in children {
-                println!(
-                    "    Repointing '{}' → '{}'",
-                    child.yellow(),
-                    repoint_children_to.green()
-                );
-                state.mount(git_repo, repo, &child, Some(repoint_children_to.clone()))?;
-            }
-
-            // Now delete the branch from the tree
-            state.delete_branch(repo, name)?;
+            unmount_branch_from_tree(git_repo, state, repo, name, repoint_children_to)?;
         }
         LocalChange::UpdatePrNumber { branch, pr_number } => {
             println!(
@@ -815,6 +1002,48 @@ fn apply_local_change(
                     &format!("{}/{}", DEFAULT_REMOTE, name),
                 ])?;
             }
+        }
+        LocalChange::DeleteLocalBranch { name, reason } => {
+            let reason_str = match reason {
+                DeleteReason::SeenOnRemote { verified_sha } => {
+                    format!("PR merged, SHA {} verified on remote", &verified_sha[..8.min(verified_sha.len())])
+                }
+                DeleteReason::MergedIntoMain => "fully merged into main".to_string(),
+            };
+            println!(
+                "  {} local branch '{}' ({})",
+                "Deleting".red().bold(),
+                name.yellow(),
+                reason_str
+            );
+
+            // For SeenOnRemote, double-check SHA hasn't changed since plan was computed
+            if let DeleteReason::SeenOnRemote { verified_sha } = reason {
+                if let Ok(current_sha) = git_repo.sha(name) {
+                    if current_sha != *verified_sha {
+                        println!(
+                            "    {} Branch SHA changed ({} -> {}), skipping deletion",
+                            "Warning:".yellow(),
+                            &verified_sha[..8.min(verified_sha.len())],
+                            &current_sha[..8.min(current_sha.len())]
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Delete the git branch
+            run_git(&["branch", "-D", name])?;
+            println!("    Branch '{}' deleted.", name);
+
+            // Also remove from git-stack tree
+            let repoint_to = state
+                .get_parent_branch_of(repo, name)
+                .map(|p| p.name.clone())
+                .or_else(|| state.get_tree(repo).map(|t| t.name.clone()))
+                .unwrap_or_else(|| "main".to_string());
+            unmount_branch_from_tree(git_repo, state, repo, name, &repoint_to)?;
+            println!("    Removed '{}' from git-stack tree.", name);
         }
     }
     Ok(())
@@ -941,6 +1170,20 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
                 }
                 LocalChange::CheckoutBranch { name } => {
                     println!("    - Checkout '{}'", name.yellow());
+                }
+                LocalChange::DeleteLocalBranch { name, reason } => {
+                    let reason_str = match reason {
+                        DeleteReason::SeenOnRemote { verified_sha } => {
+                            format!("SHA {} verified on remote", &verified_sha[..8.min(verified_sha.len())])
+                        }
+                        DeleteReason::MergedIntoMain => "merged into main".to_string(),
+                    };
+                    println!(
+                        "    - {} local branch '{}' ({})",
+                        "Delete".red().bold(),
+                        name.red(),
+                        reason_str
+                    );
                 }
             }
         }
