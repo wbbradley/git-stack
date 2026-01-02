@@ -20,6 +20,7 @@ mod git2_ops;
 mod github;
 mod state;
 mod stats;
+mod sync;
 
 const CREATE_BACKUP: bool = false;
 
@@ -133,6 +134,19 @@ enum Command {
         /// Import all open PRs for the repo, not just the current branch's chain
         #[arg(long, short)]
         all: bool,
+    },
+    /// Sync local git-stack state with GitHub PRs.
+    /// Default: weak push then weak pull (bidirectional sync).
+    Sync {
+        /// Push-only mode: sync local changes to GitHub (no pull)
+        #[arg(long, conflicts_with = "pull")]
+        push: bool,
+        /// Pull-only mode: sync GitHub changes to local (no push)
+        #[arg(long, conflicts_with = "push")]
+        pull: bool,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -324,6 +338,18 @@ fn inner_main() -> Result<()> {
         Some(Command::Import { branch, all }) => {
             let branch = branch.unwrap_or(current_branch);
             handle_import_command(&git_repo, &mut state, &repo, &branch, all)
+        }
+        Some(Command::Sync {
+            push,
+            pull,
+            dry_run,
+        }) => {
+            let options = sync::SyncOptions {
+                push_only: push,
+                pull_only: pull,
+                dry_run,
+            };
+            sync::sync(&git_repo, &mut state, &repo, options)
         }
         None => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
@@ -782,12 +808,8 @@ fn restack(
     tracing::info!("Done.");
     state.refresh_lkgs(git_repo, repo)?;
 
-    // Sync PR bases when pushing (graceful degradation on failure)
-    if push {
-        if let Err(e) = sync_pr_bases_after_restack(git_repo, &state, repo) {
-            tracing::debug!("PR sync skipped: {}", e);
-        }
-    }
+    // Note: PR sync is now handled separately via `git stack sync`
+    // Run `git stack sync` after `restack -p` to sync PR bases
 
     Ok(())
 }
