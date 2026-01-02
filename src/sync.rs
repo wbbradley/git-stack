@@ -577,7 +577,8 @@ fn apply_remote_change(
             );
 
             // Get a better title from the first commit
-            let commit_title = run_git(&["log", "--format=%s", "-1", branch])
+            // Use --no-show-signature to avoid GPG signature output polluting the title
+            let commit_title = run_git(&["log", "--no-show-signature", "--format=%s", "-1", branch])
                 .ok()
                 .and_then(|r| r.output())
                 .unwrap_or_else(|| title.clone());

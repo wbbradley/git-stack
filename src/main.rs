@@ -961,7 +961,7 @@ fn ensure_branch_pr(
     );
 
     // Generate title from first commit
-    let title = git::run_git(&["log", "--format=%s", "-1", branch_name])
+    let title = git::run_git(&["log", "--no-show-signature", "--format=%s", "-1", branch_name])
         .ok()
         .and_then(|r| r.output())
         .unwrap_or_else(|| branch_name.to_string());
@@ -1447,7 +1447,7 @@ fn handle_pr_command(
             // Generate title from first commit if not provided
             let title = title.unwrap_or_else(|| {
                 // Get commit message of the branch's first unique commit
-                let commit_msg = git::run_git(&["log", "--format=%s", "-1", &branch_name])
+                let commit_msg = git::run_git(&["log", "--no-show-signature", "--format=%s", "-1", &branch_name])
                     .ok()
                     .and_then(|r| r.output())
                     .unwrap_or_else(|| branch_name.clone());
