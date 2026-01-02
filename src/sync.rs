@@ -7,10 +7,14 @@
 //! 4. Validate: Ensure changes are non-lossy
 //! 5. Apply: Execute changes if safe
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    io::IsTerminal,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::{
     git::{git_trunk, run_git},
@@ -288,9 +292,31 @@ fn collect_local_branches(
 
 /// Read current remote state from GitHub
 fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<RemoteState> {
+    // Only show spinner if stderr is a TTY
+    let spinner = if std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .expect("valid template"),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        Some(pb)
+    } else {
+        None
+    };
+
     // Fetch open PRs
+    if let Some(s) = &spinner {
+        s.set_message("Fetching open PRs...");
+    }
+    let open_progress = |_page: usize, count: usize| {
+        if let Some(s) = &spinner {
+            s.set_message(format!("Fetching open PRs... ({count} loaded)"));
+        }
+    };
     let open_prs_map = client
-        .list_open_prs(repo_id)
+        .list_open_prs(repo_id, Some(&open_progress))
         .map_err(|e| anyhow!("{}", e))?;
 
     let prs: HashMap<String, RemotePr> = open_prs_map
@@ -299,8 +325,16 @@ fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<
         .collect();
 
     // Fetch closed PRs (includes merged)
+    if let Some(s) = &spinner {
+        s.set_message("Fetching closed PRs...");
+    }
+    let closed_progress = |_page: usize, count: usize| {
+        if let Some(s) = &spinner {
+            s.set_message(format!("Fetching closed PRs... ({count} loaded)"));
+        }
+    };
     let closed_prs_map = client
-        .list_prs(repo_id, "closed")
+        .list_prs(repo_id, "closed", Some(&closed_progress))
         .map_err(|e| anyhow!("{}", e))?;
 
     let closed_prs: HashMap<String, RemotePr> = closed_prs_map
@@ -308,6 +342,9 @@ fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
         .collect();
 
+    if let Some(s) = spinner {
+        s.finish_and_clear();
+    }
     Ok(RemoteState { prs, closed_prs })
 }
 

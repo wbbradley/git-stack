@@ -624,7 +624,7 @@ fn fetch_pr_cache(
     let client = github::GitHubClient::from_env(&repo_id).ok()?;
 
     // Try to fetch all open PRs
-    match client.list_open_prs(&repo_id) {
+    match client.list_open_prs(&repo_id, None) {
         Ok(prs) => Some(prs),
         Err(e) => {
             tracing::debug!("Failed to fetch PR info: {}", e);
@@ -845,7 +845,7 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
     processed_parents.insert(trunk.main_branch.clone()); // Trunk is always "processed"
 
     // Fetch all open PRs once
-    let mut all_prs = client.list_open_prs(&repo_id)?;
+    let mut all_prs = client.list_open_prs(&repo_id, None)?;
 
     for (branch_name, expected_base, _depth) in sorted_branches {
         // Skip trunk
@@ -1230,7 +1230,7 @@ fn import_all_prs(
     repo: &str,
     trunk: &str,
 ) -> Result<()> {
-    let all_prs = client.list_open_prs(repo_id)?;
+    let all_prs = client.list_open_prs(repo_id, None)?;
 
     if all_prs.is_empty() {
         println!("No open PRs found for this repository.");
@@ -1388,7 +1388,7 @@ fn handle_pr_command(
             ancestor_chain.reverse();
 
             // Fetch all open PRs once for efficiency
-            let mut all_prs = client.list_open_prs(&repo_id)?;
+            let mut all_prs = client.list_open_prs(&repo_id, None)?;
 
             // Ensure all ancestors have PRs (recursive creation)
             for ancestor in &ancestor_chain {
@@ -1565,7 +1565,7 @@ fn handle_pr_command(
             processed_parents.insert(trunk.main_branch.clone());
 
             // Fetch all open PRs once
-            let mut all_prs = client.list_open_prs(&repo_id)?;
+            let mut all_prs = client.list_open_prs(&repo_id, None)?;
 
             let mut synced_count = 0;
             let mut created_count = 0;

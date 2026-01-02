@@ -106,11 +106,10 @@ impl GitRepo {
             let upstream_synced = upstream_symbolic_name
                 .as_ref()
                 .is_some_and(|upstream| self.shas_match(upstream, branch));
-            let upstream_status =
-                upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
-                    symbolic_name,
-                    synced: upstream_synced,
-                });
+            let upstream_status = upstream_symbolic_name.map(|symbolic_name| UpstreamStatus {
+                symbolic_name,
+                synced: upstream_synced,
+            });
             (sha, is_descendent, upstream_status)
         } else {
             // Branch doesn't exist - use placeholder values

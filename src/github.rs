@@ -317,10 +317,14 @@ impl GitHubClient {
 
     /// List PRs for a repository with a given state filter
     /// Returns a map of head branch name -> PullRequest for easy lookup
+    ///
+    /// The optional `on_progress` callback is called after each page fetch with
+    /// (page_number, cumulative_count) to enable progress reporting.
     pub fn list_prs(
         &self,
         repo: &RepoIdentifier,
         state: &str, // "open", "closed", or "all"
+        on_progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
         let mut all_prs = Vec::new();
         let mut page = 1;
@@ -346,6 +350,11 @@ impl GitHubClient {
 
             let count = prs.len();
             all_prs.extend(prs);
+
+            // Report progress if callback provided
+            if let Some(callback) = on_progress {
+                callback(page, all_prs.len());
+            }
 
             // If we got fewer than per_page results, we've reached the end
             if count < per_page {
@@ -395,8 +404,9 @@ impl GitHubClient {
     pub fn list_open_prs(
         &self,
         repo: &RepoIdentifier,
+        on_progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
-        self.list_prs(repo, "open")
+        self.list_prs(repo, "open", on_progress)
     }
 
     /// Update PR (e.g., to retarget base)
