@@ -507,13 +507,32 @@ fn compute_sync_plan(
         }
     }
 
-    // Add unmount changes
+    // Add unmount changes and retarget PRs for children
     if !options.push_only {
         for (branch_name, repoint_to) in &branches_to_unmount {
             local_changes.push(LocalChange::UnmountBranch {
                 name: branch_name.clone(),
                 repoint_children_to: repoint_to.clone(),
             });
+
+            // Add retarget changes for children of this unmounted branch
+            // Find all branches whose parent is the unmounted branch
+            for (child_name, child_branch) in &local.branches {
+                if child_branch.parent.as_ref() == Some(branch_name) {
+                    // Check if this child has an open PR that needs retargeting
+                    if let Some(pr) = remote.prs.get(child_name) {
+                        // PR's old base should be the unmounted branch, new base is repoint_to
+                        if pr.base == *branch_name {
+                            remote_changes.push(RemoteChange::RetargetPr {
+                                number: pr.number,
+                                branch: child_name.clone(),
+                                old_base: branch_name.clone(),
+                                new_base: repoint_to.clone(),
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
