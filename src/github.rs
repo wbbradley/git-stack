@@ -436,52 +436,50 @@ pub fn get_repo_identifier(git_repo: &GitRepo) -> Result<RepoIdentifier> {
 /// Find GitHub token from various sources
 fn find_github_token(host: &str) -> Result<String, GitHubError> {
     // 1. Check GITHUB_TOKEN env var
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            tracing::debug!("Using GitHub token from GITHUB_TOKEN env var");
-            return Ok(token);
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        tracing::debug!("Using GitHub token from GITHUB_TOKEN env var");
+        return Ok(token);
     }
 
     // 2. Check GH_TOKEN env var (used by gh CLI)
-    if let Ok(token) = std::env::var("GH_TOKEN") {
-        if !token.is_empty() {
-            tracing::debug!("Using GitHub token from GH_TOKEN env var");
-            return Ok(token);
-        }
+    if let Ok(token) = std::env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        tracing::debug!("Using GitHub token from GH_TOKEN env var");
+        return Ok(token);
     }
 
     // 3. Check git config github.token
     if let Ok(output) = Command::new("git")
         .args(["config", "--get", "github.token"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !token.is_empty() {
-                tracing::debug!("Using GitHub token from git config");
-                return Ok(token);
-            }
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() {
+            tracing::debug!("Using GitHub token from git config");
+            return Ok(token);
         }
     }
 
     // 4. Check XDG config file
-    if let Ok(config_path) = get_github_config_path() {
-        if let Ok(contents) = fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_yaml::from_str::<GitHubConfigFile>(&contents) {
-                // Check for host-specific token first
-                if let Some(hosts) = &config.hosts {
-                    if let Some(token) = hosts.get(host) {
-                        tracing::debug!("Using GitHub token from config file (host-specific)");
-                        return Ok(token.clone());
-                    }
-                }
-                // Fall back to default token
-                if let Some(token) = config.default_token {
-                    tracing::debug!("Using GitHub token from config file (default)");
-                    return Ok(token);
-                }
-            }
+    if let Ok(config_path) = get_github_config_path()
+        && let Ok(contents) = fs::read_to_string(&config_path)
+        && let Ok(config) = serde_yaml::from_str::<GitHubConfigFile>(&contents)
+    {
+        // Check for host-specific token first
+        if let Some(hosts) = &config.hosts
+            && let Some(token) = hosts.get(host)
+        {
+            tracing::debug!("Using GitHub token from config file (host-specific)");
+            return Ok(token.clone());
+        }
+        // Fall back to default token
+        if let Some(token) = config.default_token {
+            tracing::debug!("Using GitHub token from config file (default)");
+            return Ok(token);
         }
     }
 
@@ -538,7 +536,9 @@ pub fn has_github_token(host: &str) -> bool {
 
 /// Interactive token setup
 pub fn setup_github_token_interactive() -> Result<String> {
-    println!("No GitHub token found. To manage PRs, git-stack needs a GitHub Personal Access Token.");
+    println!(
+        "No GitHub token found. To manage PRs, git-stack needs a GitHub Personal Access Token."
+    );
     println!();
     println!("Steps to create a token:");
     println!("1. Go to: https://github.com/settings/tokens/new");

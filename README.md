@@ -5,6 +5,8 @@ features atop one another, keeping their history clean and rebasing as needed. I
 relationships between branches, helps you re-stack and synchronize them, and visualizes your stack
 tree.
 
+`git-stack` also allows for synchronization between Github and local state.
+
 ## Key Features
 
 - Stacked Workflow: Track parent-child branch relationships ("stacks") in your repo.
