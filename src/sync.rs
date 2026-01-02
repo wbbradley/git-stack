@@ -54,8 +54,10 @@ pub struct LocalBranch {
 /// Remote state gathered from GitHub API
 #[derive(Debug)]
 pub struct RemoteState {
-    /// Map of head branch name -> PR info
+    /// Map of head branch name -> PR info (open PRs)
     pub prs: HashMap<String, RemotePr>,
+    /// Map of head branch name -> PR info (closed/merged PRs)
+    pub closed_prs: HashMap<String, RemotePr>,
 }
 
 /// Information about a single remote PR
@@ -73,7 +75,7 @@ impl From<&PullRequest> for RemotePr {
         Self {
             number: pr.number,
             base: pr.base.ref_name.clone(),
-            state: if pr.merged {
+            state: if pr.is_merged() {
                 RemotePrState::Merged
             } else if pr.state == PrState::Closed {
                 RemotePrState::Closed
@@ -286,16 +288,27 @@ fn collect_local_branches(
 
 /// Read current remote state from GitHub
 fn read_remote_state(client: &GitHubClient, repo_id: &RepoIdentifier) -> Result<RemoteState> {
-    let prs_map = client
+    // Fetch open PRs
+    let open_prs_map = client
         .list_open_prs(repo_id)
         .map_err(|e| anyhow!("{}", e))?;
 
-    let prs: HashMap<String, RemotePr> = prs_map
+    let prs: HashMap<String, RemotePr> = open_prs_map
         .iter()
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
         .collect();
 
-    Ok(RemoteState { prs })
+    // Fetch closed PRs (includes merged)
+    let closed_prs_map = client
+        .list_prs(repo_id, "closed")
+        .map_err(|e| anyhow!("{}", e))?;
+
+    let closed_prs: HashMap<String, RemotePr> = closed_prs_map
+        .iter()
+        .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
+        .collect();
+
+    Ok(RemoteState { prs, closed_prs })
 }
 
 // ============== Stage 2: Model Functions ==============
@@ -456,6 +469,79 @@ fn compute_sync_plan(
         }
     }
 
+    // Detect merged PRs and handle unmounting (pull direction)
+    // This runs regardless of push_only/pull_only since it's about reconciling state
+    let mut branches_to_unmount: Vec<(String, String)> = Vec::new(); // (branch, repoint_to)
+
+    tracing::debug!(
+        "Checking for merged PRs. Local branches: {:?}, Closed PRs: {:?}",
+        local.branches.keys().collect::<Vec<_>>(),
+        remote.closed_prs.keys().collect::<Vec<_>>()
+    );
+
+    for (branch_name, local_branch) in &local.branches {
+        // Skip trunk
+        if branch_name == &local.trunk {
+            continue;
+        }
+
+        // Check if this branch has a merged/closed PR but no open PR
+        if !remote.prs.contains_key(branch_name) {
+            if let Some(closed_pr) = remote.closed_prs.get(branch_name) {
+                tracing::debug!(
+                    "Branch '{}' has closed PR #{} with state {:?}",
+                    branch_name,
+                    closed_pr.number,
+                    closed_pr.state
+                );
+                if closed_pr.state == RemotePrState::Merged {
+                    // This branch's PR was merged - it should be unmounted
+                    // Children should be repointed to this branch's parent
+                    let repoint_to = local_branch
+                        .parent
+                        .clone()
+                        .unwrap_or_else(|| local.trunk.clone());
+                    branches_to_unmount.push((branch_name.clone(), repoint_to));
+                }
+            }
+        }
+    }
+
+    // Add unmount changes and retarget PRs for children
+    if !options.push_only {
+        for (branch_name, repoint_to) in &branches_to_unmount {
+            local_changes.push(LocalChange::UnmountBranch {
+                name: branch_name.clone(),
+                repoint_children_to: repoint_to.clone(),
+            });
+
+            // Add retarget changes for children of this unmounted branch
+            // Find all branches whose parent is the unmounted branch
+            for (child_name, child_branch) in &local.branches {
+                if child_branch.parent.as_ref() == Some(branch_name) {
+                    // Check if this child has an open PR that needs retargeting
+                    if let Some(pr) = remote.prs.get(child_name) {
+                        // PR's old base should be the unmounted branch, new base is repoint_to
+                        if pr.base == *branch_name {
+                            remote_changes.push(RemoteChange::RetargetPr {
+                                number: pr.number,
+                                branch: child_name.clone(),
+                                old_base: branch_name.clone(),
+                                new_base: repoint_to.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Set of merged branches for use in remote changes
+    let merged_branches: HashSet<&str> = branches_to_unmount
+        .iter()
+        .map(|(b, _)| b.as_str())
+        .collect();
+
     // Compute remote changes (push direction)
     if !options.pull_only {
         for (branch_name, target_branch) in &target.branches {
@@ -466,6 +552,11 @@ fn compute_sync_plan(
 
             // Skip branches not in local tree (we don't push absence)
             if !local.branches.contains_key(branch_name) {
+                continue;
+            }
+
+            // Skip merged branches - don't try to create PRs for them
+            if merged_branches.contains(branch_name.as_str()) {
                 continue;
             }
 
@@ -488,8 +579,13 @@ fn compute_sync_plan(
                         new_base: expected_base.clone(),
                     });
                 }
-                // No PR but branch is pushed - could create PR
+                // No open PR but branch is pushed - could create PR
+                // But first check if there's a merged/closed PR
                 (None, Some(expected_base)) => {
+                    // Skip if this branch had a merged or closed PR
+                    if remote.closed_prs.contains_key(branch_name) {
+                        continue;
+                    }
                     // Generate title from branch name or first commit
                     let title = branch_name.clone();
                     remote_changes.push(RemoteChange::CreatePr {
@@ -631,7 +727,28 @@ fn apply_local_change(
                 name.yellow(),
                 repoint_children_to.green()
             );
-            // TODO: Implement unmount with child repointing
+            // First, find all children of this branch and repoint them
+            let children: Vec<String> = if let Some(tree) = state.get_tree(repo) {
+                if let Some(branch) = find_branch_by_name(tree, name) {
+                    branch.branches.iter().map(|b| b.name.clone()).collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Repoint each child to the new parent
+            for child in children {
+                println!(
+                    "    Repointing '{}' → '{}'",
+                    child.yellow(),
+                    repoint_children_to.green()
+                );
+                state.mount(git_repo, repo, &child, Some(repoint_children_to.clone()))?;
+            }
+
+            // Now delete the branch from the tree
             state.delete_branch(repo, name)?;
         }
         LocalChange::UpdatePrNumber { branch, pr_number } => {
@@ -827,6 +944,19 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
             println!("    {}: {}", "!".yellow(), warning);
         }
     }
+}
+
+/// Helper to find a branch by name in the tree (immutable)
+fn find_branch_by_name<'a>(tree: &'a Branch, name: &str) -> Option<&'a Branch> {
+    if tree.name == name {
+        return Some(tree);
+    }
+    for child in &tree.branches {
+        if let Some(found) = find_branch_by_name(child, name) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Helper to find a branch by name in the tree (mutable)

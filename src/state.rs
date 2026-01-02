@@ -506,22 +506,31 @@ impl State {
             return Ok(());
         }
 
-        let current_parent_branch = self.get_parent_branch_of_mut(repo, branch_name);
-
-        if let Some(current_parent_branch) = current_parent_branch {
-            // Remove the branch from the current parent branch.
-            current_parent_branch
+        // First, extract the existing branch from its current parent (preserving metadata)
+        let mut existing_branch: Option<Branch> = None;
+        if let Some(current_parent_branch) = self.get_parent_branch_of_mut(repo, branch_name) {
+            // Find and remove the branch, preserving it
+            if let Some(pos) = current_parent_branch
                 .branches
-                .retain(|branch| branch.name != branch_name);
+                .iter()
+                .position(|b| b.name == branch_name)
+            {
+                existing_branch = Some(current_parent_branch.branches.remove(pos));
+            }
         }
 
+        // Get the branch to add (either preserved or new)
+        let mut branch_to_add = existing_branch.unwrap_or_else(|| {
+            Branch::new(branch_name.to_string(), git_repo.sha(&parent_branch).ok())
+        });
+
+        // Update the lkg_parent to the new parent
+        branch_to_add.lkg_parent = git_repo.sha(&parent_branch).ok();
+
+        // Add the branch to the new parent
         let new_parent_branch = self.get_tree_branch_mut(repo, &parent_branch);
-        // Add the branch to the new parent branch.
         if let Some(new_parent_branch) = new_parent_branch {
-            new_parent_branch.branches.push(Branch::new(
-                branch_name.to_string(),
-                git_repo.sha(&parent_branch).ok(),
-            ));
+            new_parent_branch.branches.push(branch_to_add);
         } else {
             bail!("Parent branch {parent_branch} not found in the git-stack tree.");
         }
