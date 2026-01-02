@@ -22,6 +22,10 @@ use crate::git2_ops::GitRepo;
 pub struct GitHubConfig {
     pub token: String,
     pub api_base: String,
+    /// GitHub usernames whose PRs should be synced.
+    /// When non-empty, only PRs from these authors will be synced.
+    /// When empty, PRs from forks will be excluded.
+    pub sync_authors: Vec<String>,
 }
 
 /// Repository identification (owner/repo extracted from remote URL)
@@ -50,6 +54,8 @@ pub struct PullRequest {
     pub html_url: String,
     pub base: PrBranchRef,
     pub head: PrBranchRef,
+    /// The user who created this PR
+    pub user: PrUser,
     #[serde(default)]
     pub draft: bool,
     #[serde(default)]
@@ -59,11 +65,26 @@ pub struct PullRequest {
     pub merged_at: Option<String>,
 }
 
+/// Minimal user info for PR author
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrUser {
+    pub login: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PrBranchRef {
     #[serde(rename = "ref")]
     pub ref_name: String,
     pub sha: String,
+    /// Repository info (may be null if the fork was deleted)
+    pub repo: Option<PrRepoRef>,
+}
+
+/// Minimal repo info for PR head/base references
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrRepoRef {
+    /// Full name of the repo (e.g., "owner/repo")
+    pub full_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -97,6 +118,22 @@ impl PullRequest {
     /// Check if this PR was merged (handles both `merged` field and `merged_at` field)
     pub fn is_merged(&self) -> bool {
         self.merged || self.merged_at.is_some()
+    }
+
+    /// Check if this PR is from a fork (head repo differs from base repo)
+    ///
+    /// Returns true if:
+    /// - The head repo is missing (fork was deleted)
+    /// - The head repo full_name differs from the base repo full_name
+    pub fn is_from_fork(&self) -> bool {
+        match (&self.head.repo, &self.base.repo) {
+            // If head repo is missing, the fork was probably deleted - treat as fork PR
+            (None, _) => true,
+            // If base repo is missing, something is weird but assume not a fork
+            (_, None) => false,
+            // Compare the full names
+            (Some(head_repo), Some(base_repo)) => head_repo.full_name != base_repo.full_name,
+        }
     }
 
     /// Get the display state for this PR
@@ -191,13 +228,17 @@ impl GitHubClient {
 
     /// Load config from environment/git config/config file
     pub fn from_env(repo_id: &RepoIdentifier) -> Result<Self, GitHubError> {
-        let token = find_github_token(&repo_id.host)?;
+        let (token, sync_authors) = find_github_config(&repo_id.host)?;
         let api_base = if repo_id.host == "github.com" {
             "https://api.github.com".to_string()
         } else {
             format!("https://{}/api/v3", repo_id.host)
         };
-        Ok(Self::new(GitHubConfig { token, api_base }))
+        Ok(Self::new(GitHubConfig {
+            token,
+            api_base,
+            sync_authors,
+        }))
     }
 
     /// Get PR by number
@@ -313,9 +354,37 @@ impl GitHubClient {
             page += 1;
         }
 
-        // Build map of head branch name -> PR
+        // Build map of head branch name -> PR, filtering out irrelevant PRs
         let pr_map: std::collections::HashMap<String, PullRequest> = all_prs
             .into_iter()
+            .filter(|pr| {
+                // If sync_authors is configured, only include PRs from those authors
+                if !self.config.sync_authors.is_empty() {
+                    let included = self.config.sync_authors.contains(&pr.user.login);
+                    if !included {
+                        tracing::debug!(
+                            "Skipping PR #{} '{}' - author '{}' not in sync_authors",
+                            pr.number,
+                            pr.title,
+                            pr.user.login
+                        );
+                    }
+                    return included;
+                }
+
+                // Otherwise, filter out PRs from forks
+                if pr.is_from_fork() {
+                    tracing::debug!(
+                        "Skipping PR #{} '{}' - from fork (head: {:?})",
+                        pr.number,
+                        pr.title,
+                        pr.head.repo.as_ref().map(|r| &r.full_name)
+                    );
+                    return false;
+                }
+
+                true
+            })
             .map(|pr| (pr.head.ref_name.clone(), pr))
             .collect();
 
@@ -450,14 +519,27 @@ pub fn get_repo_identifier(git_repo: &GitRepo) -> Result<RepoIdentifier> {
     parse_remote_url(&remote_url)
 }
 
-/// Find GitHub token from various sources
-fn find_github_token(host: &str) -> Result<String, GitHubError> {
+/// Load GitHub configuration from XDG config file
+fn load_github_config_file() -> Option<GitHubConfigFile> {
+    let config_path = get_github_config_path().ok()?;
+    let contents = fs::read_to_string(&config_path).ok()?;
+    serde_yaml::from_str(&contents).ok()
+}
+
+/// Find GitHub token and config from various sources
+fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> {
+    let config_file = load_github_config_file();
+    let sync_authors = config_file
+        .as_ref()
+        .map(|c| c.sync_authors.clone())
+        .unwrap_or_default();
+
     // 1. Check GITHUB_TOKEN env var
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GITHUB_TOKEN env var");
-        return Ok(token);
+        return Ok((token, sync_authors));
     }
 
     // 2. Check GH_TOKEN env var (used by gh CLI)
@@ -465,7 +547,7 @@ fn find_github_token(host: &str) -> Result<String, GitHubError> {
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GH_TOKEN env var");
-        return Ok(token);
+        return Ok((token, sync_authors));
     }
 
     // 3. Check git config github.token
@@ -477,26 +559,23 @@ fn find_github_token(host: &str) -> Result<String, GitHubError> {
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !token.is_empty() {
             tracing::debug!("Using GitHub token from git config");
-            return Ok(token);
+            return Ok((token, sync_authors));
         }
     }
 
-    // 4. Check XDG config file
-    if let Ok(config_path) = get_github_config_path()
-        && let Ok(contents) = fs::read_to_string(&config_path)
-        && let Ok(config) = serde_yaml::from_str::<GitHubConfigFile>(&contents)
-    {
+    // 4. Check XDG config file for token
+    if let Some(config) = config_file {
         // Check for host-specific token first
         if let Some(hosts) = &config.hosts
             && let Some(token) = hosts.get(host)
         {
             tracing::debug!("Using GitHub token from config file (host-specific)");
-            return Ok(token.clone());
+            return Ok((token.clone(), sync_authors));
         }
         // Fall back to default token
         if let Some(token) = config.default_token {
             tracing::debug!("Using GitHub token from config file (default)");
-            return Ok(token);
+            return Ok((token, sync_authors));
         }
     }
 
@@ -504,10 +583,15 @@ fn find_github_token(host: &str) -> Result<String, GitHubError> {
 }
 
 /// GitHub config file structure
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct GitHubConfigFile {
     default_token: Option<String>,
     hosts: Option<std::collections::HashMap<String, String>>,
+    /// GitHub usernames whose PRs should be synced.
+    /// When set, only PRs from these authors will be synced.
+    /// When empty/unset, PRs from forks will be excluded.
+    #[serde(default)]
+    sync_authors: Vec<String>,
 }
 
 /// Get path to GitHub config file
@@ -525,10 +609,9 @@ pub fn save_github_token(token: &str) -> Result<()> {
         .place_config_file("github.yaml")
         .context("Failed to create config directory")?;
 
-    let config = GitHubConfigFile {
-        default_token: Some(token.to_string()),
-        hosts: None,
-    };
+    // Load existing config to preserve other settings (like sync_authors)
+    let mut config = load_github_config_file().unwrap_or_default();
+    config.default_token = Some(token.to_string());
 
     let contents = serde_yaml::to_string(&config)?;
     fs::write(&config_path, contents)?;
@@ -548,7 +631,7 @@ pub fn save_github_token(token: &str) -> Result<()> {
 
 /// Check if GitHub token is configured
 pub fn has_github_token(host: &str) -> bool {
-    find_github_token(host).is_ok()
+    find_github_config(host).is_ok()
 }
 
 /// Interactive token setup
