@@ -240,12 +240,37 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     let mut added = 0;
     let total = seen_shas.len();
 
+    // Count how many SHAs need checking (not already in existing set)
+    let needs_checking = seen_shas
+        .iter()
+        .filter(|sha| !existing_shas.contains(*sha))
+        .count();
+
+    // Show progress bar if there are SHAs to check and stderr is a TTY
+    let progress = if needs_checking > 0 && std::io::stderr().is_terminal() {
+        let pb = ProgressBar::new(needs_checking as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.cyan} Filtering PR SHAs [{bar:30.cyan/dim}] {pos}/{len}")
+                .expect("valid template")
+                .progress_chars("=> "),
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
     for sha in seen_shas {
         // Skip if already tracked (no work needed)
         if existing_shas.contains(&sha) {
             skipped_existing += 1;
             continue;
         }
+
+        if let Some(pb) = &progress {
+            pb.inc(1);
+        }
+
         // Skip if already merged to trunk
         if git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
             skipped_merged += 1;
@@ -261,6 +286,10 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
         } else {
             skipped_unreachable += 1;
         }
+    }
+
+    if let Some(pb) = progress {
+        pb.finish_and_clear();
     }
 
     tracing::debug!(
