@@ -125,6 +125,11 @@ enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Manage caches (PR cache, seen SHAs).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Import branch stack from existing GitHub PRs.
     /// Reconstructs the git-stack tree by walking the PR base chain.
     Import {
@@ -194,6 +199,12 @@ enum AuthAction {
     Status,
     /// Remove stored authentication.
     Logout,
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Clear all caches (PR cache and seen SHAs).
+    Clear,
 }
 
 fn main() {
@@ -335,6 +346,7 @@ fn inner_main() -> Result<()> {
             handle_pr_command(&git_repo, &mut state, &repo, &current_branch, action)
         }
         Some(Command::Auth { action }) => handle_auth_command(&git_repo, action),
+        Some(Command::Cache { action }) => handle_cache_command(&git_repo, &mut state, &repo, action),
         Some(Command::Import { branch, all }) => {
             let branch = branch.unwrap_or(current_branch);
             handle_import_command(&git_repo, &mut state, &repo, &branch, all)
@@ -1748,6 +1760,33 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
             println!(
                 "Note: Tokens in environment variables (GITHUB_TOKEN, GH_TOKEN) or git config are not affected."
             );
+            Ok(())
+        }
+    }
+}
+
+// ============== Cache Commands ==============
+
+fn handle_cache_command(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    action: CacheAction,
+) -> Result<()> {
+    match action {
+        CacheAction::Clear => {
+            // Clear PR cache for this repo
+            let repo_id = github::get_repo_identifier(git_repo)?;
+            let repo_full_name = format!("{}/{}", repo_id.owner, repo_id.repo);
+            github::clear_pr_cache(&repo_full_name)?;
+            println!("Cleared PR cache for {}.", repo_full_name);
+
+            // Clear seen SHAs for current repo
+            let count = state.get_seen_shas(repo).map(|s| s.len()).unwrap_or(0);
+            state.clear_seen_shas(repo);
+            state.save_state()?;
+            println!("Cleared {} seen SHAs.", count);
+
             Ok(())
         }
     }

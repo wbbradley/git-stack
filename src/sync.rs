@@ -10,11 +10,13 @@
 use std::{
     collections::{HashMap, HashSet},
     io::IsTerminal,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::seq::SliceRandom;
 
 use crate::{
     git::{git_trunk, run_git},
@@ -224,9 +226,18 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     println!("Reading remote state...");
     let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
 
-    // Record all PR head SHAs as seen
+    // Record PR head SHAs as seen (filtering out already-merged ones to avoid re-adding garbage)
+    let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
+    let existing_shas = state.get_seen_shas(repo).cloned().unwrap_or_default();
     for sha in seen_shas {
-        state.add_seen_sha(repo, sha);
+        // Skip if already tracked (no work needed)
+        if existing_shas.contains(&sha) {
+            continue;
+        }
+        // Only add if not already merged to trunk
+        if !git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
+            state.add_seen_sha(repo, sha);
+        }
     }
 
     // Garbage collect old seen SHAs
@@ -280,32 +291,72 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
 /// - Ancestors of origin/trunk (already merged)
 /// - Not reachable from any tracked branch
 fn gc_seen_shas(git_repo: &GitRepo, state: &mut State, repo: &str, trunk: &str) {
+    const MAX_GC_DURATION: Duration = Duration::from_millis(100);
+
     let Some(repo_state) = state.get_repo_state_mut(repo) else {
         return;
     };
 
     // Collect all tracked branch HEADs
     let tracked_shas: Vec<String> = collect_tracked_branch_shas(git_repo, &repo_state.tree);
-
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, trunk);
 
-    repo_state.seen_remote_shas.retain(|sha| {
-        // Prune if merged to main
-        if git_repo.is_ancestor(sha, &origin_trunk).unwrap_or(false) {
-            return false;
+    // Copy SHAs into a Vec and shuffle for stochastic traversal
+    let mut shas_to_check: Vec<String> = repo_state.seen_remote_shas.iter().cloned().collect();
+    let total_shas = shas_to_check.len();
+    shas_to_check.shuffle(&mut rand::rng());
+
+    let start = Instant::now();
+    let mut traversed = 0;
+    let mut deleted = 0;
+
+    for sha in shas_to_check {
+        // Stop after time budget is exhausted
+        if start.elapsed() >= MAX_GC_DURATION {
+            break;
         }
 
-        // Keep if reachable from any tracked branch
-        tracked_shas.iter().any(|branch_sha| {
-            git_repo.is_ancestor(sha, branch_sha).unwrap_or(false)
-        })
-    });
+        traversed += 1;
+
+        // Check if this SHA should be pruned
+        let should_keep = {
+            // Prune if merged to main
+            if git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
+                false
+            } else {
+                // Keep if reachable from any tracked branch
+                tracked_shas
+                    .iter()
+                    .any(|branch_sha| git_repo.is_ancestor(&sha, branch_sha).unwrap_or(false))
+            }
+        };
+
+        if !should_keep {
+            repo_state.seen_remote_shas.remove(&sha);
+            deleted += 1;
+        }
+    }
+
+    if total_shas > 0 {
+        let percentage = (traversed as f64 / total_shas as f64) * 100.0;
+        tracing::info!(
+            "gc_seen_shas: traversed {}/{} ({:.1}%), deleted {}",
+            traversed,
+            total_shas,
+            percentage,
+            deleted
+        );
+    }
 }
 
 /// Get all local branches that are fully merged into origin/trunk.
 /// These branches are safe to delete unconditionally (Strategy B).
 fn get_merged_branches(trunk: &str) -> Result<HashSet<String>> {
-    let output = run_git(&["branch", "--merged", &format!("{}/{}", DEFAULT_REMOTE, trunk)])?;
+    let output = run_git(&[
+        "branch",
+        "--merged",
+        &format!("{}/{}", DEFAULT_REMOTE, trunk),
+    ])?;
     Ok(output
         .stdout
         .lines()
@@ -448,7 +499,10 @@ fn read_remote_state(
     }
 
     // Collect all PR head SHAs for seen tracking
-    let mut seen_shas: HashSet<String> = open_prs_map.values().map(|pr| pr.head.sha.clone()).collect();
+    let mut seen_shas: HashSet<String> = open_prs_map
+        .values()
+        .map(|pr| pr.head.sha.clone())
+        .collect();
     seen_shas.extend(closed_prs_map.values().map(|pr| pr.head.sha.clone()));
 
     Ok((RemoteState { prs, closed_prs }, seen_shas))
@@ -955,7 +1009,12 @@ fn unmount_branch_from_tree(
             child.yellow(),
             repoint_children_to.green()
         );
-        state.mount(git_repo, repo, &child, Some(repoint_children_to.to_string()))?;
+        state.mount(
+            git_repo,
+            repo,
+            &child,
+            Some(repoint_children_to.to_string()),
+        )?;
     }
 
     // Delete the branch from the tree
@@ -1017,7 +1076,10 @@ fn apply_local_change(
         LocalChange::DeleteLocalBranch { name, reason } => {
             let reason_str = match reason {
                 DeleteReason::SeenOnRemote { verified_sha } => {
-                    format!("PR merged, SHA {} verified on remote", &verified_sha[..8.min(verified_sha.len())])
+                    format!(
+                        "PR merged, SHA {} verified on remote",
+                        &verified_sha[..8.min(verified_sha.len())]
+                    )
                 }
                 DeleteReason::MergedIntoMain => "fully merged into main".to_string(),
             };
@@ -1185,7 +1247,10 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
                 LocalChange::DeleteLocalBranch { name, reason } => {
                     let reason_str = match reason {
                         DeleteReason::SeenOnRemote { verified_sha } => {
-                            format!("SHA {} verified on remote", &verified_sha[..8.min(verified_sha.len())])
+                            format!(
+                                "SHA {} verified on remote",
+                                &verified_sha[..8.min(verified_sha.len())]
+                            )
                         }
                         DeleteReason::MergedIntoMain => "merged into main".to_string(),
                     };

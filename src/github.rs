@@ -930,6 +930,14 @@ pub fn save_pr_cache(cache: &PrCache) -> Result<()> {
     Ok(())
 }
 
+/// Clear PR cache for a specific repo
+pub fn clear_pr_cache(repo_full_name: &str) -> Result<()> {
+    let mut cache = load_pr_cache().unwrap_or_default();
+    cache.repos.remove(repo_full_name);
+    save_pr_cache(&cache)?;
+    Ok(())
+}
+
 // ============== Cache Conversion Traits ==============
 
 impl From<&PullRequest> for CachedPullRequest {

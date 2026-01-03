@@ -147,6 +147,12 @@ impl State {
     pub fn get_seen_shas(&self, repo: &str) -> Option<&HashSet<String>> {
         self.repos.get(repo).map(|r| &r.seen_remote_shas)
     }
+    /// Clear all seen SHAs for a repo.
+    pub fn clear_seen_shas(&mut self, repo: &str) {
+        if let Some(repo_state) = self.repos.get_mut(repo) {
+            repo_state.seen_remote_shas.clear();
+        }
+    }
     /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
     /// then check whether the branch exists in the git repo. If it does, then let the user know
     /// that they need to use `git checkout` to check it out. If it doesn't, then create a new
