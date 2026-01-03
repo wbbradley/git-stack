@@ -226,19 +226,51 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     println!("Reading remote state...");
     let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
 
-    // Record PR head SHAs as seen (filtering out already-merged ones to avoid re-adding garbage)
+    // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
     let existing_shas = state.get_seen_shas(repo).cloned().unwrap_or_default();
+    let tracked_shas: Vec<String> = state
+        .get_tree(repo)
+        .map(|tree| collect_tracked_branch_shas(git_repo, tree))
+        .unwrap_or_default();
+
+    let mut skipped_existing = 0;
+    let mut skipped_merged = 0;
+    let mut skipped_unreachable = 0;
+    let mut added = 0;
+    let total = seen_shas.len();
+
     for sha in seen_shas {
         // Skip if already tracked (no work needed)
         if existing_shas.contains(&sha) {
+            skipped_existing += 1;
             continue;
         }
-        // Only add if not already merged to trunk
-        if !git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
+        // Skip if already merged to trunk
+        if git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
+            skipped_merged += 1;
+            continue;
+        }
+        // Only add if reachable from a tracked branch
+        let reachable = tracked_shas
+            .iter()
+            .any(|branch_sha| git_repo.is_ancestor(&sha, branch_sha).unwrap_or(false));
+        if reachable {
             state.add_seen_sha(repo, sha);
+            added += 1;
+        } else {
+            skipped_unreachable += 1;
         }
     }
+
+    tracing::debug!(
+        "seen_shas: total={}, skipped_existing={}, skipped_merged={}, skipped_unreachable={}, added={}",
+        total,
+        skipped_existing,
+        skipped_merged,
+        skipped_unreachable,
+        added
+    );
 
     // Garbage collect old seen SHAs
     gc_seen_shas(git_repo, state, repo, &local_state.trunk);
@@ -339,7 +371,7 @@ fn gc_seen_shas(git_repo: &GitRepo, state: &mut State, repo: &str, trunk: &str) 
 
     if total_shas > 0 {
         let percentage = (traversed as f64 / total_shas as f64) * 100.0;
-        tracing::info!(
+        tracing::debug!(
             "gc_seen_shas: traversed {}/{} ({:.1}%), deleted {}",
             traversed,
             total_shas,
