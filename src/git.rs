@@ -119,6 +119,63 @@ pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
 
+/// Counts of local changes by category from `git status --porcelain`
+#[derive(Debug, Default)]
+pub struct LocalStatus {
+    /// Files with staged changes (index differs from HEAD)
+    pub staged: usize,
+    /// Files with unstaged changes (working tree differs from index)
+    pub unstaged: usize,
+    /// Untracked files
+    pub untracked: usize,
+}
+
+impl LocalStatus {
+    pub fn is_clean(&self) -> bool {
+        self.staged == 0 && self.unstaged == 0 && self.untracked == 0
+    }
+}
+
+/// Get counts of local changes by category
+pub(crate) fn get_local_status() -> Result<LocalStatus> {
+    // Run git status directly to avoid run_git's trim() which strips leading spaces
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .context("running git status --porcelain")?;
+
+    if !output.status.success() {
+        bail!("git status --porcelain failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut status = LocalStatus::default();
+
+    for line in stdout.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let index_status = bytes[0];
+        let worktree_status = bytes[1];
+
+        if index_status == b'?' {
+            status.untracked += 1;
+        } else {
+            // Staged if first column has meaningful status (not space)
+            if index_status != b' ' {
+                status.staged += 1;
+            }
+            // Unstaged if second column has meaningful status (not space)
+            if worktree_status != b' ' {
+                status.unstaged += 1;
+            }
+        }
+    }
+
+    Ok(status)
+}
+
 pub(crate) fn after_text(s: &str, needle: impl AsRef<str>) -> Option<&str> {
     let needle = needle.as_ref();
     s.find(needle)

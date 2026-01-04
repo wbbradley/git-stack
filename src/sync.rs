@@ -747,23 +747,23 @@ fn compute_sync_plan(
         }
 
         // Check if this branch has a merged/closed PR but no open PR
-        if !remote.prs.contains_key(branch_name) {
-            if let Some(closed_pr) = remote.closed_prs.get(branch_name) {
-                tracing::debug!(
-                    "Branch '{}' has closed PR #{} with state {:?}",
-                    branch_name,
-                    closed_pr.number,
-                    closed_pr.state
-                );
-                if closed_pr.state == RemotePrState::Merged {
-                    // This branch's PR was merged - it should be unmounted
-                    // Children should be repointed to this branch's parent
-                    let repoint_to = local_branch
-                        .parent
-                        .clone()
-                        .unwrap_or_else(|| local.trunk.clone());
-                    branches_to_unmount.push((branch_name.clone(), repoint_to));
-                }
+        if !remote.prs.contains_key(branch_name)
+            && let Some(closed_pr) = remote.closed_prs.get(branch_name)
+        {
+            tracing::debug!(
+                "Branch '{}' has closed PR #{} with state {:?}",
+                branch_name,
+                closed_pr.number,
+                closed_pr.state
+            );
+            if closed_pr.state == RemotePrState::Merged {
+                // This branch's PR was merged - it should be unmounted
+                // Children should be repointed to this branch's parent
+                let repoint_to = local_branch
+                    .parent
+                    .clone()
+                    .unwrap_or_else(|| local.trunk.clone());
+                branches_to_unmount.push((branch_name.clone(), repoint_to));
             }
         }
     }
@@ -873,7 +873,7 @@ fn compute_sync_plan(
 
         // Strategy A: PR-based deletion with seen SHA verification
         // For squash/rebase merged PRs where the branch tip won't be an ancestor of main
-        for (branch_name, _local_branch) in &local.branches {
+        for branch_name in local.branches.keys() {
             // Skip trunk
             if branch_name == &local.trunk {
                 continue;
@@ -885,25 +885,24 @@ fn compute_sync_plan(
             }
 
             // Check if this branch has a merged PR
-            if let Some(closed_pr) = remote.closed_prs.get(branch_name) {
-                if closed_pr.state == RemotePrState::Merged {
-                    // Check if remote branch is deleted (fetch --prune already ran)
-                    let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
-                    if !git_repo.ref_exists(&remote_ref) {
-                        // Check if local HEAD SHA is in seen set
-                        if let Ok(local_sha) = git_repo.sha(branch_name) {
-                            if let Some(seen) = seen_shas {
-                                if seen.contains(&local_sha) {
-                                    branches_to_delete.insert(branch_name.clone());
-                                    local_changes.push(LocalChange::DeleteLocalBranch {
-                                        name: branch_name.clone(),
-                                        reason: DeleteReason::SeenOnRemote {
-                                            verified_sha: local_sha,
-                                        },
-                                    });
-                                }
-                            }
-                        }
+            if let Some(closed_pr) = remote.closed_prs.get(branch_name)
+                && closed_pr.state == RemotePrState::Merged
+            {
+                // Check if remote branch is deleted (fetch --prune already ran)
+                let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+                if !git_repo.ref_exists(&remote_ref) {
+                    // Check if local HEAD SHA is in seen set
+                    if let Ok(local_sha) = git_repo.sha(branch_name)
+                        && let Some(seen) = seen_shas
+                        && seen.contains(&local_sha)
+                    {
+                        branches_to_delete.insert(branch_name.clone());
+                        local_changes.push(LocalChange::DeleteLocalBranch {
+                            name: branch_name.clone(),
+                            reason: DeleteReason::SeenOnRemote {
+                                verified_sha: local_sha,
+                            },
+                        });
                     }
                 }
             }
@@ -1152,18 +1151,17 @@ fn apply_local_change(
             );
 
             // For SeenOnRemote, double-check SHA hasn't changed since plan was computed
-            if let DeleteReason::SeenOnRemote { verified_sha } = reason {
-                if let Ok(current_sha) = git_repo.sha(name) {
-                    if current_sha != *verified_sha {
-                        println!(
-                            "    {} Branch SHA changed ({} -> {}), skipping deletion",
-                            "Warning:".yellow(),
-                            &verified_sha[..8.min(verified_sha.len())],
-                            &current_sha[..8.min(current_sha.len())]
-                        );
-                        return Ok(());
-                    }
-                }
+            if let DeleteReason::SeenOnRemote { verified_sha } = reason
+                && let Ok(current_sha) = git_repo.sha(name)
+                && current_sha != *verified_sha
+            {
+                println!(
+                    "    {} Branch SHA changed ({} -> {}), skipping deletion",
+                    "Warning:".yellow(),
+                    &verified_sha[..8.min(verified_sha.len())],
+                    &current_sha[..8.min(current_sha.len())]
+                );
+                return Ok(());
             }
 
             // Delete the git branch

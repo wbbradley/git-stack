@@ -248,7 +248,10 @@ impl State {
         // Find all the descendents of the starting branch.
         // Traverse the tree from the starting branch to the root,
         let mut path: Vec<&Branch> = vec![];
-        let repo_state = self.repos.get(repo).ok_or_else(|| anyhow!("Repo not found"))?;
+        let repo_state = self
+            .repos
+            .get(repo)
+            .ok_or_else(|| anyhow!("Repo not found"))?;
         if !get_path(&repo_state.tree, starting_branch, &mut path) {
             bail!("Branch {starting_branch} not found in the git-stack tree.");
         }

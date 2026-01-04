@@ -492,10 +492,7 @@ impl GitHubClient {
         let repo_key = repo.full_name();
 
         // Get existing cache for this repo
-        let repo_cache = cache
-            .repos
-            .entry(repo_key.clone())
-            .or_insert_with(RepoPrCache::default);
+        let repo_cache = cache.repos.entry(repo_key.clone()).or_default();
 
         let watermark = if repo_cache.watermark.is_empty() {
             None
@@ -515,7 +512,7 @@ impl GitHubClient {
             // Track newest timestamp
             if newest_updated_at
                 .as_ref()
-                .map_or(true, |ts| pr.updated_at > *ts)
+                .is_none_or(|ts| pr.updated_at > *ts)
             {
                 newest_updated_at = Some(pr.updated_at.clone());
             }
@@ -527,10 +524,10 @@ impl GitHubClient {
         }
 
         // Update watermark if we saw newer data
-        if let Some(ts) = newest_updated_at {
-            if repo_cache.watermark.is_empty() || ts > repo_cache.watermark {
-                repo_cache.watermark = ts;
-            }
+        if let Some(ts) = newest_updated_at
+            && (repo_cache.watermark.is_empty() || ts > repo_cache.watermark)
+        {
+            repo_cache.watermark = ts;
         }
 
         // Convert cache to return type, applying filters
@@ -593,10 +590,10 @@ impl GitHubClient {
             for pr in prs {
                 // If we have a watermark and this PR's updated_at is older or equal, we can stop
                 // after this page (still include PRs on this page to handle edge cases)
-                if let Some(wm) = watermark {
-                    if pr.updated_at.as_str() <= wm {
-                        hit_watermark = true;
-                    }
+                if let Some(wm) = watermark
+                    && pr.updated_at.as_str() <= wm
+                {
+                    hit_watermark = true;
                 }
                 all_prs.push(pr);
             }

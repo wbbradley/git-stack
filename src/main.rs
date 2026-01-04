@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, git_checkout_main, git_fetch, run_git_status};
+use git::{after_text, get_local_status, git_checkout_main, git_fetch, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -346,7 +346,9 @@ fn inner_main() -> Result<()> {
             handle_pr_command(&git_repo, &mut state, &repo, &current_branch, action)
         }
         Some(Command::Auth { action }) => handle_auth_command(&git_repo, action),
-        Some(Command::Cache { action }) => handle_cache_command(&git_repo, &mut state, &repo, action),
+        Some(Command::Cache { action }) => {
+            handle_cache_command(&git_repo, &mut state, &repo, action)
+        }
         Some(Command::Import { branch, all }) => {
             let branch = branch.unwrap_or(current_branch);
             handle_import_command(&git_repo, &mut state, &repo, &branch, all)
@@ -489,11 +491,38 @@ fn recur_tree(
         String::new() // No LKG = no stats (e.g., trunk root)
     };
 
+    // Get local changes summary for current branch only
+    let local_status = if is_current_branch {
+        match get_local_status() {
+            Ok(status) if !status.is_clean() => {
+                let mut parts = Vec::new();
+                if status.staged > 0 {
+                    parts.push(format!("+{}", status.staged).green().to_string());
+                }
+                if status.unstaged > 0 {
+                    parts.push(format!("~{}", status.unstaged).yellow().to_string());
+                }
+                if status.untracked > 0 {
+                    parts.push(
+                        format!("?{}", status.untracked)
+                            .truecolor(128, 128, 128)
+                            .to_string(),
+                    );
+                }
+                format!(" [{}]", parts.join(" "))
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+
     if verbose {
         println!(
-            "{}{} ({}) {}{}{}{}",
+            "{}{}{} ({}) {}{}{}{}",
             branch_name_colored,
             diff_stats,
+            local_status,
             branch_status.sha[..8].truecolor(215, 153, 33),
             {
                 let details: String = if branch_status.exists {
@@ -581,7 +610,10 @@ fn recur_tree(
         } else {
             String::new()
         };
-        println!("{}{}{}", branch_name_colored, diff_stats, pr_info);
+        println!(
+            "{}{}{}{}",
+            branch_name_colored, diff_stats, local_status, pr_info
+        );
     }
 
     let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
