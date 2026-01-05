@@ -224,7 +224,10 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     let local_state = read_local_state(git_repo, state, repo)?;
 
     println!("Reading remote state...");
-    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
+    let (remote_state, seen_shas, all_pr_authors) = read_remote_state(&client, &repo_id)?;
+
+    // Prune branches from excluded authors before building target state
+    prune_excluded_branches(state, repo, &all_pr_authors, &client.config().sync_authors);
 
     // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
@@ -492,10 +495,12 @@ fn collect_local_branches(
 }
 
 /// Read current remote state from GitHub
+/// Returns (RemoteState, seen_shas, all_pr_authors) where all_pr_authors maps branch -> author
+/// for ALL PRs (before filtering), used for pruning decisions.
 fn read_remote_state(
     client: &GitHubClient,
     repo_id: &RepoIdentifier,
-) -> Result<(RemoteState, HashSet<String>)> {
+) -> Result<(RemoteState, HashSet<String>, HashMap<String, String>)> {
     // Only show spinner if stderr is a TTY
     let spinner = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new_spinner();
@@ -519,11 +524,12 @@ fn read_remote_state(
             s.set_message(format!("Fetching open PRs... ({count} loaded)"));
         }
     };
-    let open_prs_map = client
+    let open_result = client
         .list_open_prs(repo_id, Some(&open_progress))
         .map_err(|e| anyhow!("{}", e))?;
 
-    let prs: HashMap<String, RemotePr> = open_prs_map
+    let prs: HashMap<String, RemotePr> = open_result
+        .prs
         .iter()
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
         .collect();
@@ -541,7 +547,7 @@ fn read_remote_state(
     // Load PR cache
     let mut pr_cache = load_pr_cache().unwrap_or_default();
 
-    let closed_prs_map = client
+    let closed_result = client
         .list_closed_prs_with_cache(repo_id, &mut pr_cache, Some(&closed_progress))
         .map_err(|e| anyhow!("{}", e))?;
 
@@ -550,7 +556,8 @@ fn read_remote_state(
         tracing::warn!("Failed to save PR cache: {}", e);
     }
 
-    let closed_prs: HashMap<String, RemotePr> = closed_prs_map
+    let closed_prs: HashMap<String, RemotePr> = closed_result
+        .prs
         .iter()
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
         .collect();
@@ -560,13 +567,84 @@ fn read_remote_state(
     }
 
     // Collect all PR head SHAs for seen tracking
-    let mut seen_shas: HashSet<String> = open_prs_map
+    let mut seen_shas: HashSet<String> = open_result
+        .prs
         .values()
         .map(|pr| pr.head.sha.clone())
         .collect();
-    seen_shas.extend(closed_prs_map.values().map(|pr| pr.head.sha.clone()));
+    seen_shas.extend(closed_result.prs.values().map(|pr| pr.head.sha.clone()));
 
-    Ok((RemoteState { prs, closed_prs }, seen_shas))
+    // Merge all authors from open and closed PRs (for pruning decisions)
+    let mut all_pr_authors = open_result.all_authors;
+    all_pr_authors.extend(closed_result.all_authors);
+
+    Ok((RemoteState { prs, closed_prs }, seen_shas, all_pr_authors))
+}
+
+/// Prune branches from the local tree whose PR authors are not in sync_authors.
+/// Only prunes branches that have known PR authors - branches without PRs are kept.
+fn prune_excluded_branches(
+    state: &mut State,
+    repo: &str,
+    pr_authors: &HashMap<String, String>,
+    sync_authors: &[String],
+) {
+    if sync_authors.is_empty() {
+        return;
+    }
+
+    let Some(tree) = state.get_tree_mut(repo) else {
+        return;
+    };
+
+    // Recursively collect branches to prune
+    fn collect_branches_to_prune(
+        branch: &Branch,
+        pr_authors: &HashMap<String, String>,
+        sync_authors: &[String],
+        to_prune: &mut Vec<String>,
+    ) {
+        // Check this branch
+        if let Some(author) = pr_authors.get(&branch.name)
+            && !sync_authors.contains(author)
+        {
+            tracing::info!(
+                "Pruning branch '{}' - author '{}' not in sync_authors",
+                branch.name,
+                author
+            );
+            to_prune.push(branch.name.clone());
+        }
+        // Check children
+        for child in &branch.branches {
+            collect_branches_to_prune(child, pr_authors, sync_authors, to_prune);
+        }
+    }
+
+    let mut branches_to_prune = Vec::new();
+    for child in &tree.branches {
+        collect_branches_to_prune(child, pr_authors, sync_authors, &mut branches_to_prune);
+    }
+
+    // Recursively remove branches from the tree
+    fn remove_branch_recursive(branch: &mut Branch, name: &str) -> bool {
+        // Check if any direct child matches
+        if let Some(pos) = branch.branches.iter().position(|b| b.name == name) {
+            branch.branches.remove(pos);
+            return true;
+        }
+        // Otherwise recurse into children
+        for child in &mut branch.branches {
+            if remove_branch_recursive(child, name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    for branch_name in branches_to_prune {
+        remove_branch_recursive(tree, &branch_name);
+    }
 }
 
 // ============== Stage 2: Model Functions ==============

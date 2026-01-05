@@ -238,6 +238,15 @@ pub struct CachedPrUser {
     pub login: String,
 }
 
+/// Result from list_prs operations, containing both filtered PRs and all author mappings
+#[derive(Debug)]
+pub struct PrListResult {
+    /// Filtered PRs (by sync_authors or fork filter)
+    pub prs: std::collections::HashMap<String, PullRequest>,
+    /// All branch -> author mappings (before filtering)
+    pub all_authors: std::collections::HashMap<String, String>,
+}
+
 // ============== Error Types ==============
 
 #[derive(Debug)]
@@ -305,6 +314,11 @@ impl GitHubClient {
             api_base,
             sync_authors,
         }))
+    }
+
+    /// Get a reference to the client's config
+    pub fn config(&self) -> &GitHubConfig {
+        &self.config
     }
 
     /// Get PR by number
@@ -382,7 +396,7 @@ impl GitHubClient {
     }
 
     /// List PRs for a repository with a given state filter
-    /// Returns a map of head branch name -> PullRequest for easy lookup
+    /// Returns a PrListResult containing filtered PRs and all author mappings
     ///
     /// The optional `on_progress` callback is called after each page fetch with
     /// (page_number, cumulative_count) to enable progress reporting.
@@ -391,7 +405,7 @@ impl GitHubClient {
         repo: &RepoIdentifier,
         state: &str, // "open", "closed", or "all"
         on_progress: Option<&dyn Fn(usize, usize)>,
-    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+    ) -> Result<PrListResult, GitHubError> {
         let mut all_prs = Vec::new();
         let mut page = 1;
         let per_page = 100;
@@ -429,8 +443,14 @@ impl GitHubClient {
             page += 1;
         }
 
+        // Collect all authors before filtering (for pruning decisions)
+        let all_authors: std::collections::HashMap<String, String> = all_prs
+            .iter()
+            .map(|pr| (pr.head.ref_name.clone(), pr.user.login.clone()))
+            .collect();
+
         // Build map of head branch name -> PR, filtering out irrelevant PRs
-        let pr_map: std::collections::HashMap<String, PullRequest> = all_prs
+        let prs: std::collections::HashMap<String, PullRequest> = all_prs
             .into_iter()
             .filter(|pr| {
                 // If sync_authors is configured, only include PRs from those authors
@@ -463,7 +483,7 @@ impl GitHubClient {
             .map(|pr| (pr.head.ref_name.clone(), pr))
             .collect();
 
-        Ok(pr_map)
+        Ok(PrListResult { prs, all_authors })
     }
 
     /// List all open PRs for a repository (convenience wrapper)
@@ -471,7 +491,7 @@ impl GitHubClient {
         &self,
         repo: &RepoIdentifier,
         on_progress: Option<&dyn Fn(usize, usize)>,
-    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+    ) -> Result<PrListResult, GitHubError> {
         self.list_prs(repo, "open", on_progress)
     }
 
@@ -488,7 +508,7 @@ impl GitHubClient {
         repo: &RepoIdentifier,
         cache: &mut PrCache,
         on_progress: Option<&dyn Fn(usize, usize)>,
-    ) -> Result<std::collections::HashMap<String, PullRequest>, GitHubError> {
+    ) -> Result<PrListResult, GitHubError> {
         let repo_key = repo.full_name();
 
         // Get existing cache for this repo
@@ -530,15 +550,22 @@ impl GitHubClient {
             repo_cache.watermark = ts;
         }
 
+        // Collect all authors from cache before filtering (for pruning decisions)
+        let all_authors: std::collections::HashMap<String, String> = repo_cache
+            .closed_prs
+            .iter()
+            .map(|(branch, cached_pr)| (branch.clone(), cached_pr.user.login.clone()))
+            .collect();
+
         // Convert cache to return type, applying filters
-        let result: std::collections::HashMap<String, PullRequest> = repo_cache
+        let prs: std::collections::HashMap<String, PullRequest> = repo_cache
             .closed_prs
             .iter()
             .map(|(k, v)| (k.clone(), PullRequest::from(v)))
             .filter(|(_, pr)| self.should_include_pr(pr))
             .collect();
 
-        Ok(result)
+        Ok(PrListResult { prs, all_authors })
     }
 
     /// Check if a PR should be included based on sync_authors and fork filtering
