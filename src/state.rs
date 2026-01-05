@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     default,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     rc::Rc,
 };
@@ -17,6 +17,24 @@ use crate::{
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     run_git,
 };
+
+/// Write a file with secure permissions (0600 on Unix).
+/// This ensures sensitive config and state files are only readable by the owner.
+#[cfg(unix)]
+pub fn write_file_secure(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, contents)?;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+/// Write a file (non-Unix platforms don't have the same permission model).
+#[cfg(not(unix))]
+pub fn write_file_secure(path: &Path, contents: &str) -> std::io::Result<()> {
+    fs::write(path, contents)
+}
 
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -122,7 +140,7 @@ impl State {
     pub fn save_state(&self) -> Result<()> {
         let config_path = get_xdg_path()?;
         tracing::trace!(?self, ?config_path, "Saving state to config file");
-        Ok(fs::write(config_path, serde_yaml::to_string(&self)?)?)
+        Ok(write_file_secure(&config_path, &serde_yaml::to_string(&self)?)?)
     }
 
     pub fn get_tree(&self, repo: &str) -> Option<&Branch> {

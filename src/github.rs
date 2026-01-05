@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::git2_ops::GitRepo;
+use crate::state::write_file_secure;
 
 // ============== Configuration Types ==============
 
@@ -862,16 +863,7 @@ pub fn save_github_token(token: &str) -> Result<()> {
     config.default_token = Some(token.to_string());
 
     let contents = serde_yaml::to_string(&config)?;
-    fs::write(&config_path, contents)?;
-
-    // Set restrictive permissions on the config file (Unix only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&config_path)?.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&config_path, perms)?;
-    }
+    write_file_secure(&config_path, &contents)?;
 
     println!("Token saved to {}", config_path.display());
     Ok(())
@@ -950,7 +942,7 @@ pub fn load_pr_cache() -> Result<PrCache> {
 pub fn save_pr_cache(cache: &PrCache) -> Result<()> {
     let cache_path = get_pr_cache_path()?;
     let contents = serde_yaml::to_string(cache)?;
-    fs::write(&cache_path, contents)?;
+    write_file_secure(&cache_path, &contents)?;
     Ok(())
 }
 
