@@ -642,7 +642,7 @@ fn recur_tree(
                 let number_colored = format!("#{}", pr.number).truecolor(90, 78, 98);
                 format!(
                     " {} {} {} {}",
-                    "".truecolor(100, 105, 105),
+                    "".truecolor(100, 105, 105),
                     author_colored,
                     number_colored,
                     state_colored
