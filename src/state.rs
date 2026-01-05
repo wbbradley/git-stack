@@ -140,7 +140,10 @@ impl State {
     pub fn save_state(&self) -> Result<()> {
         let config_path = get_xdg_path()?;
         tracing::trace!(?self, ?config_path, "Saving state to config file");
-        Ok(write_file_secure(&config_path, &serde_yaml::to_string(&self)?)?)
+        Ok(write_file_secure(
+            &config_path,
+            &serde_yaml::to_string(&self)?,
+        )?)
     }
 
     pub fn get_tree(&self, repo: &str) -> Option<&Branch> {

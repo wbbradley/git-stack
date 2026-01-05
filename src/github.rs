@@ -13,8 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::git2_ops::GitRepo;
-use crate::state::write_file_secure;
+use crate::{git2_ops::GitRepo, state::write_file_secure};
 
 // ============== Configuration Types ==============
 

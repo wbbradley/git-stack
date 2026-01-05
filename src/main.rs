@@ -22,7 +22,41 @@ mod state;
 mod stats;
 mod sync;
 
-const CREATE_BACKUP: bool = false;
+/// Compute a deterministic RGB color from a string using its hash.
+/// Uses MD5 to hash the string, derives a hue from the first two bytes,
+/// and converts HSV to RGB with fixed saturation and value for readability.
+fn string_to_rgb(s: &str) -> (u8, u8, u8) {
+    let hash = md5::compute(s);
+    // Use first two bytes to get a hue value (0-360)
+    let hue = (u16::from(hash[0]) | (u16::from(hash[1]) << 8)) % 360;
+    // Fixed saturation and value for good terminal readability
+    let saturation = 0.35;
+    let value = 0.75;
+    hsv_to_rgb(hue as f32, saturation, value)
+}
+
+/// Convert HSV color to RGB.
+/// h: hue (0-360), s: saturation (0-1), v: value (0-1)
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+
+    let (r, g, b) = match h as u32 {
+        0..60 => (c, x, 0.0),
+        60..120 => (x, c, 0.0),
+        120..180 => (0.0, c, x),
+        180..240 => (0.0, x, c),
+        240..300 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
 
 // This is an important refactoring.
 #[derive(Parser)]
@@ -603,7 +637,16 @@ fn recur_tree(
                     }
                     github::PrDisplayState::Closed => format!("[{}]", state).truecolor(204, 36, 29),
                 };
-                format!("  #{} {}", pr.number, state_colored)
+                let (r, g, b) = string_to_rgb(&pr.user.login);
+                let author_colored = format!("@{}", pr.user.login).truecolor(r, g, b);
+                let number_colored = format!("#{}", pr.number).truecolor(90, 78, 98);
+                format!(
+                    " {} {} {} {}",
+                    "".truecolor(100, 105, 105),
+                    author_colored,
+                    number_colored,
+                    state_colored
+                )
             } else {
                 String::new()
             }
@@ -782,7 +825,6 @@ fn restack(
             }
         } else {
             tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
-            make_backup(&run_version, branch, &source)?;
 
             match branch.stack_method {
                 StackMethod::ApplyMerge => {
@@ -1087,22 +1129,6 @@ fn git_push(git_repo: &GitRepo, branch: &str) -> Result<()> {
             DEFAULT_REMOTE,
             &format!("{}:{}", branch, branch),
         ])?;
-    }
-    Ok(())
-}
-
-fn make_backup(run_version: &String, branch: &Branch, source: &str) -> Result<(), anyhow::Error> {
-    if !CREATE_BACKUP {
-        return Ok(());
-    }
-    let backup_branch = format!("{}-at-{}", branch.name, run_version);
-    tracing::debug!(
-        "Creating backup branch '{}' from '{}'...",
-        backup_branch,
-        branch.name
-    );
-    if !run_git_status(&["branch", &backup_branch, source], None)?.success() {
-        tracing::warn!("failed to create backup branch {}", backup_branch);
     }
     Ok(())
 }
