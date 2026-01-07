@@ -58,6 +58,49 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     )
 }
 
+// Color constants for consistent theming
+mod colors {
+    pub const GREEN: (u8, u8, u8) = (142, 192, 124);
+    pub const RED: (u8, u8, u8) = (204, 36, 29);
+    pub const GRAY: (u8, u8, u8) = (128, 128, 128);
+    pub const GOLD: (u8, u8, u8) = (215, 153, 33);
+    pub const TREE: (u8, u8, u8) = (55, 55, 50);
+    pub const YELLOW: (u8, u8, u8) = (250, 189, 47);
+    pub const PURPLE: (u8, u8, u8) = (180, 142, 173);
+    pub const MUTED: (u8, u8, u8) = (90, 90, 90);
+    pub const PR_NUMBER: (u8, u8, u8) = (90, 78, 98);
+    pub const PR_ARROW: (u8, u8, u8) = (100, 105, 105);
+    pub const UPSTREAM: (u8, u8, u8) = (88, 88, 88);
+    pub const STACKED_ON: (u8, u8, u8) = (90, 120, 87);
+}
+
+/// Dimming factor for display. Wraps RGB values and applies a multiplier.
+#[derive(Clone, Copy)]
+struct Dim(f32);
+
+impl Dim {
+    fn full() -> Self {
+        Dim(1.0)
+    }
+    fn dimmed() -> Self {
+        Dim(0.75)
+    }
+
+    /// Apply dimming to RGB values
+    fn rgb(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        (
+            (r as f32 * self.0) as u8,
+            (g as f32 * self.0) as u8,
+            (b as f32 * self.0) as u8,
+        )
+    }
+
+    /// Apply dimming to a color tuple
+    fn apply(&self, color: (u8, u8, u8)) -> (u8, u8, u8) {
+        self.rgb(color.0, color.1, color.2)
+    }
+}
+
 // This is an important refactoring.
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -490,6 +533,11 @@ fn recur_tree(
     } else {
         pr_author.is_some_and(|author| !display_authors.contains(&author.to_string()))
     };
+    let dim = if is_dimmed {
+        Dim::dimmed()
+    } else {
+        Dim::full()
+    };
 
     // Check if branch is remote-only (not local)
     let is_remote_only = !git_repo.branch_exists(&branch.name);
@@ -512,18 +560,21 @@ fn recur_tree(
             } else {
                 print!("  ");
             }
+            // Tree lines stay at full color regardless of dimming
             for _ in 0..depth {
-                print!("{}", "┃ ".truecolor(55, 55, 50));
+                print!(
+                    "{}",
+                    "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
+                );
             }
-            let branch_name_colored = if is_dimmed {
-                branch.name.truecolor(90, 90, 90)
-            } else {
-                branch.name.truecolor(128, 128, 128)
-            };
+            let branch_color = dim.apply(colors::GRAY);
+            let muted_color = dim.apply(colors::MUTED);
             println!(
                 "{} {}",
-                branch_name_colored,
-                "(remote)".truecolor(90, 90, 90)
+                branch
+                    .name
+                    .truecolor(branch_color.0, branch_color.1, branch_color.2),
+                "(remote)".truecolor(muted_color.0, muted_color.1, muted_color.2)
             );
 
             // Recurse into children
@@ -552,26 +603,35 @@ fn recur_tree(
         false
     };
 
+    // Tree lines stay at full color regardless of dimming
     for _ in 0..depth {
-        print!("{}", "┃ ".truecolor(55, 55, 50));
+        print!(
+            "{}",
+            "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
+        );
     }
 
     // Branch name coloring: green for synced, red for diverged, bold for current branch
-    // Dimmed branches (filtered by display_authors) are shown in gray
-    let branch_name_colored = if is_dimmed {
-        branch.name.truecolor(90, 90, 90)
+    let branch_color = if branch_status.is_descendent {
+        dim.apply(colors::GREEN)
     } else {
-        match (is_current_branch, branch_status.is_descendent) {
-            (true, true) => branch.name.truecolor(142, 192, 124).bold(),
-            (true, false) => branch.name.red().bold(),
-            (false, true) => branch.name.truecolor(142, 192, 124),
-            (false, false) => branch.name.red(),
-        }
+        dim.apply(colors::RED)
+    };
+    let branch_name_colored = if is_current_branch {
+        branch
+            .name
+            .truecolor(branch_color.0, branch_color.1, branch_color.2)
+            .bold()
+    } else {
+        branch
+            .name
+            .truecolor(branch_color.0, branch_color.1, branch_color.2)
     };
 
     // Remote-only indicator
     let remote_indicator = if is_remote_only {
-        " (remote)".truecolor(90, 90, 90).to_string()
+        let muted = dim.apply(colors::MUTED);
+        format!(" {}", "(remote)".truecolor(muted.0, muted.1, muted.2))
     } else {
         String::new()
     };
@@ -579,11 +639,15 @@ fn recur_tree(
     // Get diff stats from LKG ancestor to current branch
     let diff_stats = if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
         match git_repo.diff_stats(lkg_parent, &branch_status.sha) {
-            Ok((adds, dels)) => format!(
-                " {} {}",
-                format!("+{}", adds).green(),
-                format!("-{}", dels).red()
-            ),
+            Ok((adds, dels)) => {
+                let green = dim.apply(colors::GREEN);
+                let red = dim.apply(colors::RED);
+                format!(
+                    " {} {}",
+                    format!("+{}", adds).truecolor(green.0, green.1, green.2),
+                    format!("-{}", dels).truecolor(red.0, red.1, red.2)
+                )
+            }
             Err(_) => String::new(), // Silently skip on error
         }
     } else {
@@ -595,16 +659,27 @@ fn recur_tree(
         match get_local_status() {
             Ok(status) if !status.is_clean() => {
                 let mut parts = Vec::new();
+                let green = dim.apply(colors::GREEN);
+                let yellow = dim.apply(colors::YELLOW);
+                let gray = dim.apply(colors::GRAY);
                 if status.staged > 0 {
-                    parts.push(format!("+{}", status.staged).green().to_string());
+                    parts.push(
+                        format!("+{}", status.staged)
+                            .truecolor(green.0, green.1, green.2)
+                            .to_string(),
+                    );
                 }
                 if status.unstaged > 0 {
-                    parts.push(format!("~{}", status.unstaged).yellow().to_string());
+                    parts.push(
+                        format!("~{}", status.unstaged)
+                            .truecolor(yellow.0, yellow.1, yellow.2)
+                            .to_string(),
+                    );
                 }
                 if status.untracked > 0 {
                     parts.push(
                         format!("?{}", status.untracked)
-                            .truecolor(128, 128, 128)
+                            .truecolor(gray.0, gray.1, gray.2)
                             .to_string(),
                     );
                 }
@@ -617,30 +692,41 @@ fn recur_tree(
     };
 
     if verbose {
+        let gold = dim.apply(colors::GOLD);
+        let stacked_on = dim.apply(colors::STACKED_ON);
+        let yellow = dim.apply(colors::YELLOW);
+        let red = dim.apply(colors::RED);
+        let green = dim.apply(colors::GREEN);
+        let upstream_color = dim.apply(colors::UPSTREAM);
+
         println!(
             "{}{}{}{} ({}) {}{}{}{}",
             branch_name_colored,
             remote_indicator,
             diff_stats,
             local_status,
-            branch_status.sha[..8].truecolor(215, 153, 33),
+            branch_status.sha[..8].truecolor(gold.0, gold.1, gold.2),
             {
                 let details: String = if branch_status.exists {
                     if branch_status.is_descendent {
                         format!(
                             "{} {}",
-                            "is stacked on".truecolor(90, 120, 87),
-                            branch_status.parent_branch.yellow()
+                            "is stacked on".truecolor(stacked_on.0, stacked_on.1, stacked_on.2),
+                            branch_status
+                                .parent_branch
+                                .truecolor(yellow.0, yellow.1, yellow.2)
                         )
                     } else {
                         format!(
                             "{} {}",
-                            "diverges from".red(),
-                            branch_status.parent_branch.yellow()
+                            "diverges from".truecolor(red.0, red.1, red.2),
+                            branch_status
+                                .parent_branch
+                                .truecolor(yellow.0, yellow.1, yellow.2)
                         )
                     }
                 } else {
-                    "does not exist!".bright_red().to_string()
+                    "does not exist!".truecolor(red.0, red.1, red.2).to_string()
                 };
                 details
             },
@@ -648,39 +734,58 @@ fn recur_tree(
                 if let Some(upstream_status) = branch_status.upstream_status {
                     format!(
                         " (upstream {} is {})",
-                        upstream_status.symbolic_name.truecolor(88, 88, 88),
+                        upstream_status.symbolic_name.truecolor(
+                            upstream_color.0,
+                            upstream_color.1,
+                            upstream_color.2
+                        ),
                         if upstream_status.synced {
-                            "synced".truecolor(142, 192, 124)
+                            "synced".truecolor(green.0, green.1, green.2)
                         } else {
-                            "not synced".bright_red()
+                            "not synced".truecolor(red.0, red.1, red.2)
                         }
                     )
                 } else {
-                    format!(" ({})", "no upstream".truecolor(215, 153, 33))
+                    format!(" ({})", "no upstream".truecolor(gold.0, gold.1, gold.2))
                 }
             },
             {
                 if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
-                    format!(" (lkg parent {})", lkg_parent[..8].truecolor(215, 153, 33))
+                    format!(
+                        " (lkg parent {})",
+                        lkg_parent[..8].truecolor(gold.0, gold.1, gold.2)
+                    )
                 } else {
                     String::new()
                 }
             },
-            match branch.stack_method {
-                StackMethod::ApplyMerge => " (apply-merge)".truecolor(142, 192, 124),
-                StackMethod::Merge => " (merge)".truecolor(142, 192, 124),
+            {
+                let method_color = dim.apply(colors::GREEN);
+                match branch.stack_method {
+                    StackMethod::ApplyMerge => {
+                        " (apply-merge)".truecolor(method_color.0, method_color.1, method_color.2)
+                    }
+                    StackMethod::Merge => {
+                        " (merge)".truecolor(method_color.0, method_color.1, method_color.2)
+                    }
+                }
             },
         );
         if let Some(note) = &branch.note {
             print!("  ");
+            // Tree lines stay at full color regardless of dimming
             for _ in 0..depth {
-                print!("{}", "┃ ".truecolor(55, 55, 50));
+                print!(
+                    "{}",
+                    "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
+                );
             }
 
             let first_line = note.lines().next().unwrap_or("");
+            // Note: keeping blue for notes as it's distinct from status colors
             println!(
                 "  {} {}",
-                "›".truecolor(55, 55, 50),
+                "›".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2),
                 if is_current_branch {
                     first_line.bright_blue().bold()
                 } else {
@@ -693,22 +798,38 @@ fn recur_tree(
         let pr_info = if let Some(cache) = pr_cache {
             if let Some(pr) = cache.get(&branch.name) {
                 let state = pr.display_state();
+                let gray = dim.apply(colors::GRAY);
+                let green = dim.apply(colors::GREEN);
+                let purple = dim.apply(colors::PURPLE);
+                let red = dim.apply(colors::RED);
                 let state_colored = match state {
                     github::PrDisplayState::Draft => {
-                        format!("[{}]", state).truecolor(128, 128, 128)
+                        format!("[{}]", state).truecolor(gray.0, gray.1, gray.2)
                     }
-                    github::PrDisplayState::Open => format!("[{}]", state).truecolor(142, 192, 124),
+                    github::PrDisplayState::Open => {
+                        format!("[{}]", state).truecolor(green.0, green.1, green.2)
+                    }
                     github::PrDisplayState::Merged => {
-                        format!("[{}]", state).truecolor(180, 142, 173)
+                        format!("[{}]", state).truecolor(purple.0, purple.1, purple.2)
                     }
-                    github::PrDisplayState::Closed => format!("[{}]", state).truecolor(204, 36, 29),
+                    github::PrDisplayState::Closed => {
+                        format!("[{}]", state).truecolor(red.0, red.1, red.2)
+                    }
                 };
-                let (r, g, b) = string_to_rgb(&pr.user.login);
-                let author_colored = format!("@{}", pr.user.login).truecolor(r, g, b);
-                let number_colored = format!("#{}", pr.number).truecolor(90, 78, 98);
+                let author_rgb = string_to_rgb(&pr.user.login);
+                let author_color = dim.apply(author_rgb);
+                let author_colored = format!("@{}", pr.user.login).truecolor(
+                    author_color.0,
+                    author_color.1,
+                    author_color.2,
+                );
+                let pr_num = dim.apply(colors::PR_NUMBER);
+                let number_colored =
+                    format!("#{}", pr.number).truecolor(pr_num.0, pr_num.1, pr_num.2);
+                let arrow = dim.apply(colors::PR_ARROW);
                 format!(
                     " {} {} {} {}",
-                    "".truecolor(100, 105, 105),
+                    "".truecolor(arrow.0, arrow.1, arrow.2),
                     author_colored,
                     number_colored,
                     state_colored
