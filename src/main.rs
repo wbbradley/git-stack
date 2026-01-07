@@ -488,9 +488,7 @@ fn recur_tree(
     let is_dimmed = if display_authors.is_empty() {
         false
     } else {
-        pr_author.is_some_and(|author| {
-            !display_authors.contains(&author.to_string())
-        })
+        pr_author.is_some_and(|author| !display_authors.contains(&author.to_string()))
     };
 
     // Check if branch is remote-only (not local)

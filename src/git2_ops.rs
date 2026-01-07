@@ -129,7 +129,9 @@ impl GitRepo {
             let remote_ref = format!("origin/{}", branch);
             if self.ref_exists(&remote_ref) {
                 let sha = self.sha(&remote_ref).unwrap_or_default();
-                let is_descendent = self.is_ancestor(&parent_branch, &remote_ref).unwrap_or(false);
+                let is_descendent = self
+                    .is_ancestor(&parent_branch, &remote_ref)
+                    .unwrap_or(false);
                 (sha, is_descendent, None)
             } else {
                 // Neither local nor remote exists - use placeholder values
