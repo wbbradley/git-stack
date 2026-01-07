@@ -137,6 +137,8 @@ pub enum DeleteReason {
     SeenOnRemote { verified_sha: String },
     /// Branch is fully merged into main (git branch --merged)
     MergedIntoMain,
+    /// Local branch is ancestor of origin/<branch> (all work pushed)
+    AncestorOfRemote,
 }
 
 /// Changes to apply to local state
@@ -908,10 +910,41 @@ fn compute_sync_plan(
 
             // Only delete if it's a tracked branch (in our local state)
             if local.branches.contains_key(branch_name) {
+                branches_to_delete.insert(branch_name.clone());
                 local_changes.push(LocalChange::DeleteLocalBranch {
                     name: branch_name.clone(),
                     reason: DeleteReason::MergedIntoMain,
                 });
+            }
+        }
+
+        // Strategy C: Local branch is ancestor of origin/<branch>
+        // All local work has been pushed, safe to delete local branch
+        for branch_name in local.branches.keys() {
+            // Skip trunk
+            if branch_name == &local.trunk {
+                continue;
+            }
+
+            // Skip if currently checked out
+            if branch_name == &current_branch {
+                continue;
+            }
+
+            // Skip if already marked for deletion
+            if branches_to_delete.contains(branch_name) {
+                continue;
+            }
+
+            // Check if local branch is ancestor of origin/<branch>
+            let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+            if git_repo.ref_exists(&remote_ref) {
+                if let Ok(true) = git_repo.is_ancestor(branch_name, &remote_ref) {
+                    local_changes.push(LocalChange::DeleteLocalBranch {
+                        name: branch_name.clone(),
+                        reason: DeleteReason::AncestorOfRemote,
+                    });
+                }
             }
         }
     }
@@ -1106,6 +1139,7 @@ fn apply_local_change(
                     )
                 }
                 DeleteReason::MergedIntoMain => "fully merged into main".to_string(),
+                DeleteReason::AncestorOfRemote => "local is ancestor of remote".to_string(),
             };
             println!(
                 "  {} local branch '{}' ({})",
@@ -1132,14 +1166,17 @@ fn apply_local_change(
             run_git(&["branch", "-D", name])?;
             println!("    Branch '{}' deleted.", name);
 
-            // Also remove from git-stack tree
-            let repoint_to = state
-                .get_parent_branch_of(repo, name)
-                .map(|p| p.name.clone())
-                .or_else(|| state.get_tree(repo).map(|t| t.name.clone()))
-                .unwrap_or_else(|| "main".to_string());
-            unmount_branch_from_tree(git_repo, state, repo, name, &repoint_to)?;
-            println!("    Removed '{}' from git-stack tree.", name);
+            // Remove from git-stack tree ONLY if the remote is also gone
+            // For AncestorOfRemote, we keep the branch in tree since remote still exists
+            if !matches!(reason, DeleteReason::AncestorOfRemote) {
+                let repoint_to = state
+                    .get_parent_branch_of(repo, name)
+                    .map(|p| p.name.clone())
+                    .or_else(|| state.get_tree(repo).map(|t| t.name.clone()))
+                    .unwrap_or_else(|| "main".to_string());
+                unmount_branch_from_tree(git_repo, state, repo, name, &repoint_to)?;
+                println!("    Removed '{}' from git-stack tree.", name);
+            }
         }
     }
     Ok(())
@@ -1273,6 +1310,7 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
                             )
                         }
                         DeleteReason::MergedIntoMain => "merged into main".to_string(),
+                        DeleteReason::AncestorOfRemote => "ancestor of remote".to_string(),
                     };
                     println!(
                         "    - {} local branch '{}' ({})",
