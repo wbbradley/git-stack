@@ -570,11 +570,10 @@ fn recur_tree(
             let branch_color = dim.apply(colors::GRAY);
             let muted_color = dim.apply(colors::MUTED);
             println!(
-                "{} {}",
+                "{}",
                 branch
                     .name
-                    .truecolor(branch_color.0, branch_color.1, branch_color.2),
-                "(remote)".truecolor(muted_color.0, muted_color.1, muted_color.2)
+                    .truecolor(branch_color.0, branch_color.1, branch_color.2)
             );
 
             // Recurse into children
@@ -615,7 +614,7 @@ fn recur_tree(
     let branch_color = if branch_status.is_descendent {
         dim.apply(colors::GREEN)
     } else {
-        dim.apply(colors::RED)
+        dim.apply(colors::YELLOW)
     };
     let branch_name_colored = if is_current_branch {
         branch
@@ -628,30 +627,26 @@ fn recur_tree(
             .truecolor(branch_color.0, branch_color.1, branch_color.2)
     };
 
-    // Remote-only indicator
-    let remote_indicator = if is_remote_only {
-        let muted = dim.apply(colors::MUTED);
-        format!(" {}", "(remote)".truecolor(muted.0, muted.1, muted.2))
-    } else {
-        String::new()
-    };
+    // Get diff stats from LKG ancestor (or parent branch) to current branch
+    let diff_stats = {
+        // Try lkg_parent first, fall back to resolved parent branch
+        let base_ref = branch
+            .lkg_parent
+            .as_deref()
+            .unwrap_or(&branch_status.parent_branch);
 
-    // Get diff stats from LKG ancestor to current branch
-    let diff_stats = if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
-        match git_repo.diff_stats(lkg_parent, &branch_status.sha) {
+        match git_repo.diff_stats(base_ref, &branch_status.sha) {
             Ok((adds, dels)) => {
                 let green = dim.apply(colors::GREEN);
                 let red = dim.apply(colors::RED);
                 format!(
-                    " {} {}",
+                    " [{} {}]",
                     format!("+{}", adds).truecolor(green.0, green.1, green.2),
                     format!("-{}", dels).truecolor(red.0, red.1, red.2)
                 )
             }
-            Err(_) => String::new(), // Silently skip on error
+            Err(_) => String::new(),
         }
-    } else {
-        String::new() // No LKG = no stats (e.g., trunk root)
     };
 
     // Get local changes summary for current branch only
@@ -700,9 +695,8 @@ fn recur_tree(
         let upstream_color = dim.apply(colors::UPSTREAM);
 
         println!(
-            "{}{}{}{} ({}) {}{}{}{}",
+            "{}{}{} ({}) {}{}{}{}",
             branch_name_colored,
-            remote_indicator,
             diff_stats,
             local_status,
             branch_status.sha[..8].truecolor(gold.0, gold.1, gold.2),
@@ -841,8 +835,8 @@ fn recur_tree(
             String::new()
         };
         println!(
-            "{}{}{}{}{}",
-            branch_name_colored, remote_indicator, diff_stats, local_status, pr_info
+            "{}{}{}{}",
+            branch_name_colored, diff_stats, local_status, pr_info
         );
     }
 
