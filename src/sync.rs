@@ -53,8 +53,6 @@ pub struct LocalBranch {
     pub parent: Option<String>,
     /// Cached PR number from git-stack state
     pub pr_number: Option<u64>,
-    /// Whether the branch exists as a local git ref
-    pub exists_locally: bool,
     /// Whether the branch has been pushed to remote
     pub pushed_to_remote: bool,
 }
@@ -126,8 +124,6 @@ pub struct TargetBranch {
     pub pr_number: Option<u64>,
     /// Expected PR base (should match parent branch name)
     pub expected_pr_base: Option<String>,
-    /// Whether branch exists locally
-    pub exists_locally: bool,
     /// Whether branch is pushed to remote
     pub pushed_to_remote: bool,
 }
@@ -155,8 +151,6 @@ pub enum LocalChange {
     },
     /// Update the cached PR number for a branch
     UpdatePrNumber { branch: String, pr_number: u64 },
-    /// Checkout a branch from remote (branch exists on remote but not locally)
-    CheckoutBranch { name: String },
     /// Delete a local branch that has been merged
     DeleteLocalBranch { name: String, reason: DeleteReason },
 }
@@ -224,10 +218,7 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     let local_state = read_local_state(git_repo, state, repo)?;
 
     println!("Reading remote state...");
-    let (remote_state, seen_shas, all_pr_authors) = read_remote_state(&client, &repo_id)?;
-
-    // Prune branches from excluded authors before building target state
-    prune_excluded_branches(state, repo, &all_pr_authors, &client.config().sync_authors);
+    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
 
     // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
@@ -475,7 +466,6 @@ fn collect_local_branches(
     parent: Option<&str>,
     branches: &mut HashMap<String, LocalBranch>,
 ) {
-    let exists_locally = git_repo.branch_exists(&branch.name);
     let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch.name);
     let pushed_to_remote = git_repo.ref_exists(&remote_ref);
 
@@ -484,7 +474,6 @@ fn collect_local_branches(
         LocalBranch {
             parent: parent.map(|s| s.to_string()),
             pr_number: branch.pr_number,
-            exists_locally,
             pushed_to_remote,
         },
     );
@@ -495,12 +484,11 @@ fn collect_local_branches(
 }
 
 /// Read current remote state from GitHub
-/// Returns (RemoteState, seen_shas, all_pr_authors) where all_pr_authors maps branch -> author
-/// for ALL PRs (before filtering), used for pruning decisions.
+/// Returns (RemoteState, seen_shas)
 fn read_remote_state(
     client: &GitHubClient,
     repo_id: &RepoIdentifier,
-) -> Result<(RemoteState, HashSet<String>, HashMap<String, String>)> {
+) -> Result<(RemoteState, HashSet<String>)> {
     // Only show spinner if stderr is a TTY
     let spinner = if std::io::stderr().is_terminal() {
         let pb = ProgressBar::new_spinner();
@@ -574,77 +562,7 @@ fn read_remote_state(
         .collect();
     seen_shas.extend(closed_result.prs.values().map(|pr| pr.head.sha.clone()));
 
-    // Merge all authors from open and closed PRs (for pruning decisions)
-    let mut all_pr_authors = open_result.all_authors;
-    all_pr_authors.extend(closed_result.all_authors);
-
-    Ok((RemoteState { prs, closed_prs }, seen_shas, all_pr_authors))
-}
-
-/// Prune branches from the local tree whose PR authors are not in sync_authors.
-/// Only prunes branches that have known PR authors - branches without PRs are kept.
-fn prune_excluded_branches(
-    state: &mut State,
-    repo: &str,
-    pr_authors: &HashMap<String, String>,
-    sync_authors: &[String],
-) {
-    if sync_authors.is_empty() {
-        return;
-    }
-
-    let Some(tree) = state.get_tree_mut(repo) else {
-        return;
-    };
-
-    // Recursively collect branches to prune
-    fn collect_branches_to_prune(
-        branch: &Branch,
-        pr_authors: &HashMap<String, String>,
-        sync_authors: &[String],
-        to_prune: &mut Vec<String>,
-    ) {
-        // Check this branch
-        if let Some(author) = pr_authors.get(&branch.name)
-            && !sync_authors.contains(author)
-        {
-            tracing::info!(
-                "Pruning branch '{}' - author '{}' not in sync_authors",
-                branch.name,
-                author
-            );
-            to_prune.push(branch.name.clone());
-        }
-        // Check children
-        for child in &branch.branches {
-            collect_branches_to_prune(child, pr_authors, sync_authors, to_prune);
-        }
-    }
-
-    let mut branches_to_prune = Vec::new();
-    for child in &tree.branches {
-        collect_branches_to_prune(child, pr_authors, sync_authors, &mut branches_to_prune);
-    }
-
-    // Recursively remove branches from the tree
-    fn remove_branch_recursive(branch: &mut Branch, name: &str) -> bool {
-        // Check if any direct child matches
-        if let Some(pos) = branch.branches.iter().position(|b| b.name == name) {
-            branch.branches.remove(pos);
-            return true;
-        }
-        // Otherwise recurse into children
-        for child in &mut branch.branches {
-            if remove_branch_recursive(child, name) {
-                return true;
-            }
-        }
-        false
-    }
-
-    for branch_name in branches_to_prune {
-        remove_branch_recursive(tree, &branch_name);
-    }
+    Ok((RemoteState { prs, closed_prs }, seen_shas))
 }
 
 // ============== Stage 2: Model Functions ==============
@@ -690,7 +608,6 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
                 parent,
                 pr_number,
                 expected_pr_base,
-                exists_locally: local_branch.exists_locally,
                 pushed_to_remote: local_branch.pushed_to_remote,
             },
         );
@@ -700,8 +617,6 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
     for (branch_name, pr) in &remote.prs {
         if !branches.contains_key(branch_name) {
             // This PR's branch is not in our local tree
-            // Check if the branch exists locally (even if not in tree)
-            let exists_locally = git_repo.branch_exists(branch_name);
             let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
             let pushed_to_remote = git_repo.ref_exists(&remote_ref);
 
@@ -711,7 +626,6 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
                     parent: Some(pr.base.clone()),
                     pr_number: Some(pr.number),
                     expected_pr_base: Some(pr.base.clone()),
-                    exists_locally,
                     pushed_to_remote,
                 },
             );
@@ -744,7 +658,6 @@ fn compute_sync_plan(
     if !options.push_only {
         // Collect branches that need to be mounted, then topologically sort them
         let mut branches_to_mount: Vec<(String, String)> = Vec::new(); // (branch, parent)
-        let mut branches_to_checkout: HashSet<String> = HashSet::new();
         let mut pr_updates: Vec<(String, u64)> = Vec::new();
 
         for (branch_name, target_branch) in &target.branches {
@@ -760,11 +673,6 @@ fn compute_sync_plan(
                 // Branch has a PR but isn't in our local tree
                 if let Some(parent) = &target_branch.parent {
                     branches_to_mount.push((branch_name.clone(), parent.clone()));
-                }
-
-                // Check if we need to checkout the branch
-                if !target_branch.exists_locally {
-                    branches_to_checkout.insert(branch_name.clone());
                 }
             }
 
@@ -788,14 +696,8 @@ fn compute_sync_plan(
         // Topologically sort branches to mount (parents before children)
         let sorted_branches = topological_sort_branches(&branches_to_mount, &local.trunk);
 
-        // Add mount and checkout changes in topological order
+        // Add mount changes in topological order
         for (branch_name, parent) in sorted_branches {
-            // Checkout first if needed (need the ref before mounting)
-            if branches_to_checkout.contains(&branch_name) {
-                local_changes.push(LocalChange::CheckoutBranch {
-                    name: branch_name.clone(),
-                });
-            }
             local_changes.push(LocalChange::MountBranch {
                 name: branch_name,
                 parent,
@@ -1195,22 +1097,6 @@ fn apply_local_change(
                 b.pr_number = Some(*pr_number);
             }
         }
-        LocalChange::CheckoutBranch { name } => {
-            println!("  Checking out '{}'", name.yellow());
-            // Check if branch already exists locally
-            if git_repo.branch_exists(name) {
-                // Branch exists, just checkout
-                run_git(&["checkout", name])?;
-            } else {
-                // Checkout the branch from remote
-                run_git(&[
-                    "checkout",
-                    "-b",
-                    name,
-                    &format!("{}/{}", DEFAULT_REMOTE, name),
-                ])?;
-            }
-        }
         LocalChange::DeleteLocalBranch { name, reason } => {
             let reason_str = match reason {
                 DeleteReason::SeenOnRemote { verified_sha } => {
@@ -1377,9 +1263,6 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
                         branch.yellow(),
                         pr_number.to_string().green()
                     );
-                }
-                LocalChange::CheckoutBranch { name } => {
-                    println!("    - Checkout '{}'", name.yellow());
                 }
                 LocalChange::DeleteLocalBranch { name, reason } => {
                     let reason_str = match reason {

@@ -178,6 +178,9 @@ impl State {
     /// then check whether the branch exists in the git repo. If it does, then let the user know
     /// that they need to use `git checkout` to check it out. If it doesn't, then create a new
     /// branch.
+    ///
+    /// For branches tracked in git-stack but not existing locally, this will create the local
+    /// branch from the remote ref (origin/branch_name) on-demand.
     pub fn checkout(
         &mut self,
         git_repo: &GitRepo,
@@ -195,8 +198,10 @@ impl State {
         self.save_state()?;
 
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
+        let branch_exists_locally = git_branch_exists(git_repo, &branch_name);
 
-        if git_branch_exists(git_repo, &branch_name) {
+        // Case 1: Branch exists locally - just check it out
+        if branch_exists_locally {
             if !branch_exists_in_tree {
                 tracing::warn!(
                     "Branch {branch_name} exists in the git repo but is not tracked by git-stack. \
@@ -208,6 +213,26 @@ impl State {
             return Ok(());
         }
 
+        // Case 2: Branch is in tree but doesn't exist locally - create from remote
+        if branch_exists_in_tree {
+            let remote_ref = format!("origin/{}", branch_name);
+            if git_repo.ref_exists(&remote_ref) {
+                // Create local branch from remote ref
+                run_git(&["checkout", "-b", &branch_name, &remote_ref])?;
+                println!(
+                    "Branch {branch_name} created from remote and checked out.",
+                    branch_name = branch_name.yellow()
+                );
+                return Ok(());
+            } else {
+                bail!(
+                    "Branch {branch_name} is tracked by git-stack but doesn't exist locally or on remote.",
+                    branch_name = branch_name.red()
+                );
+            }
+        }
+
+        // Case 3: Branch doesn't exist anywhere - create a new branch from current
         let branch = self
             .get_tree_branch_mut(repo, &current_branch)
             .ok_or_else(|| {

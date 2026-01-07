@@ -478,7 +478,23 @@ fn recur_tree(
     parent_branch: Option<&str>,
     verbose: bool,
     pr_cache: Option<&std::collections::HashMap<String, github::PullRequest>>,
+    display_authors: &[String],
 ) -> Result<()> {
+    // Check if this branch should be dimmed (filtered by display_authors)
+    let pr_author = pr_cache
+        .and_then(|cache| cache.get(&branch.name))
+        .map(|pr| pr.user.login.as_str());
+    let is_dimmed = if display_authors.is_empty() {
+        false
+    } else {
+        pr_author.map_or(false, |author| {
+            !display_authors.contains(&author.to_string())
+        })
+    };
+
+    // Check if branch is remote-only (not local)
+    let is_remote_only = !git_repo.branch_exists(&branch.name);
+
     let Ok(branch_status) = git_repo
         .branch_status(parent_branch, &branch.name)
         .with_context(|| {
@@ -488,6 +504,44 @@ fn recur_tree(
             )
         })
     else {
+        // For remote-only branches, the local branch may not exist
+        if is_remote_only {
+            // Show remote-only branch even without status
+            let is_current_branch = branch.name == orig_branch;
+            if is_current_branch {
+                print!("{} ", selection_marker().bright_purple().bold());
+            } else {
+                print!("  ");
+            }
+            for _ in 0..depth {
+                print!("{}", "┃ ".truecolor(55, 55, 50));
+            }
+            let branch_name_colored = if is_dimmed {
+                branch.name.truecolor(90, 90, 90)
+            } else {
+                branch.name.truecolor(128, 128, 128)
+            };
+            println!(
+                "{} {}",
+                branch_name_colored,
+                "(remote)".truecolor(90, 90, 90)
+            );
+
+            // Recurse into children
+            for child in &branch.branches {
+                recur_tree(
+                    git_repo,
+                    child,
+                    depth + 1,
+                    orig_branch,
+                    Some(branch.name.as_ref()),
+                    verbose,
+                    pr_cache,
+                    display_authors,
+                )?;
+            }
+            return Ok(());
+        }
         tracing::warn!("Branch {} does not exist", branch.name);
         return Ok(());
     };
@@ -504,11 +558,23 @@ fn recur_tree(
     }
 
     // Branch name coloring: green for synced, red for diverged, bold for current branch
-    let branch_name_colored = match (is_current_branch, branch_status.is_descendent) {
-        (true, true) => branch.name.truecolor(142, 192, 124).bold(),
-        (true, false) => branch.name.red().bold(),
-        (false, true) => branch.name.truecolor(142, 192, 124),
-        (false, false) => branch.name.red(),
+    // Dimmed branches (filtered by display_authors) are shown in gray
+    let branch_name_colored = if is_dimmed {
+        branch.name.truecolor(90, 90, 90)
+    } else {
+        match (is_current_branch, branch_status.is_descendent) {
+            (true, true) => branch.name.truecolor(142, 192, 124).bold(),
+            (true, false) => branch.name.red().bold(),
+            (false, true) => branch.name.truecolor(142, 192, 124),
+            (false, false) => branch.name.red(),
+        }
+    };
+
+    // Remote-only indicator
+    let remote_indicator = if is_remote_only {
+        " (remote)".truecolor(90, 90, 90).to_string()
+    } else {
+        String::new()
     };
 
     // Get diff stats from LKG ancestor to current branch
@@ -553,8 +619,9 @@ fn recur_tree(
 
     if verbose {
         println!(
-            "{}{}{} ({}) {}{}{}{}",
+            "{}{}{}{} ({}) {}{}{}{}",
             branch_name_colored,
+            remote_indicator,
             diff_stats,
             local_status,
             branch_status.sha[..8].truecolor(215, 153, 33),
@@ -654,8 +721,8 @@ fn recur_tree(
             String::new()
         };
         println!(
-            "{}{}{}{}",
-            branch_name_colored, diff_stats, local_status, pr_info
+            "{}{}{}{}{}",
+            branch_name_colored, remote_indicator, diff_stats, local_status, pr_info
         );
     }
 
@@ -695,6 +762,7 @@ fn recur_tree(
             Some(branch.name.as_ref()),
             verbose,
             pr_cache,
+            display_authors,
         )?;
     }
     Ok(())
@@ -740,6 +808,9 @@ fn status(
     // Try to fetch PR info from GitHub (graceful degradation on failure)
     let pr_cache = fetch_pr_cache(git_repo);
 
+    // Load display_authors for filtering (show other authors dimmed)
+    let display_authors = github::load_display_authors();
+
     let tree = state
         .get_tree_mut(repo)
         .expect("tree exists after ensure_trunk");
@@ -751,6 +822,7 @@ fn status(
         None,
         verbose,
         pr_cache.as_ref(),
+        &display_authors,
     )?;
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
@@ -1186,7 +1258,17 @@ fn handle_import_command(
     println!();
     let tree = state.get_tree(repo).expect("tree exists after import");
     let pr_cache = fetch_pr_cache(git_repo);
-    recur_tree(git_repo, tree, 0, branch, None, false, pr_cache.as_ref())?;
+    let display_authors = github::load_display_authors();
+    recur_tree(
+        git_repo,
+        tree,
+        0,
+        branch,
+        None,
+        false,
+        pr_cache.as_ref(),
+        &display_authors,
+    )?;
 
     Ok(())
 }
