@@ -663,23 +663,30 @@ impl State {
         let mut queue: VecDeque<(Option<String>, String)> = VecDeque::new();
         queue.push_back((None, trunk.main_branch.clone()));
         while let Some((parent, branch)) = queue.pop_front() {
-            // Skip branches that don't exist locally
-            if !git_branch_exists(git_repo, &branch) {
+            // Resolve branch to local or remote ref
+            let Some(branch_ref) = git_repo.resolve_branch_ref(&branch) else {
                 tracing::debug!("Skipping non-existent branch {} in refresh_lkgs", branch);
                 continue;
-            }
+            };
 
             if let Some(parent) = parent {
+                // Resolve parent to local or remote ref
+                let parent_ref = git_repo
+                    .resolve_branch_ref(&parent)
+                    .unwrap_or_else(|| parent.clone());
+
                 let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
                 if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
-                    if git_repo.is_ancestor(lkg_parent, &branch)? {
+                    if git_repo.is_ancestor(lkg_parent, &branch_ref)? {
                         parent_lkgs.insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
                     } else {
                         parent_lkgs.insert(tree_branch.name.clone(), None);
                     }
                 }
-                if git_repo.is_ancestor(&parent, &branch).unwrap_or(false)
-                    && let Ok(new_lkg_parent) = git_repo.sha(&parent)
+                if git_repo
+                    .is_ancestor(&parent_ref, &branch_ref)
+                    .unwrap_or(false)
+                    && let Ok(new_lkg_parent) = git_repo.sha(&parent_ref)
                 {
                     tracing::debug!(
                         lkg_parent = ?new_lkg_parent,

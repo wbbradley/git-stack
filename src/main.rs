@@ -627,25 +627,35 @@ fn recur_tree(
             .truecolor(branch_color.0, branch_color.1, branch_color.2)
     };
 
-    // Get diff stats from LKG ancestor (or parent branch) to current branch
+    // Get diff stats from LKG ancestor (or merge-base) to current branch
     let diff_stats = {
-        // Try lkg_parent first, fall back to resolved parent branch
-        let base_ref = branch
-            .lkg_parent
-            .as_deref()
-            .unwrap_or(&branch_status.parent_branch);
+        // Determine base ref and whether it's reliable
+        let (base_ref, is_reliable) = if let Some(lkg) = branch.lkg_parent.as_deref() {
+            (Some(lkg.to_string()), true)
+        } else if let Ok(merge_base) =
+            git_repo.merge_base(&branch_status.parent_branch, &branch_status.sha)
+        {
+            (Some(merge_base), false) // merge-base is less reliable
+        } else {
+            (None, false)
+        };
 
-        match git_repo.diff_stats(base_ref, &branch_status.sha) {
-            Ok((adds, dels)) => {
-                let green = dim.apply(colors::GREEN);
-                let red = dim.apply(colors::RED);
-                format!(
-                    " [{} {}]",
-                    format!("+{}", adds).truecolor(green.0, green.1, green.2),
-                    format!("-{}", dels).truecolor(red.0, red.1, red.2)
-                )
-            }
-            Err(_) => String::new(),
+        match base_ref {
+            Some(base) => match git_repo.diff_stats(&base, &branch_status.sha) {
+                Ok((adds, dels)) => {
+                    let green = dim.apply(colors::GREEN);
+                    let red = dim.apply(colors::RED);
+                    let prefix = if is_reliable { "" } else { "~ " };
+                    format!(
+                        " [{}{}{}]",
+                        prefix,
+                        format!("+{}", adds).truecolor(green.0, green.1, green.2),
+                        format!(" -{}", dels).truecolor(red.0, red.1, red.2)
+                    )
+                }
+                Err(_) => String::new(),
+            },
+            None => String::new(),
         }
     };
 

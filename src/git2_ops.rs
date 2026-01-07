@@ -73,6 +73,26 @@ impl GitRepo {
                 .unwrap_or(false))
     }
 
+    /// Find the merge-base (common ancestor) of two refs.
+    /// Equivalent to `git merge-base <ref1> <ref2>`
+    pub fn merge_base(&self, ref1: &str, ref2: &str) -> Result<String> {
+        let _bench = GitBenchmark::start("git2:merge-base");
+        let obj1 = self
+            .repo
+            .revparse_single(ref1)
+            .with_context(|| format!("Failed to resolve ref: {}", ref1))?;
+        let obj2 = self
+            .repo
+            .revparse_single(ref2)
+            .with_context(|| format!("Failed to resolve ref: {}", ref2))?;
+
+        let oid = self
+            .repo
+            .merge_base(obj1.id(), obj2.id())
+            .with_context(|| format!("Failed to find merge-base between {} and {}", ref1, ref2))?;
+        Ok(oid.to_string())
+    }
+
     /// Check if a local branch exists.
     /// Only checks for local branches, not remote refs.
     pub fn branch_exists(&self, branch: &str) -> bool {
@@ -85,6 +105,22 @@ impl GitRepo {
     pub fn ref_exists(&self, ref_name: &str) -> bool {
         let _bench = GitBenchmark::start("git2:ref-exists");
         self.repo.revparse_single(ref_name).is_ok()
+    }
+
+    /// Resolve a branch name to a ref that exists.
+    /// Tries the branch name first, then falls back to origin/{branch}.
+    /// Returns None if neither exists.
+    pub fn resolve_branch_ref(&self, branch: &str) -> Option<String> {
+        if self.branch_exists(branch) {
+            Some(branch.to_string())
+        } else {
+            let remote_ref = format!("origin/{}", branch);
+            if self.ref_exists(&remote_ref) {
+                Some(remote_ref)
+            } else {
+                None
+            }
+        }
     }
 
     pub fn branch_status(
