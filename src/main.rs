@@ -470,6 +470,7 @@ fn selection_marker() -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recur_tree(
     git_repo: &GitRepo,
     branch: &Branch,
@@ -487,7 +488,7 @@ fn recur_tree(
     let is_dimmed = if display_authors.is_empty() {
         false
     } else {
-        pr_author.map_or(false, |author| {
+        pr_author.is_some_and(|author| {
             !display_authors.contains(&author.to_string())
         })
     };

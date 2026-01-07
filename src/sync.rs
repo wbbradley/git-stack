@@ -938,14 +938,13 @@ fn compute_sync_plan(
 
             // Check if local branch is ancestor of origin/<branch>
             let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
-            if git_repo.ref_exists(&remote_ref) {
-                if let Ok(true) = git_repo.is_ancestor(branch_name, &remote_ref) {
+            if git_repo.ref_exists(&remote_ref)
+                && let Ok(true) = git_repo.is_ancestor(branch_name, &remote_ref) {
                     local_changes.push(LocalChange::DeleteLocalBranch {
                         name: branch_name.clone(),
                         reason: DeleteReason::AncestorOfRemote,
                     });
                 }
-            }
         }
     }
 
