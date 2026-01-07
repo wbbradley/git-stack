@@ -946,8 +946,9 @@ fn cleanup_tree_recursive(
     let mut indices_to_remove = Vec::new();
 
     for (index, child) in branch.branches.iter().enumerate() {
-        if !git_branch_exists(git_repo, &child.name) {
-            // This branch doesn't exist locally, mark it for removal
+        let remote_ref = format!("origin/{}", child.name);
+        if !git_branch_exists(git_repo, &child.name) && !git_repo.ref_exists(&remote_ref) {
+            // This branch doesn't exist locally or on remote, mark it for removal
             removed_branches.push(child.name.clone());
 
             // Collect its children to be adopted by the current branch

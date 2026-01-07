@@ -93,8 +93,21 @@ impl GitRepo {
         branch: &str,
     ) -> Result<GitBranchStatus> {
         let exists = self.branch_exists(branch);
+
+        // Resolve parent branch - use origin/<parent> if local doesn't exist
         let parent_branch = match parent_branch {
-            Some(parent_branch) => parent_branch.to_string(),
+            Some(parent_branch) => {
+                if self.branch_exists(parent_branch) {
+                    parent_branch.to_string()
+                } else {
+                    let remote_parent = format!("origin/{}", parent_branch);
+                    if self.ref_exists(&remote_parent) {
+                        remote_parent
+                    } else {
+                        parent_branch.to_string()
+                    }
+                }
+            }
             None => self.remote_main(DEFAULT_REMOTE)?,
         };
 
@@ -112,8 +125,16 @@ impl GitRepo {
             });
             (sha, is_descendent, upstream_status)
         } else {
-            // Branch doesn't exist - use placeholder values
-            (String::new(), false, None)
+            // Local branch doesn't exist - try using origin/<branch> instead
+            let remote_ref = format!("origin/{}", branch);
+            if self.ref_exists(&remote_ref) {
+                let sha = self.sha(&remote_ref).unwrap_or_default();
+                let is_descendent = self.is_ancestor(&parent_branch, &remote_ref).unwrap_or(false);
+                (sha, is_descendent, None)
+            } else {
+                // Neither local nor remote exists - use placeholder values
+                (String::new(), false, None)
+            }
         };
 
         Ok(GitBranchStatus {
