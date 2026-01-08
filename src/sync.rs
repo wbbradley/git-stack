@@ -173,6 +173,8 @@ pub enum RemoteChange {
         old_base: String,
         new_base: String,
     },
+    /// Push a branch to remote (used before retargeting to it)
+    PushBranch { branch: String },
 }
 
 // ============== Stage 4: Sync Plan ==============
@@ -658,7 +660,7 @@ fn compute_sync_plan(
 ) -> SyncPlan {
     let mut local_changes = Vec::new();
     let mut remote_changes = Vec::new();
-    let warnings = Vec::new();
+    let mut warnings = Vec::new();
 
     // Compute local changes (pull direction)
     if !options.push_only {
@@ -698,6 +700,60 @@ fn compute_sync_plan(
                 }
             }
         }
+
+        // Ensure all parents are available (transitive closure)
+        // Keep adding missing parents until no more are needed
+        loop {
+            let mut parents_to_add: Vec<(String, String)> = Vec::new();
+
+            for (_, parent) in &branches_to_mount {
+                // Skip if parent is trunk
+                if parent == &local.trunk {
+                    continue;
+                }
+                // Skip if parent is already in local tree
+                if local.branches.contains_key(parent) {
+                    continue;
+                }
+                // Skip if parent is already being mounted
+                if branches_to_mount.iter().any(|(b, _)| b == parent) {
+                    continue;
+                }
+                // Check if parent exists as remote tracking branch
+                let remote_ref = format!("{}/{}", DEFAULT_REMOTE, parent);
+                if git_repo.ref_exists(&remote_ref) {
+                    // Mount missing parent on trunk
+                    parents_to_add.push((parent.clone(), local.trunk.clone()));
+                }
+            }
+
+            if parents_to_add.is_empty() {
+                break;
+            }
+            branches_to_mount.extend(parents_to_add);
+        }
+
+        // Filter out branches whose parents still can't be resolved
+        // (parents that don't exist as remote refs and aren't in tree)
+        let branches_being_mounted: HashSet<String> =
+            branches_to_mount.iter().map(|(b, _)| b.clone()).collect();
+
+        let (valid, invalid): (Vec<_>, Vec<_>) = branches_to_mount
+            .into_iter()
+            .partition(|(_, parent)| {
+                parent == &local.trunk
+                    || local.branches.contains_key(parent)
+                    || branches_being_mounted.contains(parent)
+            });
+
+        for (branch, parent) in invalid {
+            warnings.push(format!(
+                "Skipping branch '{}': parent '{}' not available on remote",
+                branch, parent
+            ));
+        }
+
+        let branches_to_mount = valid;
 
         // Topologically sort branches to mount (parents before children)
         let sorted_branches = topological_sort_branches(&branches_to_mount, &local.trunk);
@@ -793,6 +849,15 @@ fn compute_sync_plan(
                     if let Some(pr) = remote.prs.get(child_name) {
                         // PR's old base should be the unmounted branch, new base is repoint_to
                         if pr.base == *branch_name {
+                            // Check if the new base branch is pushed to remote
+                            let new_base_remote_ref =
+                                format!("{}/{}", DEFAULT_REMOTE, repoint_to);
+                            if !git_repo.ref_exists(&new_base_remote_ref) {
+                                // Need to push the intermediate branch first
+                                remote_changes.push(RemoteChange::PushBranch {
+                                    branch: repoint_to.clone(),
+                                });
+                            }
                             remote_changes.push(RemoteChange::RetargetPr {
                                 number: pr.number,
                                 branch: child_name.clone(),
@@ -842,6 +907,14 @@ fn compute_sync_plan(
             match (remote_pr, &target_branch.expected_pr_base) {
                 // PR exists, check if base matches
                 (Some(pr), Some(expected_base)) if pr.base != *expected_base => {
+                    // Check if the new base branch is pushed to remote
+                    let new_base_remote_ref = format!("{}/{}", DEFAULT_REMOTE, expected_base);
+                    if !git_repo.ref_exists(&new_base_remote_ref) {
+                        // Need to push the intermediate branch first
+                        remote_changes.push(RemoteChange::PushBranch {
+                            branch: expected_base.clone(),
+                        });
+                    }
                     remote_changes.push(RemoteChange::RetargetPr {
                         number: pr.number,
                         branch: branch_name.clone(),
@@ -849,20 +922,10 @@ fn compute_sync_plan(
                         new_base: expected_base.clone(),
                     });
                 }
-                // No open PR but branch is pushed - could create PR
-                // But first check if there's a merged/closed PR
-                (None, Some(expected_base)) => {
-                    // Skip if this branch had a merged or closed PR
-                    if remote.closed_prs.contains_key(branch_name) {
-                        continue;
-                    }
-                    // Generate title from branch name or first commit
-                    let title = branch_name.clone();
-                    remote_changes.push(RemoteChange::CreatePr {
-                        branch: branch_name.clone(),
-                        base: expected_base.clone(),
-                        title,
-                    });
+                // No open PR but branch is pushed - don't auto-create PRs
+                // Users should create PRs explicitly with `git stack pr`
+                (None, Some(_expected_base)) => {
+                    continue;
                 }
                 _ => {}
             }
@@ -1337,6 +1400,15 @@ fn apply_remote_change(
                 )
                 .map_err(|e| anyhow!("{}", e))?;
         }
+        RemoteChange::PushBranch { branch } => {
+            println!("  Pushing '{}' to remote", branch.yellow());
+            run_git(&[
+                "push",
+                "-fu",
+                DEFAULT_REMOTE,
+                &format!("{}:{}", branch, branch),
+            ])?;
+        }
     }
     Ok(())
 }
@@ -1421,6 +1493,9 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
                         old_base.red(),
                         new_base.green()
                     );
+                }
+                RemoteChange::PushBranch { branch } => {
+                    println!("    - Push '{}' to remote", branch.yellow());
                 }
             }
         }

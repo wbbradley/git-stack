@@ -189,7 +189,7 @@ enum Command {
     /// Clean up branches from the git-stack tree that no longer exist locally.
     Cleanup {
         /// Show what would be cleaned up without actually removing anything.
-        #[arg(long, short, default_value_t = false)]
+        #[arg(long, short = 'n', default_value_t = false)]
         dry_run: bool,
         /// Clean up all trees in the config, removing invalid repos and cleaning branches.
         #[arg(long, short, default_value_t = false)]
@@ -230,7 +230,7 @@ enum Command {
         #[arg(long, conflicts_with = "push")]
         pull: bool,
         /// Show what would be done without making changes
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 }
@@ -266,7 +266,7 @@ enum PrAction {
         #[arg(long, short)]
         all: bool,
         /// Show what would be done without making changes
-        #[arg(long)]
+        #[arg(long, short = 'n')]
         dry_run: bool,
     },
 }
