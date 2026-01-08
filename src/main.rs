@@ -518,6 +518,31 @@ fn selection_marker() -> &'static str {
     }
 }
 
+/// Check if a branch subtree contains the target branch or a display_author PR
+/// Returns (has_target_branch, has_display_author_pr)
+fn subtree_contains(
+    branch: &Branch,
+    target_branch: &str,
+    display_authors: &[String],
+    pr_cache: Option<&std::collections::HashMap<String, github::PullRequest>>,
+) -> (bool, bool) {
+    // Check this branch
+    let is_target = branch.name == target_branch;
+    let has_author = pr_cache
+        .and_then(|cache| cache.get(&branch.name))
+        .map(|pr| display_authors.contains(&pr.user.login))
+        .unwrap_or(false);
+
+    // Recursively check children
+    let (child_has_target, child_has_author) = branch
+        .branches
+        .iter()
+        .map(|b| subtree_contains(b, target_branch, display_authors, pr_cache))
+        .fold((false, false), |(t1, a1), (t2, a2)| (t1 || t2, a1 || a2));
+
+    (is_target || child_has_target, has_author || child_has_author)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recur_tree(
     git_repo: &GitRepo,
@@ -856,32 +881,44 @@ fn recur_tree(
     }
 
     let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
-    // Pre-compute is_ancestor results to avoid repeated git merge-base calls during sorting
-    let ancestor_cache: std::collections::HashMap<&str, bool> = branches_sorted
+
+    // Pre-compute subtree properties for sorting
+    let subtree_cache: std::collections::HashMap<&str, (bool, bool)> = branches_sorted
         .iter()
         .map(|b| {
             (
                 b.name.as_str(),
-                git_repo.is_ancestor(&b.name, orig_branch).unwrap_or(false),
+                subtree_contains(b, orig_branch, display_authors, pr_cache),
             )
         })
         .collect();
+
     branches_sorted.sort_by(|&a, &b| {
-        let a_is_ancestor = ancestor_cache
+        let (a_has_current, a_has_author) = subtree_cache
             .get(a.name.as_str())
             .copied()
-            .unwrap_or(false);
-        let b_is_ancestor = ancestor_cache
+            .unwrap_or((false, false));
+        let (b_has_current, b_has_author) = subtree_cache
             .get(b.name.as_str())
             .copied()
-            .unwrap_or(false);
-        match (a_is_ancestor, b_is_ancestor) {
-            (true, true) => a.name.cmp(&b.name),
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.name.cmp(&b.name),
+            .unwrap_or((false, false));
+
+        // Priority 1: subtree contains current branch
+        match (a_has_current, b_has_current) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
         }
+        // Priority 2: subtree contains display_author PR
+        match (a_has_author, b_has_author) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        // Priority 3: alphabetical
+        a.name.cmp(&b.name)
     });
+
     for child in branches_sorted {
         recur_tree(
             git_repo,
