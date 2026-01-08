@@ -745,7 +745,10 @@ fn compute_sync_plan(
             );
 
             // Any closed PR (merged or just closed) should unmount from git-stack
-            if matches!(closed_pr.state, RemotePrState::Merged | RemotePrState::Closed) {
+            if matches!(
+                closed_pr.state,
+                RemotePrState::Merged | RemotePrState::Closed
+            ) {
                 // This branch's PR was merged/closed - it should be unmounted
                 // Children should be repointed to this branch's parent
                 let repoint_to = local_branch
@@ -762,7 +765,9 @@ fn compute_sync_plan(
                     // Closed but not merged - check if remote has our work
                     let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
                     git_repo.ref_exists(&remote_ref)
-                        && git_repo.is_ancestor(branch_name, &remote_ref).unwrap_or(false)
+                        && git_repo
+                            .is_ancestor(branch_name, &remote_ref)
+                            .unwrap_or(false)
                 };
 
                 if safe_to_delete {

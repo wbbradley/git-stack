@@ -978,6 +978,11 @@ fn restack(
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
+    // Track what changes occurred during restack
+    let mut branches_created: Vec<String> = Vec::new();
+    let mut branches_restacked: Vec<String> = Vec::new();
+    let mut branches_pushed: Vec<String> = Vec::new();
+
     if fetch {
         git_fetch()?;
     }
@@ -987,10 +992,7 @@ fn restack(
         let remote_ref = format!("{DEFAULT_REMOTE}/{restack_branch}");
         if git_repo.ref_exists(&remote_ref) {
             run_git(&["checkout", "-b", &restack_branch, &remote_ref])?;
-            println!(
-                "Created local branch {} from remote.",
-                restack_branch.yellow()
-            );
+            branches_created.push(restack_branch.clone());
         } else {
             bail!(
                 "Branch {} does not exist locally or on remote.",
@@ -1025,7 +1027,6 @@ fn restack(
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
-                println!("Pushing branch '{}' to remote...", branch.name);
                 run_git(&[
                     "push",
                     match branch.stack_method {
@@ -1042,6 +1043,7 @@ fn restack(
                     &format!("{branch_name}:{branch_name}", branch_name = branch.name),
                 ])?;
                 pushed_branches.push(branch.name.clone());
+                branches_pushed.push(branch.name.clone());
             }
         } else {
             tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
@@ -1080,9 +1082,11 @@ fn restack(
                             );
                             std::process::exit(1);
                         }
+                        branches_restacked.push(branch.name.clone());
                         if push {
                             git_push(git_repo, &branch.name)?;
                             pushed_branches.push(branch.name.clone());
+                            branches_pushed.push(branch.name.clone());
                         }
                         continue;
                     }
@@ -1101,9 +1105,11 @@ fn restack(
                         );
                         std::process::exit(1);
                     }
+                    branches_restacked.push(branch.name.clone());
                     if push {
                         git_push(git_repo, &branch.name)?;
                         pushed_branches.push(branch.name.clone());
+                        branches_pushed.push(branch.name.clone());
                     }
                     tracing::info!("Rebase completed successfully. Continuing...");
                 }
@@ -1112,6 +1118,7 @@ fn restack(
                         .with_context(|| format!("checking out {}", branch.name))?;
                     run_git(&["merge", &parent])
                         .with_context(|| format!("merging {parent} into {}", branch.name))?;
+                    branches_restacked.push(branch.name.clone());
                 }
             }
         }
@@ -1130,7 +1137,46 @@ fn restack(
         "git checkout {} failed",
         restack_branch
     );
-    println!("Done.");
+
+    // Print summary report if any changes occurred
+    let has_changes = !branches_created.is_empty()
+        || !branches_restacked.is_empty()
+        || !branches_pushed.is_empty();
+
+    if has_changes {
+        println!();
+        if !branches_created.is_empty() {
+            println!(
+                "Created from remote: {}",
+                branches_created
+                    .iter()
+                    .map(|b| b.yellow().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !branches_restacked.is_empty() {
+            println!(
+                "Restacked: {}",
+                branches_restacked
+                    .iter()
+                    .map(|b| b.yellow().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !branches_pushed.is_empty() {
+            println!(
+                "Pushed: {}",
+                branches_pushed
+                    .iter()
+                    .map(|b| b.yellow().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     state.refresh_lkgs(git_repo, repo)?;
 
     // Note: PR sync is now handled separately via `git stack sync`
