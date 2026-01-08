@@ -183,6 +183,10 @@ pub struct SyncPlan {
     pub local_changes: Vec<LocalChange>,
     pub remote_changes: Vec<RemoteChange>,
     pub warnings: Vec<String>,
+    /// Branches that will be unmounted (for checkout logic if user is on one)
+    pub branches_to_unmount: Vec<String>,
+    /// Branches safe to delete locally (work preserved on remote)
+    pub branches_to_delete: Vec<String>,
 }
 
 impl SyncPlan {
@@ -712,9 +716,10 @@ fn compute_sync_plan(
         }
     }
 
-    // Detect merged PRs and handle unmounting (pull direction)
+    // Detect merged/closed PRs and handle unmounting (pull direction)
     // This runs regardless of push_only/pull_only since it's about reconciling state
     let mut branches_to_unmount: Vec<(String, String)> = Vec::new(); // (branch, repoint_to)
+    let mut branches_to_delete: Vec<String> = Vec::new();
 
     tracing::debug!(
         "Checking for merged PRs. Local branches: {:?}, Closed PRs: {:?}",
@@ -738,14 +743,31 @@ fn compute_sync_plan(
                 closed_pr.number,
                 closed_pr.state
             );
-            if closed_pr.state == RemotePrState::Merged {
-                // This branch's PR was merged - it should be unmounted
+
+            // Any closed PR (merged or just closed) should unmount from git-stack
+            if matches!(closed_pr.state, RemotePrState::Merged | RemotePrState::Closed) {
+                // This branch's PR was merged/closed - it should be unmounted
                 // Children should be repointed to this branch's parent
                 let repoint_to = local_branch
                     .parent
                     .clone()
                     .unwrap_or_else(|| local.trunk.clone());
                 branches_to_unmount.push((branch_name.clone(), repoint_to));
+
+                // Determine if local branch is safe to delete
+                // Safe if: merged, OR (closed AND remote exists AND local is ancestor of remote)
+                let safe_to_delete = if closed_pr.state == RemotePrState::Merged {
+                    true
+                } else {
+                    // Closed but not merged - check if remote has our work
+                    let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+                    git_repo.ref_exists(&remote_ref)
+                        && git_repo.is_ancestor(branch_name, &remote_ref).unwrap_or(false)
+                };
+
+                if safe_to_delete {
+                    branches_to_delete.push(branch_name.clone());
+                }
             }
         }
     }
@@ -953,6 +975,11 @@ fn compute_sync_plan(
         local_changes,
         remote_changes,
         warnings,
+        branches_to_unmount: branches_to_unmount
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect(),
+        branches_to_delete,
     }
 }
 
@@ -1037,6 +1064,38 @@ fn apply_plan(
     repo_id: &RepoIdentifier,
     plan: &SyncPlan,
 ) -> Result<()> {
+    // If current branch is being unmounted, checkout a safe ancestor first
+    if !plan.branches_to_unmount.is_empty() {
+        let current_branch = git_repo.current_branch().unwrap_or_default();
+        let unmount_set: HashSet<&str> = plan
+            .branches_to_unmount
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        if unmount_set.contains(current_branch.as_str()) {
+            // Find the first ancestor that's NOT being unmounted
+            let trunk = git_trunk(git_repo)?;
+            let mut safe_branch = trunk.main_branch.clone();
+            let mut current = current_branch.clone();
+
+            while let Some(parent) = state.get_parent_branch_of(repo, &current) {
+                if !unmount_set.contains(parent.name.as_str()) {
+                    safe_branch = parent.name.clone();
+                    break;
+                }
+                current = parent.name.clone();
+            }
+
+            println!(
+                "Branch {} was merged. Switching to {}...",
+                current_branch.yellow(),
+                safe_branch.green()
+            );
+            run_git(&["checkout", &safe_branch])?;
+        }
+    }
+
     // Apply local changes first (checkout, mount, update pr_number)
     for change in &plan.local_changes {
         apply_local_change(git_repo, state, repo, change)?;
@@ -1052,6 +1111,16 @@ fn apply_plan(
 
     // Save state again if PR numbers were updated
     state.save_state()?;
+
+    // Delete local branches that are safe to delete (work preserved on remote)
+    for branch_name in &plan.branches_to_delete {
+        if git_repo.branch_exists(branch_name) {
+            println!("Deleting local branch {}...", branch_name.yellow());
+            if let Err(e) = run_git(&["branch", "-D", branch_name]) {
+                tracing::warn!("Failed to delete local branch {}: {}", branch_name, e);
+            }
+        }
+    }
 
     Ok(())
 }

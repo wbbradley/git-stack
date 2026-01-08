@@ -134,7 +134,7 @@ enum Command {
     },
     /// Open the git-stack state file in an editor for manual editing.
     Edit,
-    /// Restack your active branch and all branches in its related stack.
+    /// Restack your active branch onto its parent branch.
     Restack {
         /// The name of the branch to restack.
         #[arg(long, short)]
@@ -145,6 +145,9 @@ enum Command {
         /// Push any changes up to the remote after restacking.
         #[arg(long, short)]
         push: bool,
+        /// Restack all parent branches recursively up to trunk.
+        #[arg(long, short = 'a', default_value_t = false)]
+        all_parents: bool,
     },
     /// Shows the log between the given branch and its parent (git-stack tree) branch.
     Log {
@@ -368,6 +371,7 @@ fn inner_main() -> Result<()> {
             branch,
             fetch,
             push,
+            all_parents,
         }) => {
             let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
             state.try_auto_mount(&git_repo, &repo, &restack_branch)?;
@@ -380,6 +384,7 @@ fn inner_main() -> Result<()> {
                 current_branch,
                 fetch,
                 push,
+                all_parents,
             )
         }
         Some(Command::Mount { parent_branch }) => {
@@ -969,6 +974,7 @@ fn restack(
     orig_branch: String,
     fetch: bool,
     push: bool,
+    all_parents: bool,
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
@@ -976,8 +982,25 @@ fn restack(
         git_fetch()?;
     }
 
+    // Ensure target branch exists locally (check it out from remote if needed)
+    if !git_repo.branch_exists(&restack_branch) {
+        let remote_ref = format!("{DEFAULT_REMOTE}/{restack_branch}");
+        if git_repo.ref_exists(&remote_ref) {
+            run_git(&["checkout", "-b", &restack_branch, &remote_ref])?;
+            println!(
+                "Created local branch {} from remote.",
+                restack_branch.yellow()
+            );
+        } else {
+            bail!(
+                "Branch {} does not exist locally or on remote.",
+                restack_branch
+            );
+        }
+    }
+
     // Find starting_branch in the stacks of branches to determine which stack to use.
-    let plan = state.plan_restack(git_repo, repo, &restack_branch)?;
+    let plan = state.plan_restack(git_repo, repo, &restack_branch, all_parents)?;
 
     tracing::debug!(?plan, "Restacking branches with plan. Checking out main...");
     git_checkout_main(git_repo, None)?;
@@ -1002,6 +1025,7 @@ fn restack(
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
+                println!("Pushing branch '{}' to remote...", branch.name);
                 run_git(&[
                     "push",
                     match branch.stack_method {
@@ -1106,7 +1130,7 @@ fn restack(
         "git checkout {} failed",
         restack_branch
     );
-    tracing::info!("Done.");
+    println!("Done.");
     state.refresh_lkgs(git_repo, repo)?;
 
     // Note: PR sync is now handled separately via `git stack sync`

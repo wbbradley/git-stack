@@ -288,11 +288,34 @@ impl State {
         git_repo: &GitRepo,
         repo: &str,
         starting_branch: &str,
+        all_parents: bool,
     ) -> Result<Vec<RestackStep<'_>>> {
-        tracing::debug!("Planning restack for {starting_branch}");
-        let trunk = git_trunk(git_repo)?;
-        // Find all the descendents of the starting branch.
-        // Traverse the tree from the starting branch to the root,
+        tracing::debug!("Planning restack for {starting_branch} (all_parents={all_parents})");
+
+        // Single-step mode: only restack the target branch onto its immediate parent
+        if !all_parents {
+            let parent = self
+                .get_parent_branch_of(repo, starting_branch)
+                .ok_or_else(|| {
+                    anyhow!("Branch {starting_branch} not found in the git-stack tree.")
+                })?;
+
+            let branch = self.get_tree_branch(repo, starting_branch).ok_or_else(|| {
+                anyhow!("Branch {starting_branch} not found in the git-stack tree.")
+            })?;
+
+            // Resolve parent ref to local or origin/branch
+            let parent_ref = git_repo
+                .resolve_branch_ref(&parent.name)
+                .unwrap_or_else(|| parent.name.clone());
+
+            return Ok(vec![RestackStep {
+                parent: parent_ref,
+                branch,
+            }]);
+        }
+
+        // All-parents mode: restack the entire ancestry chain
         let mut path: Vec<&Branch> = vec![];
         let repo_state = self
             .repos
