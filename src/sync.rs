@@ -738,9 +738,8 @@ fn compute_sync_plan(
         let branches_being_mounted: HashSet<String> =
             branches_to_mount.iter().map(|(b, _)| b.clone()).collect();
 
-        let (valid, invalid): (Vec<_>, Vec<_>) = branches_to_mount
-            .into_iter()
-            .partition(|(_, parent)| {
+        let (valid, invalid): (Vec<_>, Vec<_>) =
+            branches_to_mount.into_iter().partition(|(_, parent)| {
                 parent == &local.trunk
                     || local.branches.contains_key(parent)
                     || branches_being_mounted.contains(parent)
@@ -850,8 +849,7 @@ fn compute_sync_plan(
                         // PR's old base should be the unmounted branch, new base is repoint_to
                         if pr.base == *branch_name {
                             // Check if the new base branch is pushed to remote
-                            let new_base_remote_ref =
-                                format!("{}/{}", DEFAULT_REMOTE, repoint_to);
+                            let new_base_remote_ref = format!("{}/{}", DEFAULT_REMOTE, repoint_to);
                             if !git_repo.ref_exists(&new_base_remote_ref) {
                                 // Need to push the intermediate branch first
                                 remote_changes.push(RemoteChange::PushBranch {

@@ -540,7 +540,10 @@ fn subtree_contains(
         .map(|b| subtree_contains(b, target_branch, display_authors, pr_cache))
         .fold((false, false), |(t1, a1), (t2, a2)| (t1 || t2, a1 || a2));
 
-    (is_target || child_has_target, has_author || child_has_author)
+    (
+        is_target || child_has_target,
+        has_author || child_has_author,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1127,7 +1130,7 @@ fn restack(
                             tracing::debug!("No diff between LKG and branch?!");
                             continue;
                         };
-                        tracing::info!("Applying patch...");
+                        println!("Applying patch...");
                         let rebased =
                             run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
                         if !rebased {
@@ -1212,7 +1215,11 @@ fn restack(
         println!(
             "All {} branch{} already up-to-date: {}",
             branches_uptodate.len(),
-            if branches_uptodate.len() == 1 { "" } else { "es" },
+            if branches_uptodate.len() == 1 {
+                ""
+            } else {
+                "es"
+            },
             branches_uptodate
                 .iter()
                 .map(|b| b.green().to_string())
