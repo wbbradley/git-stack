@@ -1019,11 +1019,8 @@ fn restack(
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
-    // Track what changes occurred during restack
-    let mut branches_created: Vec<String> = Vec::new();
-    let mut branches_restacked: Vec<String> = Vec::new();
-    let mut branches_pushed: Vec<String> = Vec::new();
-    let mut branches_uptodate: Vec<String> = Vec::new();
+    // Track what changes occurred during restack (branch_name, status)
+    let mut branch_results: Vec<(String, String)> = Vec::new();
 
     if fetch {
         git_fetch()?;
@@ -1044,7 +1041,7 @@ fn restack(
         let remote_ref = format!("{DEFAULT_REMOTE}/{restack_branch}");
         if git_repo.ref_exists(&remote_ref) {
             run_git(&["checkout", "-b", &restack_branch, &remote_ref])?;
-            branches_created.push(restack_branch.clone());
+            branch_results.push((restack_branch.clone(), "created".to_string()));
         } else {
             bail!(
                 "Branch {} does not exist locally or on remote.",
@@ -1068,7 +1065,7 @@ fn restack(
             let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch.name);
             if git_repo.ref_exists(&remote_ref) {
                 run_git(&["checkout", "-b", &branch.name, &remote_ref])?;
-                branches_created.push(branch.name.clone());
+                branch_results.push((branch.name.clone(), "created".to_string()));
             }
             // If remote doesn't exist either, let the subsequent operations fail
             // with a clear error message
@@ -1087,7 +1084,7 @@ fn restack(
                 branch.name,
                 parent
             );
-            branches_uptodate.push(branch.name.clone());
+            let mut status = "no changes".to_string();
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
@@ -1107,8 +1104,9 @@ fn restack(
                     &format!("{branch_name}:{branch_name}", branch_name = branch.name),
                 ])?;
                 pushed_branches.push(branch.name.clone());
-                branches_pushed.push(branch.name.clone());
+                status = "no changes, pushed".to_string();
             }
+            branch_results.push((branch.name.clone(), status));
         } else {
             tracing::info!("Branch '{}' is not stacked on '{}'...", branch.name, parent);
 
@@ -1146,12 +1144,14 @@ fn restack(
                             );
                             std::process::exit(1);
                         }
-                        branches_restacked.push(branch.name.clone());
-                        if push {
+                        let status = if push {
                             git_push(git_repo, &branch.name)?;
                             pushed_branches.push(branch.name.clone());
-                            branches_pushed.push(branch.name.clone());
-                        }
+                            "restacked, pushed"
+                        } else {
+                            "restacked"
+                        };
+                        branch_results.push((branch.name.clone(), status.to_string()));
                         continue;
                     }
 
@@ -1169,12 +1169,14 @@ fn restack(
                         );
                         std::process::exit(1);
                     }
-                    branches_restacked.push(branch.name.clone());
-                    if push {
+                    let status = if push {
                         git_push(git_repo, &branch.name)?;
                         pushed_branches.push(branch.name.clone());
-                        branches_pushed.push(branch.name.clone());
-                    }
+                        "restacked, pushed"
+                    } else {
+                        "restacked"
+                    };
+                    branch_results.push((branch.name.clone(), status.to_string()));
                     tracing::info!("Rebase completed successfully. Continuing...");
                 }
                 StackMethod::Merge => {
@@ -1182,7 +1184,7 @@ fn restack(
                         .with_context(|| format!("checking out {}", branch.name))?;
                     run_git(&["merge", &parent])
                         .with_context(|| format!("merging {parent} into {}", branch.name))?;
-                    branches_restacked.push(branch.name.clone());
+                    branch_results.push((branch.name.clone(), "restacked".to_string()));
                 }
             }
         }
@@ -1203,70 +1205,11 @@ fn restack(
     );
 
     // Print summary report
-    let total_examined =
-        branches_restacked.len() + branches_uptodate.len() + branches_created.len();
-    let has_changes = !branches_created.is_empty()
-        || !branches_restacked.is_empty()
-        || !branches_pushed.is_empty();
-
-    println!();
-    if total_examined == 0 {
+    if branch_results.is_empty() {
         println!("No branches to restack.");
-    } else if !has_changes && !branches_uptodate.is_empty() {
-        println!(
-            "All {} branch{} already up-to-date: {}",
-            branches_uptodate.len(),
-            if branches_uptodate.len() == 1 {
-                ""
-            } else {
-                "es"
-            },
-            branches_uptodate
-                .iter()
-                .map(|b| b.green().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
     } else {
-        if !branches_created.is_empty() {
-            println!(
-                "Created from remote: {}",
-                branches_created
-                    .iter()
-                    .map(|b| b.yellow().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !branches_restacked.is_empty() {
-            println!(
-                "Restacked: {}",
-                branches_restacked
-                    .iter()
-                    .map(|b| b.yellow().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !branches_uptodate.is_empty() {
-            println!(
-                "Already up-to-date: {}",
-                branches_uptodate
-                    .iter()
-                    .map(|b| b.green().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        if !branches_pushed.is_empty() {
-            println!(
-                "Pushed: {}",
-                branches_pushed
-                    .iter()
-                    .map(|b| b.yellow().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+        for (branch, status) in &branch_results {
+            println!("{}: {}", branch.yellow(), status);
         }
     }
 
