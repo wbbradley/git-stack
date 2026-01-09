@@ -195,6 +195,10 @@ impl SyncPlan {
     pub fn is_empty(&self) -> bool {
         self.local_changes.is_empty() && self.remote_changes.is_empty()
     }
+
+    pub fn has_remote_changes(&self) -> bool {
+        !self.remote_changes.is_empty()
+    }
 }
 
 // ============== Sync Options ==============
@@ -338,13 +342,43 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
             "\n{}",
             "Dry run mode: no changes applied.".bright_blue().bold()
         );
+    } else if plan.has_remote_changes() {
+        // Prompt for confirmation before applying remote changes
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "Remote changes require confirmation. Use --dry-run to preview or run interactively to confirm."
+            );
+        }
+        if confirm_remote_changes() {
+            println!("\nApplying changes...");
+            apply_plan(git_repo, state, repo, &client, &repo_id, &plan)?;
+            println!("\n{}", "Sync complete!".green().bold());
+        } else {
+            println!("\n{}", "Aborted.".yellow());
+        }
     } else {
+        // Only local changes - apply without confirmation
         println!("\nApplying changes...");
         apply_plan(git_repo, state, repo, &client, &repo_id, &plan)?;
         println!("\n{}", "Sync complete!".green().bold());
     }
 
     Ok(())
+}
+
+/// Prompt user to confirm remote changes
+fn confirm_remote_changes() -> bool {
+    use std::io::{self, Write};
+
+    print!("Apply remote changes? [y/N] ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 // ============== Stage 1: Read Functions ==============
@@ -447,7 +481,7 @@ fn collect_tracked_branch_shas(git_repo: &GitRepo, branch: &Branch) -> Vec<Strin
 
 /// Read current local state from git-stack and git
 fn read_local_state(git_repo: &GitRepo, state: &State, repo: &str) -> Result<LocalState> {
-    let trunk = git_trunk(git_repo)?;
+    let trunk = git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
     let mut branches = HashMap::new();
 
     // Get the tree for this repo
@@ -1141,7 +1175,7 @@ fn apply_plan(
 
         if unmount_set.contains(current_branch.as_str()) {
             // Find the first ancestor that's NOT being unmounted
-            let trunk = git_trunk(git_repo)?;
+            let trunk = git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
             let mut safe_branch = trunk.main_branch.clone();
             let mut current = current_branch.clone();
 

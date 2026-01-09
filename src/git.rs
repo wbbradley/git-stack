@@ -188,7 +188,7 @@ pub(crate) fn git_checkout_main(repo: &GitRepo, new_branch: Option<&str>) -> Res
     }
     git_fetch()?;
     let remote = DEFAULT_REMOTE;
-    let trunk = git_trunk(repo)?;
+    let trunk = git_trunk(repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
     // Check that we don't orphan unpushed changes in the local `main` branch.
     if !repo.is_ancestor(&trunk.main_branch, &trunk.remote_main)? {
@@ -228,12 +228,10 @@ pub(crate) struct GitTrunk {
     pub(crate) main_branch: String,
 }
 
-pub(crate) fn git_trunk(git_repo: &GitRepo) -> Result<GitTrunk> {
-    let remote_main = git_repo.remote_main(DEFAULT_REMOTE)?;
-    let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))
-        .ok_or(anyhow!("no branch?"))?
-        .to_string();
-    Ok(GitTrunk {
+pub(crate) fn git_trunk(git_repo: &GitRepo) -> Option<GitTrunk> {
+    let remote_main = git_repo.remote_main(DEFAULT_REMOTE).ok()?;
+    let main_branch = after_text(&remote_main, format!("{DEFAULT_REMOTE}/"))?.to_string();
+    Some(GitTrunk {
         remote_main,
         main_branch,
     })

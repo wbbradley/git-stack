@@ -189,13 +189,14 @@ impl State {
         current_upstream: Option<String>,
         branch_name: String,
     ) -> Result<()> {
-        let trunk = git_trunk(git_repo)?;
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
-        // added it yet.
-        self.repos
-            .entry(repo.to_string())
-            .or_insert_with(|| RepoState::new(Branch::new(trunk.main_branch.clone(), None)));
-        self.save_state()?;
+        // added it yet (only if we have a remote configured).
+        if let Some(trunk) = git_trunk(git_repo) {
+            self.repos
+                .entry(repo.to_string())
+                .or_insert_with(|| RepoState::new(Branch::new(trunk.main_branch.clone(), None)));
+            self.save_state()?;
+        }
 
         let branch_exists_in_tree = self.branch_exists_in_tree(repo, &branch_name);
         let branch_exists_locally = git_branch_exists(git_repo, &branch_name);
@@ -574,7 +575,7 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn ensure_trunk(&mut self, git_repo: &GitRepo, repo: &str) -> Result<GitTrunk> {
+    pub(crate) fn ensure_trunk(&mut self, git_repo: &GitRepo, repo: &str) -> Option<GitTrunk> {
         let trunk = git_trunk(git_repo)?;
         // The branch might not exist in git, let's create it, and add it to the tree.
         // Ensure the main branch is in the git-stack tree for this repo if we haven't
@@ -582,7 +583,7 @@ impl State {
         self.repos
             .entry(repo.to_string())
             .or_insert_with(|| RepoState::new(Branch::new(trunk.main_branch.clone(), None)));
-        Ok(trunk)
+        Some(trunk)
     }
 
     pub(crate) fn mount(
@@ -592,16 +593,20 @@ impl State {
         branch_name: &str,
         parent_branch: Option<String>,
     ) -> Result<()> {
-        let trunk = self.ensure_trunk(git_repo, repo)?;
+        let trunk = self.ensure_trunk(git_repo, repo);
 
-        if trunk.main_branch == branch_name {
-            bail!(
-                "Branch {branch_name} cannot be stacked on anything else.",
-                branch_name = branch_name.red()
-            );
+        if let Some(ref trunk) = trunk {
+            if trunk.main_branch == branch_name {
+                bail!(
+                    "Branch {branch_name} cannot be stacked on anything else.",
+                    branch_name = branch_name.red()
+                );
+            }
         }
 
-        let parent_branch = parent_branch.unwrap_or(trunk.main_branch);
+        let parent_branch = parent_branch
+            .or_else(|| trunk.map(|t| t.main_branch))
+            .ok_or_else(|| anyhow!("No parent branch specified and no remote configured"))?;
 
         if branch_name == parent_branch {
             bail!(
@@ -678,7 +683,9 @@ impl State {
         // For each sub-branch in the tree, check if the parent
 
         tracing::debug!("Refreshing lkgs for all branches...");
-        let trunk = git_trunk(git_repo)?;
+        let Some(trunk) = git_trunk(git_repo) else {
+            return Ok(());
+        };
 
         let mut parent_lkgs: HashMap<String, Option<String>> = HashMap::default();
 
@@ -800,8 +807,8 @@ impl State {
         repo: &str,
         branch_name: &str,
     ) -> Result<bool> {
-        // Ensure the tree exists for this repo
-        self.ensure_trunk(git_repo, repo)?;
+        // Ensure the tree exists for this repo (no-op if no remote)
+        self.ensure_trunk(git_repo, repo);
 
         // Check if the branch is already in the tree
         if self.branch_exists_in_tree(repo, branch_name) {
@@ -813,8 +820,10 @@ impl State {
             bail!("Branch {branch_name} does not exist in git");
         }
 
-        // Get the tree for this repo (guaranteed to exist after ensure_trunk)
-        let tree = self.get_tree(repo).expect("tree exists after ensure_trunk");
+        // Get the tree for this repo (may not exist if no remote configured)
+        let Some(tree) = self.get_tree(repo) else {
+            return Ok(false);
+        };
 
         // Collect all mounted branches
         let mut all_branches = Vec::new();
@@ -831,7 +840,10 @@ impl State {
         // Determine the parent branch
         let parent_branch = if ancestor_branches.is_empty() {
             // No ancestors found, default to the trunk/main branch
-            let trunk = git_trunk(git_repo)?;
+            let Some(trunk) = git_trunk(git_repo) else {
+                // No remote configured and no ancestor branches - can't auto-mount
+                return Ok(false);
+            };
             tracing::info!(
                 "No mounted ancestor branches found for {}. Defaulting to trunk branch {}.",
                 branch_name,

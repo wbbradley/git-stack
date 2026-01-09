@@ -968,8 +968,8 @@ fn status(
     if fetch {
         git_fetch()?;
     }
-    // ensure_trunk creates the tree if it doesn't exist
-    let _trunk = state.ensure_trunk(git_repo, repo)?;
+    // ensure_trunk creates the tree if it doesn't exist (no-op if no remote)
+    let _trunk = state.ensure_trunk(git_repo, repo);
 
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
@@ -980,9 +980,10 @@ fn status(
     // Load display_authors for filtering (show other authors dimmed)
     let display_authors = github::load_display_authors();
 
-    let tree = state
-        .get_tree_mut(repo)
-        .expect("tree exists after ensure_trunk");
+    let Some(tree) = state.get_tree_mut(repo) else {
+        println!("No stack configured for this repository.");
+        return Ok(());
+    };
     recur_tree(
         git_repo,
         tree,
@@ -1029,7 +1030,7 @@ fn restack(
     }
 
     // Check if user is trying to restack the trunk branch
-    let trunk = git_trunk(git_repo)?;
+    let trunk = git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
     if restack_branch == trunk.main_branch {
         println!(
             "You are on the trunk branch ({}). Nothing to restack.",
@@ -1290,7 +1291,8 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
         .get_tree(repo)
         .ok_or_else(|| anyhow!("No stack tree found"))?;
 
-    let trunk = crate::git::git_trunk(git_repo)?;
+    let trunk =
+        crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
     // Collect branches with depth for bottom-up processing
     let branches_with_depth = collect_branches_with_depth(tree, &tree.name, 0);
@@ -1516,10 +1518,11 @@ fn handle_import_command(
     }
 
     let client = GitHubClient::from_env(&repo_id)?;
-    let trunk = crate::git::git_trunk(git_repo)?;
+    let trunk =
+        crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
     // Ensure trunk exists in tree
-    state.ensure_trunk(git_repo, repo)?;
+    state.ensure_trunk(git_repo, repo);
 
     if import_all {
         // Import all open PRs
@@ -1542,7 +1545,9 @@ fn handle_import_command(
 
     // Show the tree
     println!();
-    let tree = state.get_tree(repo).expect("tree exists after import");
+    let Some(tree) = state.get_tree(repo) else {
+        return Ok(());
+    };
     let pr_cache = fetch_pr_cache(git_repo);
     let display_authors = github::load_display_authors();
     recur_tree(
@@ -1819,7 +1824,8 @@ fn handle_pr_command(
             state.try_auto_mount(git_repo, repo, &branch_name)?;
 
             // Check if this is the trunk branch (can't create PR for main)
-            let trunk = crate::git::git_trunk(git_repo)?;
+            let trunk = crate::git::git_trunk(git_repo)
+                .ok_or_else(|| anyhow!("No remote configured"))?;
             if branch_name == trunk.main_branch {
                 bail!(
                     "Cannot create a PR for the trunk branch '{}'.",
@@ -1991,7 +1997,8 @@ fn handle_pr_command(
         PrAction::Sync { all, dry_run } => {
             use github::UpdatePrRequest;
 
-            let trunk = crate::git::git_trunk(git_repo)?;
+            let trunk = crate::git::git_trunk(git_repo)
+                .ok_or_else(|| anyhow!("No remote configured"))?;
 
             // Get branches to sync with depth for bottom-up processing
             let branches_to_sync: Vec<(String, String, usize)> = if all {
