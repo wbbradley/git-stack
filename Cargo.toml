@@ -1,9 +1,9 @@
 [package]
 name = "git-stack"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL2"
-keywords = ["git", "stack", "vcs"]
+keywords = ["git", "stack", "github"]
 categories = ["development-tools"]
 description = "A git stacking CLI for basic stacked diff management."
 readme = "README.md"
