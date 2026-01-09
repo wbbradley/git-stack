@@ -195,13 +195,28 @@ pub(crate) fn git_checkout_main(repo: &GitRepo, new_branch: Option<&str>) -> Res
         bail!("It looks like this would orphan unpushed changes in your main branch! Aborting...");
     }
 
-    // Repoint "main" to the remote main branch.
-    run_git(&[
-        "branch",
-        "-f",
-        &trunk.main_branch,
-        &format!("{}/{}", remote, trunk.main_branch),
-    ])?;
+    // Check if we're currently on the main branch
+    let current_branch = repo.current_branch().unwrap_or_default();
+    if current_branch == trunk.main_branch {
+        // Can't use `git branch -f` on the current branch, so checkout directly
+        run_git(&["checkout", &trunk.remote_main])?;
+        // Now we can update the branch pointer
+        run_git(&[
+            "branch",
+            "-f",
+            &trunk.main_branch,
+            &format!("{}/{}", remote, trunk.main_branch),
+        ])?;
+    } else {
+        // Repoint "main" to the remote main branch.
+        run_git(&[
+            "branch",
+            "-f",
+            &trunk.main_branch,
+            &format!("{}/{}", remote, trunk.main_branch),
+        ])?;
+    }
+
     if let Some(new_branch) = new_branch {
         run_git(&["checkout", "-B", new_branch, &trunk.remote_main])?;
     }

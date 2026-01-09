@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, get_local_status, git_checkout_main, git_fetch, run_git_status};
+use git::{after_text, get_local_status, git_checkout_main, git_fetch, git_trunk, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -1019,9 +1019,20 @@ fn restack(
     let mut branches_created: Vec<String> = Vec::new();
     let mut branches_restacked: Vec<String> = Vec::new();
     let mut branches_pushed: Vec<String> = Vec::new();
+    let mut branches_uptodate: Vec<String> = Vec::new();
 
     if fetch {
         git_fetch()?;
+    }
+
+    // Check if user is trying to restack the trunk branch
+    let trunk = git_trunk(git_repo)?;
+    if restack_branch == trunk.main_branch {
+        println!(
+            "You are on the trunk branch ({}). Nothing to restack.",
+            trunk.main_branch.yellow()
+        );
+        return Ok(());
     }
 
     // Ensure target branch exists locally (check it out from remote if needed)
@@ -1048,6 +1059,17 @@ fn restack(
     let mut pushed_branches: Vec<String> = Vec::new();
 
     for RestackStep { parent, branch } in plan {
+        // Ensure the branch exists locally (check it out from remote if needed)
+        if !git_repo.branch_exists(&branch.name) {
+            let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch.name);
+            if git_repo.ref_exists(&remote_ref) {
+                run_git(&["checkout", "-b", &branch.name, &remote_ref])?;
+                branches_created.push(branch.name.clone());
+            }
+            // If remote doesn't exist either, let the subsequent operations fail
+            // with a clear error message
+        }
+
         tracing::debug!(
             "Starting branch: {} [pwd={}]",
             restack_branch,
@@ -1061,6 +1083,7 @@ fn restack(
                 branch.name,
                 parent
             );
+            branches_uptodate.push(branch.name.clone());
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
@@ -1175,13 +1198,28 @@ fn restack(
         restack_branch
     );
 
-    // Print summary report if any changes occurred
+    // Print summary report
+    let total_examined =
+        branches_restacked.len() + branches_uptodate.len() + branches_created.len();
     let has_changes = !branches_created.is_empty()
         || !branches_restacked.is_empty()
         || !branches_pushed.is_empty();
 
-    if has_changes {
-        println!();
+    println!();
+    if total_examined == 0 {
+        println!("No branches to restack.");
+    } else if !has_changes && !branches_uptodate.is_empty() {
+        println!(
+            "All {} branch{} already up-to-date: {}",
+            branches_uptodate.len(),
+            if branches_uptodate.len() == 1 { "" } else { "es" },
+            branches_uptodate
+                .iter()
+                .map(|b| b.green().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
         if !branches_created.is_empty() {
             println!(
                 "Created from remote: {}",
@@ -1198,6 +1236,16 @@ fn restack(
                 branches_restacked
                     .iter()
                     .map(|b| b.yellow().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !branches_uptodate.is_empty() {
+            println!(
+                "Already up-to-date: {}",
+                branches_uptodate
+                    .iter()
+                    .map(|b| b.green().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
