@@ -148,6 +148,15 @@ enum Command {
         /// Restack all parent branches recursively up to trunk.
         #[arg(long, short = 'a', default_value_t = false)]
         all_parents: bool,
+        /// Squash all commits in the branch into a single commit.
+        #[arg(long, short = 's', default_value_t = false)]
+        squash: bool,
+        /// Continue a previously interrupted squash operation after conflict resolution.
+        #[arg(long, default_value_t = false)]
+        r#continue: bool,
+        /// Abort an in-progress squash operation and restore the original branch state.
+        #[arg(long, default_value_t = false)]
+        abort: bool,
     },
     /// Shows the log between the given branch and its parent (git-stack tree) branch.
     Log {
@@ -358,6 +367,23 @@ fn inner_main() -> Result<()> {
     let current_upstream = git_repo.get_upstream("");
     tracing::debug!(run_version, current_branch, current_upstream);
 
+    // Check for pending squash operation - block other commands except --continue and --abort
+    if state.has_pending_squash(&repo) {
+        match &args.command {
+            Some(Command::Restack {
+                r#continue: true, ..
+            }) => { /* allowed */ }
+            Some(Command::Restack { abort: true, .. }) => { /* allowed */ }
+            _ => {
+                bail!(
+                    "A squash operation is in progress for this repository.\n\
+                     Run `git stack restack --continue` after resolving conflicts,\n\
+                     or `git stack restack --abort` to cancel."
+                );
+            }
+        }
+    }
+
     match args.command {
         Some(Command::Checkout { branch_name }) => state.checkout(
             &git_repo,
@@ -372,7 +398,18 @@ fn inner_main() -> Result<()> {
             fetch,
             push,
             all_parents,
+            squash,
+            r#continue,
+            abort,
         }) => {
+            // Handle --continue first
+            if r#continue {
+                return handle_squash_continue(&git_repo, &mut state, &repo);
+            }
+            // Handle --abort
+            if abort {
+                return handle_squash_abort(&git_repo, &mut state, &repo);
+            }
             let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
             state.try_auto_mount(&git_repo, &repo, &restack_branch)?;
             restack(
@@ -385,6 +422,7 @@ fn inner_main() -> Result<()> {
                 fetch,
                 push,
                 all_parents,
+                squash,
             )
         }
         Some(Command::Mount { parent_branch }) => {
@@ -1005,6 +1043,202 @@ fn status(
     Ok(())
 }
 
+/// Get concatenated commit messages between ancestor and branch tip.
+fn get_concatenated_commit_messages(branch: &str, ancestor: &str) -> Result<String> {
+    let output = run_git(&[
+        "log",
+        "--reverse",
+        "--format=%B",
+        &format!("{}..{}", ancestor, branch),
+    ])?;
+
+    let messages = output.output().unwrap_or_default();
+    if messages.trim().is_empty() {
+        bail!("No commits found between {} and {}", ancestor, branch);
+    }
+
+    // Clean up the messages - join with separator for readability
+    let cleaned: String = messages
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(cleaned)
+}
+
+/// Complete a squash operation (either after clean merge or after conflict resolution).
+fn complete_squash(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    pending: &state::PendingSquashOperation,
+) -> Result<()> {
+    // Commit with the concatenated messages
+    run_git(&["commit", "-m", &pending.squash_message])?;
+
+    // Move the branch pointer: git checkout -B <branch>
+    // This points <branch> to current HEAD (the squashed commit) and checks it out
+    run_git(&["checkout", "-B", &pending.branch_name])?;
+
+    // Clean up temp branch
+    let _ = run_git(&["branch", "-D", &pending.tmp_branch_name]);
+
+    // Clear the pending operation
+    state.set_pending_squash(repo, None);
+    state.save_state()?;
+
+    println!(
+        "Squash completed for branch '{}'.",
+        pending.branch_name.yellow()
+    );
+
+    Ok(())
+}
+
+/// Execute a squash operation for a single branch.
+fn squash_branch(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    branch: &state::Branch,
+    parent: &str,
+) -> Result<bool> {
+    let branch_name = &branch.name;
+    let tmp_branch = format!("tmp-{}", branch_name);
+
+    // Determine ancestor for commit message range
+    let source_sha = git_repo.sha(branch_name)?;
+    let lkg_ancestor = branch
+        .lkg_parent
+        .as_deref()
+        .filter(|lkg| git_repo.is_ancestor(lkg, &source_sha).unwrap_or(false))
+        .map(|s| s.to_string())
+        .or_else(|| git_repo.merge_base(parent, branch_name).ok())
+        .ok_or_else(|| anyhow!("Cannot determine ancestor for commit messages"))?;
+
+    // Collect commit messages from ancestor to branch tip
+    let squash_message = get_concatenated_commit_messages(branch_name, &lkg_ancestor)?;
+
+    // Save original SHA for recovery
+    let original_sha = git_repo.sha(branch_name)?;
+
+    // Create pending operation state
+    let pending = state::PendingSquashOperation {
+        branch_name: branch_name.clone(),
+        parent_branch: parent.to_string(),
+        tmp_branch_name: tmp_branch.clone(),
+        original_sha,
+        squash_message: squash_message.clone(),
+    };
+    state.set_pending_squash(repo, Some(pending.clone()));
+    state.save_state()?;
+
+    // Execute the squash workflow
+    // git checkout <parent>
+    run_git(&["checkout", parent])?;
+
+    // git checkout -B tmp-<branch>
+    run_git(&["checkout", "-B", &tmp_branch])?;
+
+    // git merge --squash <branch>
+    let merge_status = run_git_status(&["merge", "--squash", branch_name], None)?;
+
+    if !merge_status.success() {
+        // Conflict! Print instructions and exit
+        eprintln!("{}", "Merge conflict during squash operation.".red().bold());
+        eprintln!();
+        eprintln!("Resolve the conflicts, then run:");
+        eprintln!("  git add <resolved-files>");
+        eprintln!("  {}", "git stack restack --continue".green().bold());
+        eprintln!();
+        eprintln!("Or to abort and restore the original branch:");
+        eprintln!("  {}", "git stack restack --abort".yellow().bold());
+        std::process::exit(1);
+    }
+
+    // Complete the squash (no conflict)
+    complete_squash(git_repo, state, repo, &pending)?;
+
+    Ok(true)
+}
+
+/// Handle the --continue flag for resuming a squash operation.
+fn handle_squash_continue(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+) -> Result<()> {
+    let pending = state
+        .get_pending_squash(repo)
+        .ok_or_else(|| anyhow!("No pending squash operation to continue."))?
+        .clone();
+
+    // Check if there are unresolved conflicts
+    let status_output = run_git(&["status", "--porcelain"])?;
+    let has_conflicts = status_output
+        .output()
+        .map(|s| s.lines().any(|line| line.starts_with("UU") || line.starts_with("AA")))
+        .unwrap_or(false);
+
+    if has_conflicts {
+        bail!(
+            "There are still unresolved conflicts. Resolve them and add the files, \
+             then run --continue again."
+        );
+    }
+
+    // Check if we're on the temp branch
+    let current = git_repo.current_branch()?;
+    if current != pending.tmp_branch_name {
+        bail!(
+            "Expected to be on branch '{}' but currently on '{}'. \
+             Please checkout '{}' and run --continue again.",
+            pending.tmp_branch_name,
+            current,
+            pending.tmp_branch_name
+        );
+    }
+
+    // Complete the squash
+    complete_squash(git_repo, state, repo, &pending)?;
+
+    Ok(())
+}
+
+/// Handle the --abort flag for aborting a squash operation.
+fn handle_squash_abort(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+) -> Result<()> {
+    let pending = state
+        .get_pending_squash(repo)
+        .ok_or_else(|| anyhow!("No pending squash operation to abort."))?
+        .clone();
+
+    // Abort any in-progress merge
+    let _ = run_git_status(&["merge", "--abort"], None);
+
+    // Checkout the original branch at its original SHA
+    run_git(&["checkout", "-f", &pending.original_sha])?;
+    run_git(&["checkout", "-B", &pending.branch_name])?;
+
+    // Clean up temp branch if it exists
+    let _ = run_git(&["branch", "-D", &pending.tmp_branch_name]);
+
+    // Clear pending state
+    state.set_pending_squash(repo, None);
+    state.save_state()?;
+
+    println!(
+        "Squash operation aborted. Branch '{}' restored to original state.",
+        pending.branch_name.yellow()
+    );
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restack(
     git_repo: &GitRepo,
@@ -1016,6 +1250,7 @@ fn restack(
     fetch: bool,
     push: bool,
     all_parents: bool,
+    squash: bool,
 ) -> Result<(), anyhow::Error> {
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
@@ -1053,13 +1288,19 @@ fn restack(
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let plan = state.plan_restack(git_repo, repo, &restack_branch, all_parents)?;
 
-    tracing::debug!(?plan, "Restacking branches with plan. Checking out main...");
+    // Collect plan into owned data to allow mutable access to state during the loop
+    let plan_owned: Vec<(String, state::Branch)> = plan
+        .into_iter()
+        .map(|step| (step.parent, step.branch.clone()))
+        .collect();
+
+    tracing::debug!("Restacking branches with plan. Checking out main...");
     git_checkout_main(git_repo, None)?;
 
     // Track pushed branches to record SHAs after the loop (avoids borrow issues with plan)
     let mut pushed_branches: Vec<String> = Vec::new();
 
-    for RestackStep { parent, branch } in plan {
+    for (parent, branch) in plan_owned {
         // Ensure the branch exists locally (check it out from remote if needed)
         if !git_repo.branch_exists(&branch.name) {
             let remote_ref = format!("{DEFAULT_REMOTE}/{}", branch.name);
@@ -1077,6 +1318,20 @@ fn restack(
             env::current_dir()?.display()
         );
         let source = git_repo.sha(&branch.name)?;
+
+        // Handle squash mode - squash all commits into one on top of parent
+        if squash {
+            squash_branch(git_repo, &mut state, repo, &branch, &parent)?;
+            let status = if push {
+                git_push(git_repo, &branch.name)?;
+                pushed_branches.push(branch.name.clone());
+                "squashed, pushed"
+            } else {
+                "squashed"
+            };
+            branch_results.push((branch.name.clone(), status.to_string()));
+            continue;
+        }
 
         if git_repo.is_ancestor(&parent, &branch.name)? {
             tracing::debug!(

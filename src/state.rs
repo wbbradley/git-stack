@@ -46,6 +46,21 @@ pub enum StackMethod {
     Merge,
 }
 
+/// State for an in-progress squash operation that needs to be resumed after conflict resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingSquashOperation {
+    /// The branch being squashed.
+    pub branch_name: String,
+    /// The parent branch we're squashing onto.
+    pub parent_branch: String,
+    /// The temporary branch name used during the squash (e.g., "tmp-<branch>").
+    pub tmp_branch_name: String,
+    /// The original branch SHA before squashing (for recovery).
+    pub original_sha: String,
+    /// The concatenated commit messages to use for the squash commit.
+    pub squash_message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     /// The name of the branch or ref.
@@ -90,6 +105,9 @@ pub struct RepoState {
     /// branch can be deleted (no unpushed work would be lost).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub seen_remote_shas: HashSet<String>,
+    /// Pending squash operation that needs to be resumed after conflict resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_squash: Option<PendingSquashOperation>,
 }
 
 impl RepoState {
@@ -97,6 +115,7 @@ impl RepoState {
         Self {
             tree,
             seen_remote_shas: HashSet::new(),
+            pending_squash: None,
         }
     }
 }
@@ -173,6 +192,23 @@ impl State {
         if let Some(repo_state) = self.repos.get_mut(repo) {
             repo_state.seen_remote_shas.clear();
         }
+    }
+    /// Get the pending squash operation for a repo, if any.
+    pub fn get_pending_squash(&self, repo: &str) -> Option<&PendingSquashOperation> {
+        self.repos.get(repo).and_then(|r| r.pending_squash.as_ref())
+    }
+    /// Set or clear the pending squash operation for a repo.
+    pub fn set_pending_squash(&mut self, repo: &str, pending: Option<PendingSquashOperation>) {
+        if let Some(repo_state) = self.repos.get_mut(repo) {
+            repo_state.pending_squash = pending;
+        }
+    }
+    /// Check if there is a pending squash operation for a repo.
+    pub fn has_pending_squash(&self, repo: &str) -> bool {
+        self.repos
+            .get(repo)
+            .map(|r| r.pending_squash.is_some())
+            .unwrap_or(false)
     }
     /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
     /// then check whether the branch exists in the git repo. If it does, then let the user know
