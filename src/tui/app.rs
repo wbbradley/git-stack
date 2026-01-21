@@ -175,16 +175,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         .tree
         .branches
         .iter()
-        .map(|branch| render_branch_item(branch, app.verbose))
+        .enumerate()
+        .map(|(i, branch)| render_branch_item(branch, i == app.cursor, app.verbose))
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(40, 40, 45))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("→ ");
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Rgb(40, 40, 45))
+            .add_modifier(Modifier::BOLD),
+    );
 
     frame.render_stateful_widget(list, inner_area, &mut app.list_state);
 
@@ -193,10 +192,24 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 /// Render a single branch as a ListItem.
-fn render_branch_item(branch: &RenderableBranch, verbose: bool) -> ListItem<'static> {
+fn render_branch_item(
+    branch: &RenderableBranch,
+    is_selected: bool,
+    verbose: bool,
+) -> ListItem<'static> {
     let dim = if branch.is_dimmed { 0.75 } else { 1.0 };
 
     let mut spans = Vec::new();
+
+    // Arrow prefix: selection arrow takes precedence over HEAD indicator
+    let arrow = if is_selected {
+        Span::styled("→ ", Style::default().fg(Color::White))
+    } else if branch.is_current {
+        Span::styled("→ ", Style::default().fg(Color::Rgb(80, 80, 80))) // faint gray
+    } else {
+        Span::raw("  ") // spacing to maintain alignment
+    };
+    spans.push(arrow);
 
     // Tree indentation
     for _ in 0..branch.depth {
