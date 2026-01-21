@@ -14,6 +14,7 @@ repository = "https://github.com/wbbradley/git-stack"
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 chrono = "0.4.41"
 clap = { version = "4.5.37", features = ["derive"] }
+clap_complete = "4.5.65"
 colored = "3.0.0"
 crossterm = "0.29.0"
 git2 = "0.20"
