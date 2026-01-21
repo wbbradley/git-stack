@@ -4,7 +4,7 @@ use std::{env, fs::canonicalize};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use git::{after_text, get_local_status, git_checkout_main, git_fetch, git_trunk, run_git_status};
+use git::{after_text, git_checkout_main, git_fetch, git_trunk, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
@@ -18,90 +18,11 @@ use crate::{
 mod git;
 mod git2_ops;
 mod github;
+mod render;
 mod state;
 mod stats;
 mod sync;
-
-/// Compute a deterministic RGB color from a string using its hash.
-/// Uses MD5 to hash the string, derives a hue from the first two bytes,
-/// and converts HSV to RGB with fixed saturation and value for readability.
-fn string_to_rgb(s: &str) -> (u8, u8, u8) {
-    let hash = md5::compute(s);
-    // Use first two bytes to get a hue value (0-360)
-    let hue = (u16::from(hash[0]) | (u16::from(hash[1]) << 8)) % 360;
-    // Fixed saturation and value for good terminal readability
-    let saturation = 0.35;
-    let value = 0.75;
-    hsv_to_rgb(hue as f32, saturation, value)
-}
-
-/// Convert HSV color to RGB.
-/// h: hue (0-360), s: saturation (0-1), v: value (0-1)
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-
-    let (r, g, b) = match h as u32 {
-        0..60 => (c, x, 0.0),
-        60..120 => (x, c, 0.0),
-        120..180 => (0.0, c, x),
-        180..240 => (0.0, x, c),
-        240..300 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-
-    (
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
-}
-
-// Color constants for consistent theming
-mod colors {
-    pub const GREEN: (u8, u8, u8) = (142, 192, 124);
-    pub const RED: (u8, u8, u8) = (204, 36, 29);
-    pub const GRAY: (u8, u8, u8) = (128, 128, 128);
-    pub const GOLD: (u8, u8, u8) = (215, 153, 33);
-    pub const TREE: (u8, u8, u8) = (55, 55, 50);
-    pub const YELLOW: (u8, u8, u8) = (250, 189, 47);
-    pub const PURPLE: (u8, u8, u8) = (180, 142, 173);
-    pub const MUTED: (u8, u8, u8) = (90, 90, 90);
-    pub const PR_NUMBER: (u8, u8, u8) = (90, 78, 98);
-    pub const PR_ARROW: (u8, u8, u8) = (100, 105, 105);
-    pub const UPSTREAM: (u8, u8, u8) = (88, 88, 88);
-    pub const STACKED_ON: (u8, u8, u8) = (90, 120, 87);
-}
-
-/// Dimming factor for display. Wraps RGB values and applies a multiplier.
-#[derive(Clone, Copy)]
-struct Dim(f32);
-
-impl Dim {
-    fn full() -> Self {
-        Dim(1.0)
-    }
-    fn dimmed() -> Self {
-        Dim(0.75)
-    }
-
-    /// Apply dimming to RGB values
-    fn rgb(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        (
-            (r as f32 * self.0) as u8,
-            (g as f32 * self.0) as u8,
-            (b as f32 * self.0) as u8,
-        )
-    }
-
-    /// Apply dimming to a color tuple
-    fn apply(&self, color: (u8, u8, u8)) -> (u8, u8, u8) {
-        self.rgb(color.0, color.1, color.2)
-    }
-}
-
-// This is an important refactoring.
+mod tui;
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -131,6 +52,9 @@ enum Command {
         /// Whether to fetch the latest changes from the remote before showing the status.
         #[arg(long, short, default_value_t = false)]
         fetch: bool,
+        /// Launch interactive TUI mode for branch navigation and checkout.
+        #[arg(long, short = 'i', default_value_t = false)]
+        interactive: bool,
     },
     /// Open the git-stack state file in an editor for manual editing.
     Edit,
@@ -428,7 +352,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Mount { parent_branch }) => {
             state.mount(&git_repo, &repo, &current_branch, parent_branch)
         }
-        Some(Command::Status { fetch }) => {
+        Some(Command::Status { fetch, interactive }) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
                 &git_repo,
@@ -437,6 +361,7 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 fetch,
                 args.verbose,
+                interactive,
             )
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
@@ -494,6 +419,7 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 false,
                 args.verbose,
+                false, // interactive
             )
         }
     }
@@ -548,433 +474,6 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn selection_marker() -> &'static str {
-    if cfg!(target_os = "windows") {
-        ">"
-    } else {
-        "→"
-    }
-}
-
-/// Check if a branch subtree contains the target branch or a display_author PR
-/// Returns (has_target_branch, has_display_author_pr)
-fn subtree_contains(
-    branch: &Branch,
-    target_branch: &str,
-    display_authors: &[String],
-    pr_cache: Option<&std::collections::HashMap<String, github::PullRequest>>,
-) -> (bool, bool) {
-    // Check this branch
-    let is_target = branch.name == target_branch;
-    let has_author = pr_cache
-        .and_then(|cache| cache.get(&branch.name))
-        .map(|pr| display_authors.contains(&pr.user.login))
-        .unwrap_or(false);
-
-    // Recursively check children
-    let (child_has_target, child_has_author) = branch
-        .branches
-        .iter()
-        .map(|b| subtree_contains(b, target_branch, display_authors, pr_cache))
-        .fold((false, false), |(t1, a1), (t2, a2)| (t1 || t2, a1 || a2));
-
-    (
-        is_target || child_has_target,
-        has_author || child_has_author,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn recur_tree(
-    git_repo: &GitRepo,
-    branch: &Branch,
-    depth: usize,
-    orig_branch: &str,
-    parent_branch: Option<&str>,
-    verbose: bool,
-    pr_cache: Option<&std::collections::HashMap<String, github::PullRequest>>,
-    display_authors: &[String],
-) -> Result<()> {
-    // Check if this branch should be dimmed (filtered by display_authors)
-    let pr_author = pr_cache
-        .and_then(|cache| cache.get(&branch.name))
-        .map(|pr| pr.user.login.as_str());
-    let is_dimmed = if display_authors.is_empty() {
-        false
-    } else {
-        pr_author.is_some_and(|author| !display_authors.contains(&author.to_string()))
-    };
-    let dim = if is_dimmed {
-        Dim::dimmed()
-    } else {
-        Dim::full()
-    };
-
-    // Check if branch is remote-only (not local)
-    let is_remote_only = !git_repo.branch_exists(&branch.name);
-
-    let Ok(branch_status) = git_repo
-        .branch_status(parent_branch, &branch.name)
-        .with_context(|| {
-            format!(
-                "attempting to fetch the branch status of {}",
-                branch.name.red()
-            )
-        })
-    else {
-        // For remote-only branches, the local branch may not exist
-        if is_remote_only {
-            // Show remote-only branch even without status
-            let is_current_branch = branch.name == orig_branch;
-            if is_current_branch {
-                print!("{} ", selection_marker().bright_purple().bold());
-            } else {
-                print!("  ");
-            }
-            // Tree lines stay at full color regardless of dimming
-            for _ in 0..depth {
-                print!(
-                    "{}",
-                    "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
-                );
-            }
-            let branch_color = dim.apply(colors::GRAY);
-            let muted_color = dim.apply(colors::MUTED);
-            println!(
-                "{}",
-                branch
-                    .name
-                    .truecolor(branch_color.0, branch_color.1, branch_color.2)
-            );
-
-            // Recurse into children
-            for child in &branch.branches {
-                recur_tree(
-                    git_repo,
-                    child,
-                    depth + 1,
-                    orig_branch,
-                    Some(branch.name.as_ref()),
-                    verbose,
-                    pr_cache,
-                    display_authors,
-                )?;
-            }
-            return Ok(());
-        }
-        tracing::warn!("Branch {} does not exist", branch.name);
-        return Ok(());
-    };
-    let is_current_branch = if branch.name == orig_branch {
-        print!("{} ", selection_marker().bright_purple().bold());
-        true
-    } else {
-        print!("  ");
-        false
-    };
-
-    // Tree lines stay at full color regardless of dimming
-    for _ in 0..depth {
-        print!(
-            "{}",
-            "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
-        );
-    }
-
-    // Branch name coloring: green for synced, red for diverged, bold for current branch
-    let branch_color = if branch_status.is_descendent {
-        dim.apply(colors::GREEN)
-    } else {
-        dim.apply(colors::YELLOW)
-    };
-    let branch_name_colored = if is_current_branch {
-        branch
-            .name
-            .truecolor(branch_color.0, branch_color.1, branch_color.2)
-            .bold()
-    } else {
-        branch
-            .name
-            .truecolor(branch_color.0, branch_color.1, branch_color.2)
-    };
-
-    // Get diff stats from LKG ancestor (or merge-base) to current branch
-    let diff_stats = {
-        // Determine base ref and whether it's reliable
-        let (base_ref, is_reliable) = if let Some(lkg) = branch.lkg_parent.as_deref() {
-            (Some(lkg.to_string()), true)
-        } else if let Ok(merge_base) =
-            git_repo.merge_base(&branch_status.parent_branch, &branch_status.sha)
-        {
-            (Some(merge_base), false) // merge-base is less reliable
-        } else {
-            (None, false)
-        };
-
-        match base_ref {
-            Some(base) => match git_repo.diff_stats(&base, &branch_status.sha) {
-                Ok((adds, dels)) => {
-                    let green = dim.apply(colors::GREEN);
-                    let red = dim.apply(colors::RED);
-                    let prefix = if is_reliable { "" } else { "~ " };
-                    format!(
-                        " [{}{}{}]",
-                        prefix,
-                        format!("+{}", adds).truecolor(green.0, green.1, green.2),
-                        format!(" -{}", dels).truecolor(red.0, red.1, red.2)
-                    )
-                }
-                Err(_) => String::new(),
-            },
-            None => String::new(),
-        }
-    };
-
-    // Get local changes summary for current branch only
-    let local_status = if is_current_branch {
-        match get_local_status() {
-            Ok(status) if !status.is_clean() => {
-                let mut parts = Vec::new();
-                let green = dim.apply(colors::GREEN);
-                let yellow = dim.apply(colors::YELLOW);
-                let gray = dim.apply(colors::GRAY);
-                if status.staged > 0 {
-                    parts.push(
-                        format!("+{}", status.staged)
-                            .truecolor(green.0, green.1, green.2)
-                            .to_string(),
-                    );
-                }
-                if status.unstaged > 0 {
-                    parts.push(
-                        format!("~{}", status.unstaged)
-                            .truecolor(yellow.0, yellow.1, yellow.2)
-                            .to_string(),
-                    );
-                }
-                if status.untracked > 0 {
-                    parts.push(
-                        format!("?{}", status.untracked)
-                            .truecolor(gray.0, gray.1, gray.2)
-                            .to_string(),
-                    );
-                }
-                format!(" [{}]", parts.join(" "))
-            }
-            _ => String::new(),
-        }
-    } else {
-        String::new()
-    };
-
-    if verbose {
-        let gold = dim.apply(colors::GOLD);
-        let stacked_on = dim.apply(colors::STACKED_ON);
-        let yellow = dim.apply(colors::YELLOW);
-        let red = dim.apply(colors::RED);
-        let green = dim.apply(colors::GREEN);
-        let upstream_color = dim.apply(colors::UPSTREAM);
-
-        println!(
-            "{}{}{} ({}) {}{}{}{}",
-            branch_name_colored,
-            diff_stats,
-            local_status,
-            branch_status.sha[..8].truecolor(gold.0, gold.1, gold.2),
-            {
-                let details: String = if branch_status.exists {
-                    if branch_status.is_descendent {
-                        format!(
-                            "{} {}",
-                            "is stacked on".truecolor(stacked_on.0, stacked_on.1, stacked_on.2),
-                            branch_status
-                                .parent_branch
-                                .truecolor(yellow.0, yellow.1, yellow.2)
-                        )
-                    } else {
-                        format!(
-                            "{} {}",
-                            "diverges from".truecolor(red.0, red.1, red.2),
-                            branch_status
-                                .parent_branch
-                                .truecolor(yellow.0, yellow.1, yellow.2)
-                        )
-                    }
-                } else {
-                    "does not exist!".truecolor(red.0, red.1, red.2).to_string()
-                };
-                details
-            },
-            {
-                if let Some(upstream_status) = branch_status.upstream_status {
-                    format!(
-                        " (upstream {} is {})",
-                        upstream_status.symbolic_name.truecolor(
-                            upstream_color.0,
-                            upstream_color.1,
-                            upstream_color.2
-                        ),
-                        if upstream_status.synced {
-                            "synced".truecolor(green.0, green.1, green.2)
-                        } else {
-                            "not synced".truecolor(red.0, red.1, red.2)
-                        }
-                    )
-                } else {
-                    format!(" ({})", "no upstream".truecolor(gold.0, gold.1, gold.2))
-                }
-            },
-            {
-                if let Some(lkg_parent) = branch.lkg_parent.as_ref() {
-                    format!(
-                        " (lkg parent {})",
-                        lkg_parent[..8].truecolor(gold.0, gold.1, gold.2)
-                    )
-                } else {
-                    String::new()
-                }
-            },
-            {
-                let method_color = dim.apply(colors::GREEN);
-                match branch.stack_method {
-                    StackMethod::ApplyMerge => {
-                        " (apply-merge)".truecolor(method_color.0, method_color.1, method_color.2)
-                    }
-                    StackMethod::Merge => {
-                        " (merge)".truecolor(method_color.0, method_color.1, method_color.2)
-                    }
-                }
-            },
-        );
-        if let Some(note) = &branch.note {
-            print!("  ");
-            // Tree lines stay at full color regardless of dimming
-            for _ in 0..depth {
-                print!(
-                    "{}",
-                    "┃ ".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2)
-                );
-            }
-
-            let first_line = note.lines().next().unwrap_or("");
-            // Note: keeping blue for notes as it's distinct from status colors
-            println!(
-                "  {} {}",
-                "›".truecolor(colors::TREE.0, colors::TREE.1, colors::TREE.2),
-                if is_current_branch {
-                    first_line.bright_blue().bold()
-                } else {
-                    first_line.blue()
-                }
-            );
-        }
-    } else {
-        // Format PR info for display
-        let pr_info = if let Some(cache) = pr_cache {
-            if let Some(pr) = cache.get(&branch.name) {
-                let state = pr.display_state();
-                let gray = dim.apply(colors::GRAY);
-                let green = dim.apply(colors::GREEN);
-                let purple = dim.apply(colors::PURPLE);
-                let red = dim.apply(colors::RED);
-                let state_colored = match state {
-                    github::PrDisplayState::Draft => {
-                        format!("[{}]", state).truecolor(gray.0, gray.1, gray.2)
-                    }
-                    github::PrDisplayState::Open => {
-                        format!("[{}]", state).truecolor(green.0, green.1, green.2)
-                    }
-                    github::PrDisplayState::Merged => {
-                        format!("[{}]", state).truecolor(purple.0, purple.1, purple.2)
-                    }
-                    github::PrDisplayState::Closed => {
-                        format!("[{}]", state).truecolor(red.0, red.1, red.2)
-                    }
-                };
-                let author_rgb = string_to_rgb(&pr.user.login);
-                let author_color = dim.apply(author_rgb);
-                let author_colored = format!("@{}", pr.user.login).truecolor(
-                    author_color.0,
-                    author_color.1,
-                    author_color.2,
-                );
-                let pr_num = dim.apply(colors::PR_NUMBER);
-                let number_colored =
-                    format!("#{}", pr.number).truecolor(pr_num.0, pr_num.1, pr_num.2);
-                let arrow = dim.apply(colors::PR_ARROW);
-                format!(
-                    " {} {} {} {}",
-                    "".truecolor(arrow.0, arrow.1, arrow.2),
-                    author_colored,
-                    number_colored,
-                    state_colored
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        println!(
-            "{}{}{}{}",
-            branch_name_colored, diff_stats, local_status, pr_info
-        );
-    }
-
-    let mut branches_sorted = branch.branches.iter().collect::<Vec<_>>();
-
-    // Pre-compute subtree properties for sorting
-    let subtree_cache: std::collections::HashMap<&str, (bool, bool)> = branches_sorted
-        .iter()
-        .map(|b| {
-            (
-                b.name.as_str(),
-                subtree_contains(b, orig_branch, display_authors, pr_cache),
-            )
-        })
-        .collect();
-
-    branches_sorted.sort_by(|&a, &b| {
-        let (a_has_current, a_has_author) = subtree_cache
-            .get(a.name.as_str())
-            .copied()
-            .unwrap_or((false, false));
-        let (b_has_current, b_has_author) = subtree_cache
-            .get(b.name.as_str())
-            .copied()
-            .unwrap_or((false, false));
-
-        // Priority 1: subtree contains current branch
-        match (a_has_current, b_has_current) {
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
-        // Priority 2: subtree contains display_author PR
-        match (a_has_author, b_has_author) {
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
-        // Priority 3: alphabetical
-        a.name.cmp(&b.name)
-    });
-
-    for child in branches_sorted {
-        recur_tree(
-            git_repo,
-            child,
-            depth + 1,
-            orig_branch,
-            Some(branch.name.as_ref()),
-            verbose,
-            pr_cache,
-            display_authors,
-        )?;
-    }
-    Ok(())
-}
-
 /// Fetch PR cache from GitHub, returning None on any error (graceful degradation)
 fn fetch_pr_cache(
     git_repo: &GitRepo,
@@ -1002,6 +501,7 @@ fn status(
     orig_branch: &str,
     fetch: bool,
     verbose: bool,
+    interactive: bool,
 ) -> Result<()> {
     if fetch {
         git_fetch()?;
@@ -1018,27 +518,39 @@ fn status(
     // Load display_authors for filtering (show other authors dimmed)
     let display_authors = github::load_display_authors();
 
-    let Some(tree) = state.get_tree_mut(repo) else {
+    let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
         return Ok(());
     };
-    recur_tree(
+
+    // Compute renderable tree
+    let renderable = render::compute_renderable_tree(
         git_repo,
         tree,
-        0,
         orig_branch,
-        None,
         verbose,
         pr_cache.as_ref(),
         &display_authors,
-    )?;
-    if !state.branch_exists_in_tree(repo, orig_branch) {
-        eprintln!(
-            "The current branch {} is not in the stack tree.",
-            orig_branch.red()
-        );
-        eprintln!("Run `git stack mount <parent_branch>` to add it.");
+    );
+
+    if interactive {
+        // Run TUI and handle checkout if user selected a branch
+        if let Some(branch_to_checkout) = tui::run_tui(renderable, verbose)? {
+            run_git(&["checkout", &branch_to_checkout])?;
+        }
+    } else {
+        // Render to CLI
+        render::render_cli(&renderable, verbose);
+
+        if !state.branch_exists_in_tree(repo, orig_branch) {
+            eprintln!(
+                "The current branch {} is not in the stack tree.",
+                orig_branch.red()
+            );
+            eprintln!("Run `git stack mount <parent_branch>` to add it.");
+        }
     }
+
     state.save_state()?;
     Ok(())
 }
@@ -1748,16 +1260,15 @@ fn handle_import_command(
     };
     let pr_cache = fetch_pr_cache(git_repo);
     let display_authors = github::load_display_authors();
-    recur_tree(
+    let renderable = render::compute_renderable_tree(
         git_repo,
         tree,
-        0,
         branch,
-        None,
         false,
         pr_cache.as_ref(),
         &display_authors,
-    )?;
+    );
+    render::render_cli(&renderable, false);
 
     Ok(())
 }
