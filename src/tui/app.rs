@@ -272,37 +272,36 @@ fn render_branch_item(branch: &RenderableBranch, verbose: bool) -> ListItem<'sta
     }
 
     // PR info (non-verbose mode)
-    if !verbose
-        && let Some(ref pr) = branch.pr_info {
-            let state_color = match pr.state {
-                PrDisplayState::Draft => apply_dim(theme::GRAY, dim),
-                PrDisplayState::Open => apply_dim(theme::GREEN, dim),
-                PrDisplayState::Merged => apply_dim(theme::PURPLE, dim),
-                PrDisplayState::Closed => apply_dim(theme::RED, dim),
-            };
+    if !verbose && let Some(ref pr) = branch.pr_info {
+        let state_color = match pr.state {
+            PrDisplayState::Draft => apply_dim(theme::GRAY, dim),
+            PrDisplayState::Open => apply_dim(theme::GREEN, dim),
+            PrDisplayState::Merged => apply_dim(theme::PURPLE, dim),
+            PrDisplayState::Closed => apply_dim(theme::RED, dim),
+        };
 
-            let author_rgb = string_to_color(&pr.author);
-            let author_color = apply_dim(author_rgb, dim);
+        let author_rgb = string_to_color(&pr.author);
+        let author_color = apply_dim(author_rgb, dim);
 
-            spans.push(Span::styled(
-                " ",
-                Style::default().fg(apply_dim(theme::PR_ARROW, dim)),
-            ));
-            spans.push(Span::styled(
-                format!("@{}", pr.author),
-                Style::default().fg(author_color),
-            ));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("#{}", pr.number),
-                Style::default().fg(apply_dim(theme::PR_NUMBER, dim)),
-            ));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("[{}]", pr.state),
-                Style::default().fg(state_color),
-            ));
-        }
+        spans.push(Span::styled(
+            " ",
+            Style::default().fg(apply_dim(theme::PR_ARROW, dim)),
+        ));
+        spans.push(Span::styled(
+            format!("@{}", pr.author),
+            Style::default().fg(author_color),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("#{}", pr.number),
+            Style::default().fg(apply_dim(theme::PR_NUMBER, dim)),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("[{}]", pr.state),
+            Style::default().fg(state_color),
+        ));
+    }
 
     ListItem::new(Line::from(spans))
 }

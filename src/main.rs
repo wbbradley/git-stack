@@ -2,7 +2,8 @@
 use std::{env, fs::canonicalize};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use colored::Colorize;
 use git::{after_text, git_checkout_main, git_fetch, git_trunk, run_git_status};
 use state::{Branch, RestackStep, StackMethod};
@@ -142,6 +143,12 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Generate shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
     /// Sync local git-stack state with GitHub PRs.
     /// Default: weak push then weak pull (bidirectional sync).
     Sync {
@@ -258,6 +265,13 @@ fn inner_main() -> Result<()> {
     if args.json {
         // SAFETY: We're single-threaded at this point in startup
         unsafe { std::env::set_var("GIT_STACK_BENCHMARK_JSON", "1") };
+    }
+
+    // Handle completions early (doesn't require git repo)
+    if let Some(Command::Completions { shell }) = args.command {
+        let mut cmd = Args::command();
+        generate(shell, &mut cmd, "git-stack", &mut std::io::stdout());
+        return Ok(());
     }
 
     let repo = canonicalize(
@@ -398,6 +412,7 @@ fn inner_main() -> Result<()> {
             };
             sync::sync(&git_repo, &mut state, &repo, options)
         }
+        Some(Command::Completions { .. }) => unreachable!("handled above"),
         None => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
