@@ -21,7 +21,8 @@ use super::input::{AppAction, handle_event};
 use crate::{
     github::PrDisplayState,
     render::{
-        RenderableBranch, RenderableTree,
+        RenderableBranch,
+        RenderableTree,
         colors::{string_to_color, theme},
     },
 };
@@ -158,13 +159,13 @@ fn render(frame: &mut Frame, app: &mut App) {
     // Create the main block with border
     let block = Block::default()
         .title(" git-stack status ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(
-            theme::TREE.0,
-            theme::TREE.1,
-            theme::TREE.2,
-        )));
+        .border_style(Style::default().fg(Color::Rgb(theme::TREE.0, theme::TREE.1, theme::TREE.2)));
 
     let inner_area = block.inner(area);
     frame.render_widget(block, area);
@@ -271,8 +272,8 @@ fn render_branch_item(branch: &RenderableBranch, verbose: bool) -> ListItem<'sta
     }
 
     // PR info (non-verbose mode)
-    if !verbose {
-        if let Some(ref pr) = branch.pr_info {
+    if !verbose
+        && let Some(ref pr) = branch.pr_info {
             let state_color = match pr.state {
                 PrDisplayState::Draft => apply_dim(theme::GRAY, dim),
                 PrDisplayState::Open => apply_dim(theme::GREEN, dim),
@@ -297,9 +298,11 @@ fn render_branch_item(branch: &RenderableBranch, verbose: bool) -> ListItem<'sta
                 Style::default().fg(apply_dim(theme::PR_NUMBER, dim)),
             ));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("[{}]", pr.state), Style::default().fg(state_color)));
+            spans.push(Span::styled(
+                format!("[{}]", pr.state),
+                Style::default().fg(state_color),
+            ));
         }
-    }
 
     ListItem::new(Line::from(spans))
 }
@@ -324,10 +327,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         height: 1,
     };
 
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(help_text),
-        help_area,
-    );
+    frame.render_widget(ratatui::widgets::Paragraph::new(help_text), help_area);
 }
 
 /// Apply dimming to a ThemeColor and convert to ratatui Color.

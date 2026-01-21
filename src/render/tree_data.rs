@@ -345,10 +345,13 @@ fn compute_diff_stats(
     };
 
     base_ref.and_then(|base| {
-        git_repo.diff_stats(&base, &status.sha).ok().map(|(adds, dels)| DiffStats {
-            additions: adds,
-            deletions: dels,
-            reliable: is_reliable,
-        })
+        git_repo
+            .diff_stats(&base, &status.sha)
+            .ok()
+            .map(|(adds, dels)| DiffStats {
+                additions: adds,
+                deletions: dels,
+                reliable: is_reliable,
+            })
     })
 }

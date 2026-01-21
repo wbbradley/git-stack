@@ -24,7 +24,7 @@ mod stats;
 mod sync;
 mod tui;
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, infer_subcommands = true)]
 struct Args {
     #[arg(long, short, global = true, help = "Enable verbose output")]
     verbose: bool,
@@ -52,10 +52,9 @@ enum Command {
         /// Whether to fetch the latest changes from the remote before showing the status.
         #[arg(long, short, default_value_t = false)]
         fetch: bool,
-        /// Launch interactive TUI mode for branch navigation and checkout.
-        #[arg(long, short = 'i', default_value_t = false)]
-        interactive: bool,
     },
+    /// Launch interactive TUI mode for branch navigation and checkout.
+    Interactive,
     /// Open the git-stack state file in an editor for manual editing.
     Edit,
     /// Restack your active branch onto its parent branch.
@@ -352,7 +351,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Mount { parent_branch }) => {
             state.mount(&git_repo, &repo, &current_branch, parent_branch)
         }
-        Some(Command::Status { fetch, interactive }) => {
+        Some(Command::Status { fetch }) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
                 &git_repo,
@@ -361,8 +360,11 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 fetch,
                 args.verbose,
-                interactive,
             )
+        }
+        Some(Command::Interactive) => {
+            state.try_auto_mount(&git_repo, &repo, &current_branch)?;
+            interactive(&git_repo, state, &repo, &current_branch, args.verbose)
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
@@ -419,7 +421,6 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 false,
                 args.verbose,
-                false, // interactive
             )
         }
     }
@@ -501,7 +502,6 @@ fn status(
     orig_branch: &str,
     fetch: bool,
     verbose: bool,
-    interactive: bool,
 ) -> Result<()> {
     if fetch {
         git_fetch()?;
@@ -533,22 +533,58 @@ fn status(
         &display_authors,
     );
 
-    if interactive {
-        // Run TUI and handle checkout if user selected a branch
-        if let Some(branch_to_checkout) = tui::run_tui(renderable, verbose)? {
-            run_git(&["checkout", &branch_to_checkout])?;
-        }
-    } else {
-        // Render to CLI
-        render::render_cli(&renderable, verbose);
+    // Render to CLI
+    render::render_cli(&renderable, verbose);
 
-        if !state.branch_exists_in_tree(repo, orig_branch) {
-            eprintln!(
-                "The current branch {} is not in the stack tree.",
-                orig_branch.red()
-            );
-            eprintln!("Run `git stack mount <parent_branch>` to add it.");
-        }
+    if !state.branch_exists_in_tree(repo, orig_branch) {
+        eprintln!(
+            "The current branch {} is not in the stack tree.",
+            orig_branch.red()
+        );
+        eprintln!("Run `git stack mount <parent_branch>` to add it.");
+    }
+
+    state.save_state()?;
+    Ok(())
+}
+
+fn interactive(
+    git_repo: &GitRepo,
+    mut state: State,
+    repo: &str,
+    orig_branch: &str,
+    verbose: bool,
+) -> Result<()> {
+    // ensure_trunk creates the tree if it doesn't exist (no-op if no remote)
+    let _trunk = state.ensure_trunk(git_repo, repo);
+
+    // Auto-cleanup any missing branches before displaying the tree
+    state.auto_cleanup_missing_branches(git_repo, repo)?;
+
+    // Try to fetch PR info from GitHub (graceful degradation on failure)
+    let pr_cache = fetch_pr_cache(git_repo);
+
+    // Load display_authors for filtering (show other authors dimmed)
+    let display_authors = github::load_display_authors();
+
+    let Some(tree) = state.get_tree(repo) else {
+        println!("No stack configured for this repository.");
+        return Ok(());
+    };
+
+    // Compute renderable tree
+    let renderable = render::compute_renderable_tree(
+        git_repo,
+        tree,
+        orig_branch,
+        verbose,
+        pr_cache.as_ref(),
+        &display_authors,
+    );
+
+    // Run TUI and handle checkout if user selected a branch
+    if let Some(branch_to_checkout) = tui::run_tui(renderable, verbose)? {
+        run_git(&["checkout", &branch_to_checkout])?;
     }
 
     state.save_state()?;
@@ -676,11 +712,7 @@ fn squash_branch(
 }
 
 /// Handle the --continue flag for resuming a squash operation.
-fn handle_squash_continue(
-    git_repo: &GitRepo,
-    state: &mut State,
-    repo: &str,
-) -> Result<()> {
+fn handle_squash_continue(git_repo: &GitRepo, state: &mut State, repo: &str) -> Result<()> {
     let pending = state
         .get_pending_squash(repo)
         .ok_or_else(|| anyhow!("No pending squash operation to continue."))?
@@ -690,7 +722,10 @@ fn handle_squash_continue(
     let status_output = run_git(&["status", "--porcelain"])?;
     let has_conflicts = status_output
         .output()
-        .map(|s| s.lines().any(|line| line.starts_with("UU") || line.starts_with("AA")))
+        .map(|s| {
+            s.lines()
+                .any(|line| line.starts_with("UU") || line.starts_with("AA"))
+        })
         .unwrap_or(false);
 
     if has_conflicts {
@@ -719,11 +754,7 @@ fn handle_squash_continue(
 }
 
 /// Handle the --abort flag for aborting a squash operation.
-fn handle_squash_abort(
-    git_repo: &GitRepo,
-    state: &mut State,
-    repo: &str,
-) -> Result<()> {
+fn handle_squash_abort(git_repo: &GitRepo, state: &mut State, repo: &str) -> Result<()> {
     let pending = state
         .get_pending_squash(repo)
         .ok_or_else(|| anyhow!("No pending squash operation to abort."))?
@@ -1001,8 +1032,7 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
         .get_tree(repo)
         .ok_or_else(|| anyhow!("No stack tree found"))?;
 
-    let trunk =
-        crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
+    let trunk = crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
     // Collect branches with depth for bottom-up processing
     let branches_with_depth = collect_branches_with_depth(tree, &tree.name, 0);
@@ -1228,8 +1258,7 @@ fn handle_import_command(
     }
 
     let client = GitHubClient::from_env(&repo_id)?;
-    let trunk =
-        crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
+    let trunk = crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
     // Ensure trunk exists in tree
     state.ensure_trunk(git_repo, repo);
@@ -1533,8 +1562,8 @@ fn handle_pr_command(
             state.try_auto_mount(git_repo, repo, &branch_name)?;
 
             // Check if this is the trunk branch (can't create PR for main)
-            let trunk = crate::git::git_trunk(git_repo)
-                .ok_or_else(|| anyhow!("No remote configured"))?;
+            let trunk =
+                crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
             if branch_name == trunk.main_branch {
                 bail!(
                     "Cannot create a PR for the trunk branch '{}'.",
@@ -1706,8 +1735,8 @@ fn handle_pr_command(
         PrAction::Sync { all, dry_run } => {
             use github::UpdatePrRequest;
 
-            let trunk = crate::git::git_trunk(git_repo)
-                .ok_or_else(|| anyhow!("No remote configured"))?;
+            let trunk =
+                crate::git::git_trunk(git_repo).ok_or_else(|| anyhow!("No remote configured"))?;
 
             // Get branches to sync with depth for bottom-up processing
             let branches_to_sync: Vec<(String, String, usize)> = if all {

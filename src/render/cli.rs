@@ -3,7 +3,7 @@
 use colored::Colorize;
 
 use super::{
-    colors::{string_to_color, theme, ThemeColor},
+    colors::{ThemeColor, string_to_color, theme},
     tree_data::{RenderableBranch, RenderableTree},
 };
 use crate::github::PrDisplayState;
@@ -72,35 +72,43 @@ fn render_branch(branch: &RenderableBranch, verbose: bool) {
     };
 
     // Diff stats
-    let diff_stats = branch.diff_stats.as_ref().map(|ds| {
-        let green = theme::GREEN.apply_dim(dim);
-        let red = theme::RED.apply_dim(dim);
-        let prefix = if ds.reliable { "" } else { "~ " };
-        format!(
-            " [{}{}{}]",
-            prefix,
-            apply_color(&format!("+{}", ds.additions), green),
-            apply_color(&format!(" -{}", ds.deletions), red)
-        )
-    }).unwrap_or_default();
+    let diff_stats = branch
+        .diff_stats
+        .as_ref()
+        .map(|ds| {
+            let green = theme::GREEN.apply_dim(dim);
+            let red = theme::RED.apply_dim(dim);
+            let prefix = if ds.reliable { "" } else { "~ " };
+            format!(
+                " [{}{}{}]",
+                prefix,
+                apply_color(&format!("+{}", ds.additions), green),
+                apply_color(&format!(" -{}", ds.deletions), red)
+            )
+        })
+        .unwrap_or_default();
 
     // Local status
-    let local_status = branch.local_status.as_ref().map(|ls| {
-        let mut parts = Vec::new();
-        let green = theme::GREEN.apply_dim(dim);
-        let yellow = theme::YELLOW.apply_dim(dim);
-        let gray = theme::GRAY.apply_dim(dim);
-        if ls.staged > 0 {
-            parts.push(apply_color(&format!("+{}", ls.staged), green).to_string());
-        }
-        if ls.unstaged > 0 {
-            parts.push(apply_color(&format!("~{}", ls.unstaged), yellow).to_string());
-        }
-        if ls.untracked > 0 {
-            parts.push(apply_color(&format!("?{}", ls.untracked), gray).to_string());
-        }
-        format!(" [{}]", parts.join(" "))
-    }).unwrap_or_default();
+    let local_status = branch
+        .local_status
+        .as_ref()
+        .map(|ls| {
+            let mut parts = Vec::new();
+            let green = theme::GREEN.apply_dim(dim);
+            let yellow = theme::YELLOW.apply_dim(dim);
+            let gray = theme::GRAY.apply_dim(dim);
+            if ls.staged > 0 {
+                parts.push(apply_color(&format!("+{}", ls.staged), green).to_string());
+            }
+            if ls.unstaged > 0 {
+                parts.push(apply_color(&format!("~{}", ls.unstaged), yellow).to_string());
+            }
+            if ls.untracked > 0 {
+                parts.push(apply_color(&format!("?{}", ls.untracked), gray).to_string());
+            }
+            format!(" [{}]", parts.join(" "))
+        })
+        .unwrap_or_default();
 
     if verbose {
         render_verbose_line(branch, &branch_name, &diff_stats, &local_status, dim);
@@ -117,34 +125,38 @@ fn render_simple_line(
     dim: f32,
 ) {
     // PR info
-    let pr_info = branch.pr_info.as_ref().map(|pr| {
-        let gray = theme::GRAY.apply_dim(dim);
-        let green = theme::GREEN.apply_dim(dim);
-        let purple = theme::PURPLE.apply_dim(dim);
-        let red = theme::RED.apply_dim(dim);
+    let pr_info = branch
+        .pr_info
+        .as_ref()
+        .map(|pr| {
+            let gray = theme::GRAY.apply_dim(dim);
+            let green = theme::GREEN.apply_dim(dim);
+            let purple = theme::PURPLE.apply_dim(dim);
+            let red = theme::RED.apply_dim(dim);
 
-        let state_colored = match pr.state {
-            PrDisplayState::Draft => apply_color(&format!("[{}]", pr.state), gray),
-            PrDisplayState::Open => apply_color(&format!("[{}]", pr.state), green),
-            PrDisplayState::Merged => apply_color(&format!("[{}]", pr.state), purple),
-            PrDisplayState::Closed => apply_color(&format!("[{}]", pr.state), red),
-        };
+            let state_colored = match pr.state {
+                PrDisplayState::Draft => apply_color(&format!("[{}]", pr.state), gray),
+                PrDisplayState::Open => apply_color(&format!("[{}]", pr.state), green),
+                PrDisplayState::Merged => apply_color(&format!("[{}]", pr.state), purple),
+                PrDisplayState::Closed => apply_color(&format!("[{}]", pr.state), red),
+            };
 
-        let author_color = string_to_color(&pr.author).apply_dim(dim);
-        let author_colored = apply_color(&format!("@{}", pr.author), author_color);
+            let author_color = string_to_color(&pr.author).apply_dim(dim);
+            let author_colored = apply_color(&format!("@{}", pr.author), author_color);
 
-        let pr_num = theme::PR_NUMBER.apply_dim(dim);
-        let number_colored = apply_color(&format!("#{}", pr.number), pr_num);
+            let pr_num = theme::PR_NUMBER.apply_dim(dim);
+            let number_colored = apply_color(&format!("#{}", pr.number), pr_num);
 
-        let arrow = theme::PR_ARROW.apply_dim(dim);
-        format!(
-            " {} {} {} {}",
-            apply_color("", arrow),
-            author_colored,
-            number_colored,
-            state_colored
-        )
-    }).unwrap_or_default();
+            let arrow = theme::PR_ARROW.apply_dim(dim);
+            format!(
+                " {} {} {} {}",
+                apply_color("", arrow),
+                author_colored,
+                number_colored,
+                state_colored
+            )
+        })
+        .unwrap_or_default();
 
     println!("{}{}{}{}", branch_name, diff_stats, local_status, pr_info);
 }
@@ -215,13 +227,17 @@ fn render_verbose_line(
     };
 
     // LKG parent
-    let lkg_info = branch.verbose.as_ref()
+    let lkg_info = branch
+        .verbose
+        .as_ref()
         .and_then(|v| v.lkg_parent.as_ref())
         .map(|lkg| format!(" (lkg parent {})", apply_color(lkg, gold)))
         .unwrap_or_default();
 
     // Stack method
-    let method_info = branch.verbose.as_ref()
+    let method_info = branch
+        .verbose
+        .as_ref()
         .map(|v| {
             let method_color = theme::GREEN.apply_dim(dim);
             format!(" ({})", apply_color(&v.stack_method, method_color))
@@ -251,10 +267,6 @@ fn render_verbose_line(
         } else {
             note.blue()
         };
-        println!(
-            "  {} {}",
-            apply_color("›", theme::TREE),
-            note_display
-        );
+        println!("  {} {}", apply_color("›", theme::TREE), note_display);
     }
 }

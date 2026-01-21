@@ -631,14 +631,13 @@ impl State {
     ) -> Result<()> {
         let trunk = self.ensure_trunk(git_repo, repo);
 
-        if let Some(ref trunk) = trunk {
-            if trunk.main_branch == branch_name {
+        if let Some(ref trunk) = trunk
+            && trunk.main_branch == branch_name {
                 bail!(
                     "Branch {branch_name} cannot be stacked on anything else.",
                     branch_name = branch_name.red()
                 );
             }
-        }
 
         let parent_branch = parent_branch
             .or_else(|| trunk.map(|t| t.main_branch))
