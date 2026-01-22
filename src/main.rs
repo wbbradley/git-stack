@@ -56,6 +56,10 @@ enum Command {
     },
     /// Launch interactive TUI mode for branch navigation and checkout.
     Interactive,
+    /// Move up the stack to the parent branch.
+    Up,
+    /// Move down the stack to a child branch (only if there's exactly one child).
+    Down,
     /// Open the git-stack state file in an editor for manual editing.
     Edit,
     /// Restack your active branch onto its parent branch.
@@ -370,6 +374,14 @@ fn inner_main() -> Result<()> {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             interactive(&git_repo, state, &repo, &current_branch, args.verbose)
         }
+        Some(Command::Up) => {
+            state.try_auto_mount(&git_repo, &repo, &current_branch)?;
+            navigate_up(&state, &repo, &current_branch)
+        }
+        Some(Command::Down) => {
+            state.try_auto_mount(&git_repo, &repo, &current_branch)?;
+            navigate_down(&state, &repo, &current_branch)
+        }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
             state.cleanup_missing_branches(&git_repo, &repo, dry_run, all)
@@ -590,6 +602,60 @@ fn interactive(
 
     state.save_state()?;
     Ok(())
+}
+
+/// Navigate up the stack to the parent branch.
+fn navigate_up(state: &State, repo: &str, current_branch: &str) -> Result<()> {
+    let parent = state.get_parent_branch_of(repo, current_branch);
+
+    match parent {
+        Some(parent_branch) => {
+            run_git(&["checkout", &parent_branch.name])?;
+            Ok(())
+        }
+        None => {
+            bail!(
+                "Branch '{}' has no parent in the stack (already at root).",
+                current_branch.yellow()
+            );
+        }
+    }
+}
+
+/// Navigate down the stack to a child branch.
+fn navigate_down(state: &State, repo: &str, current_branch: &str) -> Result<()> {
+    let branch = state.get_tree_branch(repo, current_branch);
+
+    match branch {
+        Some(branch) => {
+            let children = &branch.branches;
+            match children.len() {
+                0 => {
+                    bail!(
+                        "Branch '{}' has no children in the stack.",
+                        current_branch.yellow()
+                    );
+                }
+                1 => {
+                    run_git(&["checkout", &children[0].name])?;
+                    Ok(())
+                }
+                n => {
+                    bail!(
+                        "Branch '{}' has {} children. Use `git stack interactive` to choose.",
+                        current_branch.yellow(),
+                        n
+                    );
+                }
+            }
+        }
+        None => {
+            bail!(
+                "Branch '{}' not found in the stack.",
+                current_branch.yellow()
+            );
+        }
+    }
 }
 
 /// Get concatenated commit messages between ancestor and branch tip.
