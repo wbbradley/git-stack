@@ -357,7 +357,35 @@ fn inner_main() -> Result<()> {
             )
         }
         Some(Command::Mount { parent_branch }) => {
-            state.mount(&git_repo, &repo, &current_branch, parent_branch)
+            state.mount(&git_repo, &repo, &current_branch, parent_branch.clone())?;
+
+            // If this branch has a PR, retarget its base to the new parent
+            let effective_parent =
+                parent_branch.or_else(|| git::git_trunk(&git_repo).map(|t| t.main_branch));
+            if let Some(parent) = effective_parent
+                && let Some(branch) = state.get_tree_branch(&repo, &current_branch)
+                && let Some(pr_number) = branch.pr_number
+                && let Ok(repo_id) = github::get_repo_identifier(&git_repo)
+                    && let Ok(client) = github::GitHubClient::from_env(&repo_id)
+                {
+                    match client.update_pr(
+                        &repo_id,
+                        pr_number,
+                        github::UpdatePrRequest {
+                            base: Some(&parent),
+                            title: None,
+                            body: None,
+                        },
+                    ) {
+                        Ok(_) => {
+                            println!("Retargeted PR #{} base to '{}'.", pr_number, parent);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to retarget PR #{pr_number}: {e}");
+                        }
+                    }
+                }
+            Ok(())
         }
         Some(Command::Status { fetch }) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
