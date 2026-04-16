@@ -366,25 +366,25 @@ fn inner_main() -> Result<()> {
                 && let Some(branch) = state.get_tree_branch(&repo, &current_branch)
                 && let Some(pr_number) = branch.pr_number
                 && let Ok(repo_id) = github::get_repo_identifier(&git_repo)
-                    && let Ok(client) = github::GitHubClient::from_env(&repo_id)
-                {
-                    match client.update_pr(
-                        &repo_id,
-                        pr_number,
-                        github::UpdatePrRequest {
-                            base: Some(&parent),
-                            title: None,
-                            body: None,
-                        },
-                    ) {
-                        Ok(_) => {
-                            println!("Retargeted PR #{} base to '{}'.", pr_number, parent);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to retarget PR #{pr_number}: {e}");
-                        }
+                && let Ok(client) = github::GitHubClient::from_env(&repo_id)
+            {
+                match client.update_pr(
+                    &repo_id,
+                    pr_number,
+                    github::UpdatePrRequest {
+                        base: Some(&parent),
+                        title: None,
+                        body: None,
+                    },
+                ) {
+                    Ok(_) => {
+                        println!("Retargeted PR #{} base to '{}'.", pr_number, parent);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to retarget PR #{pr_number}: {e}");
                     }
                 }
+            }
             Ok(())
         }
         Some(Command::Status { fetch }) => {
@@ -981,21 +981,18 @@ fn restack(
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
-                run_git(&[
-                    "push",
-                    match branch.stack_method {
-                        StackMethod::ApplyMerge => {
-                            tracing::debug!(
-                                "Force-pushing '{}' to {DEFAULT_REMOTE}...",
-                                branch.name
-                            );
-                            "-fu"
-                        }
-                        StackMethod::Merge => "-u",
-                    },
-                    DEFAULT_REMOTE,
-                    &format!("{branch_name}:{branch_name}", branch_name = branch.name),
-                ])?;
+                let refspec = format!("{branch_name}:{branch_name}", branch_name = branch.name);
+                let mut args = vec!["push", "-u"];
+                if matches!(branch.stack_method, StackMethod::ApplyMerge) {
+                    tracing::debug!(
+                        "Force-pushing (with lease) '{}' to {DEFAULT_REMOTE}...",
+                        branch.name
+                    );
+                    args.push("--force-with-lease");
+                }
+                args.push(DEFAULT_REMOTE);
+                args.push(&refspec);
+                run_git(&args)?;
                 pushed_branches.push(branch.name.clone());
                 status = "no changes, pushed".to_string();
             }
@@ -1320,7 +1317,8 @@ fn git_push(git_repo: &GitRepo, branch: &str) -> Result<()> {
     if !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch), branch) {
         run_git(&[
             "push",
-            "-fu",
+            "-u",
+            "--force-with-lease",
             DEFAULT_REMOTE,
             &format!("{}:{}", branch, branch),
         ])?;

@@ -1436,7 +1436,8 @@ fn apply_remote_change(
             println!("  Pushing '{}' to remote", branch.yellow());
             run_git(&[
                 "push",
-                "-fu",
+                "-u",
+                "--force-with-lease",
                 DEFAULT_REMOTE,
                 &format!("{}:{}", branch, branch),
             ])?;
