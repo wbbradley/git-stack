@@ -682,6 +682,32 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
 
 // ============== Stage 3: Diff Functions ==============
 
+/// Walk up the parent chain from `branch`, skipping ancestors that are themselves
+/// being unmounted, and return the first surviving ancestor (falling back to
+/// `trunk` when we run off the top of the chain).
+fn resolve_repoint(
+    branch: &str,
+    branches: &HashMap<String, LocalBranch>,
+    trunk: &str,
+    unmount_set: &HashSet<String>,
+) -> String {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut candidate: Option<String> = branches.get(branch).and_then(|b| b.parent.clone());
+
+    while let Some(name) = candidate {
+        if name == trunk || !unmount_set.contains(&name) {
+            return name;
+        }
+        if !visited.insert(name.clone()) {
+            // Cycle guard (shouldn't happen in a well-formed tree).
+            return trunk.to_string();
+        }
+        candidate = branches.get(&name).and_then(|b| b.parent.clone());
+    }
+
+    trunk.to_string()
+}
+
 /// Compute the sync plan by diffing current state against target
 fn compute_sync_plan(
     git_repo: &GitRepo,
@@ -807,7 +833,6 @@ fn compute_sync_plan(
 
     // Detect merged/closed PRs and handle unmounting (pull direction)
     // This runs regardless of push_only/pull_only since it's about reconciling state
-    let mut branches_to_unmount: Vec<(String, String)> = Vec::new(); // (branch, repoint_to)
     let mut branches_to_delete: Vec<String> = Vec::new();
 
     tracing::debug!(
@@ -816,53 +841,60 @@ fn compute_sync_plan(
         remote.closed_prs.keys().collect::<Vec<_>>()
     );
 
-    for (branch_name, local_branch) in &local.branches {
-        // Skip trunk
+    // First pass: collect the raw set of branches to unmount (eligible by closed PR).
+    let mut unmount_set: HashSet<String> = HashSet::new();
+    for branch_name in local.branches.keys() {
         if branch_name == &local.trunk {
             continue;
         }
-
-        // Check if this branch has a merged/closed PR but no open PR
         if !remote.prs.contains_key(branch_name)
             && let Some(closed_pr) = remote.closed_prs.get(branch_name)
-        {
-            tracing::debug!(
-                "Branch '{}' has closed PR #{} with state {:?}",
-                branch_name,
-                closed_pr.number,
-                closed_pr.state
-            );
-
-            // Any closed PR (merged or just closed) should unmount from git-stack
-            if matches!(
+            && matches!(
                 closed_pr.state,
                 RemotePrState::Merged | RemotePrState::Closed
-            ) {
-                // This branch's PR was merged/closed - it should be unmounted
-                // Children should be repointed to this branch's parent
-                let repoint_to = local_branch
-                    .parent
-                    .clone()
-                    .unwrap_or_else(|| local.trunk.clone());
-                branches_to_unmount.push((branch_name.clone(), repoint_to));
+            )
+        {
+            unmount_set.insert(branch_name.clone());
+        }
+    }
 
-                // Determine if local branch is safe to delete
-                // Safe if: merged, OR (closed AND remote exists AND local is ancestor of remote)
-                let safe_to_delete = if closed_pr.state == RemotePrState::Merged {
-                    true
-                } else {
-                    // Closed but not merged - check if remote has our work
-                    let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
-                    git_repo.ref_exists(&remote_ref)
-                        && git_repo
-                            .is_ancestor(branch_name, &remote_ref)
-                            .unwrap_or(false)
-                };
+    // Second pass: emit unmount entries with transitively-resolved repoint targets,
+    // and compute safe-to-delete.
+    let mut branches_to_unmount: Vec<(String, String)> = Vec::new(); // (branch, repoint_to)
+    for branch_name in local.branches.keys() {
+        if !unmount_set.contains(branch_name) {
+            continue;
+        }
+        let closed_pr = remote
+            .closed_prs
+            .get(branch_name)
+            .expect("unmount_set membership implies closed PR");
 
-                if safe_to_delete {
-                    branches_to_delete.push(branch_name.clone());
-                }
-            }
+        tracing::debug!(
+            "Branch '{}' has closed PR #{} with state {:?}",
+            branch_name,
+            closed_pr.number,
+            closed_pr.state
+        );
+
+        let repoint_to = resolve_repoint(branch_name, &local.branches, &local.trunk, &unmount_set);
+        branches_to_unmount.push((branch_name.clone(), repoint_to));
+
+        // Determine if local branch is safe to delete
+        // Safe if: merged, OR (closed AND remote exists AND local is ancestor of remote)
+        let safe_to_delete = if closed_pr.state == RemotePrState::Merged {
+            true
+        } else {
+            // Closed but not merged - check if remote has our work
+            let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+            git_repo.ref_exists(&remote_ref)
+                && git_repo
+                    .is_ancestor(branch_name, &remote_ref)
+                    .unwrap_or(false)
+        };
+
+        if safe_to_delete {
+            branches_to_delete.push(branch_name.clone());
         }
     }
 
@@ -1566,4 +1598,75 @@ fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a m
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lb(parent: Option<&str>) -> LocalBranch {
+        LocalBranch {
+            parent: parent.map(String::from),
+            pr_number: None,
+            pushed_to_remote: true,
+        }
+    }
+
+    #[test]
+    fn resolve_repoint_skips_chain_of_unmounted_ancestors() {
+        // Two chains on top of main, all closed-PR → all in unmount_set.
+        //
+        //   main ← grpc-level-08 ← grpc-level-09 ← grpc-level-10 (leaf)
+        //   main ← sadhan/09     ← sadhan/12     ← sadhan/15    ← sadhan/17
+        let trunk = "main".to_string();
+        let mut branches: HashMap<String, LocalBranch> = HashMap::new();
+        branches.insert("grpc-level-08".into(), lb(Some("main")));
+        branches.insert("grpc-level-09".into(), lb(Some("grpc-level-08")));
+        branches.insert("grpc-level-10".into(), lb(Some("grpc-level-09")));
+        branches.insert("sadhan/09".into(), lb(Some("main")));
+        branches.insert("sadhan/12".into(), lb(Some("sadhan/09")));
+        branches.insert("sadhan/15".into(), lb(Some("sadhan/12")));
+        branches.insert("sadhan/17".into(), lb(Some("sadhan/15")));
+
+        let unmount_set: HashSet<String> = branches.keys().cloned().collect();
+
+        for branch in branches.keys() {
+            let got = resolve_repoint(branch, &branches, &trunk, &unmount_set);
+            assert_eq!(
+                got, trunk,
+                "branch '{branch}' should resolve past all unmounted ancestors to trunk, got '{got}'"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_repoint_stops_at_first_surviving_ancestor() {
+        // main ← A (live) ← B (unmount) ← C (unmount) ← D (leaf, unmount)
+        // D, C, B are being unmounted; A survives.
+        // Expected: D and C and B all repoint to A.
+        let trunk = "main".to_string();
+        let mut branches: HashMap<String, LocalBranch> = HashMap::new();
+        branches.insert("A".into(), lb(Some("main")));
+        branches.insert("B".into(), lb(Some("A")));
+        branches.insert("C".into(), lb(Some("B")));
+        branches.insert("D".into(), lb(Some("C")));
+
+        let unmount_set: HashSet<String> = ["B", "C", "D"].iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(resolve_repoint("D", &branches, &trunk, &unmount_set), "A");
+        assert_eq!(resolve_repoint("C", &branches, &trunk, &unmount_set), "A");
+        assert_eq!(resolve_repoint("B", &branches, &trunk, &unmount_set), "A");
+    }
+
+    #[test]
+    fn resolve_repoint_falls_back_to_trunk_when_no_parent() {
+        let trunk = "main".to_string();
+        let mut branches: HashMap<String, LocalBranch> = HashMap::new();
+        branches.insert("orphan".into(), lb(None));
+        let unmount_set: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_repoint("orphan", &branches, &trunk, &unmount_set),
+            trunk
+        );
+    }
 }
