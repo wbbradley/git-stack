@@ -1360,13 +1360,20 @@ fn apply_local_change(
             // Remove from git-stack tree ONLY if the remote is also gone
             // For AncestorOfRemote, we keep the branch in tree since remote still exists
             if !matches!(reason, DeleteReason::AncestorOfRemote) {
-                let repoint_to = state
-                    .get_parent_branch_of(repo, name)
-                    .map(|p| p.name.clone())
-                    .or_else(|| state.get_tree(repo).map(|t| t.name.clone()))
-                    .unwrap_or_else(|| "main".to_string());
-                unmount_branch_from_tree(git_repo, state, repo, name, &repoint_to)?;
-                println!("    Removed '{}' from git-stack tree.", name);
+                // A prior UnmountBranch in the same plan may have already removed it.
+                let still_in_tree = state
+                    .get_tree(repo)
+                    .and_then(|t| find_branch_by_name(t, name))
+                    .is_some();
+                if still_in_tree {
+                    let repoint_to = state
+                        .get_parent_branch_of(repo, name)
+                        .map(|p| p.name.clone())
+                        .or_else(|| state.get_tree(repo).map(|t| t.name.clone()))
+                        .unwrap_or_else(|| "main".to_string());
+                    unmount_branch_from_tree(git_repo, state, repo, name, &repoint_to)?;
+                    println!("    Removed '{}' from git-stack tree.", name);
+                }
             }
         }
     }
