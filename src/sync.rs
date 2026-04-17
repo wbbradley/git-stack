@@ -22,7 +22,6 @@ use crate::{
     git::{git_trunk, run_git},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
-        CreatePrRequest,
         GitHubClient,
         PrState,
         PullRequest,
@@ -160,12 +159,6 @@ pub enum LocalChange {
 /// Changes to apply to remote state (GitHub)
 #[derive(Debug, Clone)]
 pub enum RemoteChange {
-    /// Create a new PR
-    CreatePr {
-        branch: String,
-        base: String,
-        title: String,
-    },
     /// Retarget a PR to a different base
     RetargetPr {
         number: u64,
@@ -986,11 +979,8 @@ fn compute_sync_plan(
                         new_base: expected_base.clone(),
                     });
                 }
-                // No open PR but branch is pushed - don't auto-create PRs
-                // Users should create PRs explicitly with `git stack pr`
-                (None, Some(_expected_base)) => {
-                    continue;
-                }
+                // No open PR: don't auto-create PRs during sync.
+                // Users create PRs explicitly with `git stack pr`.
                 _ => {}
             }
         }
@@ -1236,9 +1226,9 @@ fn apply_plan(
     // Save state after local changes
     state.save_state()?;
 
-    // Apply remote changes (create PRs, retarget)
+    // Apply remote changes (retarget PRs, push intermediate branches)
     for change in &plan.remote_changes {
-        apply_remote_change(git_repo, state, repo, client, repo_id, change)?;
+        apply_remote_change(client, repo_id, change)?;
     }
 
     // Save state again if PR numbers were updated
@@ -1385,59 +1375,11 @@ fn apply_local_change(
 
 /// Apply a single remote change
 fn apply_remote_change(
-    git_repo: &GitRepo,
-    state: &mut State,
-    repo: &str,
     client: &GitHubClient,
     repo_id: &RepoIdentifier,
     change: &RemoteChange,
 ) -> Result<()> {
     match change {
-        RemoteChange::CreatePr {
-            branch,
-            base,
-            title,
-        } => {
-            println!(
-                "  Creating PR for '{}' (base: '{}')",
-                branch.yellow(),
-                base.green()
-            );
-
-            // Get a better title from the first commit
-            // Use --no-show-signature to avoid GPG signature output polluting the title
-            let commit_title =
-                run_git(&["log", "--no-show-signature", "--format=%s", "-1", branch])
-                    .ok()
-                    .and_then(|r| r.output())
-                    .unwrap_or_else(|| title.clone());
-
-            let pr = client
-                .create_pr(
-                    repo_id,
-                    CreatePrRequest {
-                        title: &commit_title,
-                        body: "",
-                        head: branch,
-                        base,
-                        draft: Some(true),
-                    },
-                )
-                .map_err(|e| anyhow!("{}", e))?;
-
-            println!(
-                "    Created PR #{}: {}",
-                pr.number.to_string().green(),
-                pr.html_url.blue()
-            );
-
-            // Update the cached PR number
-            if let Some(tree) = state.get_tree_mut(repo)
-                && let Some(b) = find_branch_by_name_mut(tree, branch)
-            {
-                b.pr_number = Some(pr.number);
-            }
-        }
         RemoteChange::RetargetPr {
             number,
             branch,
@@ -1538,13 +1480,6 @@ fn print_plan(plan: &SyncPlan, dry_run: bool) {
         println!("  Remote changes:");
         for change in &plan.remote_changes {
             match change {
-                RemoteChange::CreatePr { branch, base, .. } => {
-                    println!(
-                        "    - Create PR for '{}' (base: '{}')",
-                        branch.yellow(),
-                        base.green()
-                    );
-                }
                 RemoteChange::RetargetPr {
                     number,
                     branch,
