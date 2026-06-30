@@ -207,11 +207,22 @@ enum PrAction {
 #[derive(Subcommand)]
 enum AuthAction {
     /// Set up GitHub authentication interactively.
-    Login,
+    Login {
+        /// Force the paste-a-token flow (skip the browser OAuth menu).
+        #[arg(long)]
+        pat: bool,
+    },
     /// Show current auth status.
     Status,
     /// Remove stored authentication.
-    Logout,
+    Logout {
+        /// Clear only the OAuth token.
+        #[arg(long)]
+        oauth: bool,
+        /// Clear only the PAT (default_token).
+        #[arg(long)]
+        pat: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1340,16 +1351,19 @@ fn handle_pr_command(
         GitHubClient,
         get_repo_identifier,
         has_github_token,
+        login_interactive,
         open_in_browser,
-        setup_github_token_interactive,
     };
 
     let repo_id = get_repo_identifier(git_repo)?;
 
     // Ensure we have auth configured
     if !has_github_token(&repo_id.host) {
-        println!("{}", "GitHub authentication required (needs a Personal Access Token with the 'repo' scope).".yellow());
-        setup_github_token_interactive()?;
+        println!(
+            "{}",
+            "GitHub authentication required (needs the 'repo' scope).".yellow()
+        );
+        login_interactive()?;
     }
 
     let client = GitHubClient::from_env(&repo_id)?;
@@ -1692,15 +1706,21 @@ fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a m
 
 fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
     use github::{
+        AuthSource,
+        clear_github_tokens,
+        find_auth_source,
         get_repo_identifier,
-        has_github_token,
-        save_github_token,
+        login_interactive,
         setup_github_token_interactive,
     };
 
     match action {
-        AuthAction::Login => {
-            setup_github_token_interactive()?;
+        AuthAction::Login { pat } => {
+            if pat {
+                setup_github_token_interactive()?;
+            } else {
+                login_interactive()?;
+            }
             println!(
                 "{}",
                 "GitHub authentication configured successfully.".green()
@@ -1713,27 +1733,40 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
                 .map(|r| r.host)
                 .unwrap_or_else(|_| "github.com".to_string());
 
-            if has_github_token(&host) {
-                println!("{}", "GitHub token is configured.".green());
-            } else {
-                println!("{}", "No GitHub token configured.".yellow());
-                println!("Run `git stack auth login` to set up authentication.");
+            match find_auth_source(&host) {
+                Some(source) => {
+                    let desc = match source {
+                        AuthSource::EnvGithubToken => {
+                            "GITHUB_TOKEN environment variable".to_string()
+                        }
+                        AuthSource::EnvGhToken => "GH_TOKEN environment variable".to_string(),
+                        AuthSource::GitConfig => "git config (github.token)".to_string(),
+                        AuthSource::ConfigHostToken => {
+                            "config file (host-specific token)".to_string()
+                        }
+                        AuthSource::ConfigDefaultToken => {
+                            "config file (personal access token)".to_string()
+                        }
+                        AuthSource::ConfigOauth { scope } => match scope {
+                            Some(s) => format!("config file (OAuth, scope: {s})"),
+                            None => "config file (OAuth)".to_string(),
+                        },
+                    };
+                    println!(
+                        "{} Active method: {}.",
+                        "GitHub token is configured.".green(),
+                        desc
+                    );
+                }
+                None => {
+                    println!("{}", "No GitHub token configured.".yellow());
+                    println!("Run `git stack auth login` to set up authentication.");
+                }
             }
             Ok(())
         }
-        AuthAction::Logout => {
-            // Remove the config file
-            let base_dirs = xdg::BaseDirectories::with_prefix("git-stack");
-            if let Ok(config_path) = base_dirs.get_config_file("github.yaml").ok_or(()) {
-                if config_path.exists() {
-                    std::fs::remove_file(&config_path)?;
-                    println!("GitHub token removed from {}", config_path.display());
-                } else {
-                    println!("No stored GitHub token found.");
-                }
-            } else {
-                println!("No stored GitHub token found.");
-            }
+        AuthAction::Logout { oauth, pat } => {
+            clear_github_tokens(oauth, pat)?;
             println!(
                 "Note: Tokens in environment variables (GITHUB_TOKEN, GH_TOKEN) or git config are not affected."
             );

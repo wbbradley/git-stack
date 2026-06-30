@@ -762,20 +762,25 @@ pub fn load_display_authors() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Find GitHub token and config from various sources
-fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> {
-    let config_file = load_github_config_file();
-    let display_authors = config_file
-        .as_ref()
-        .map(|c| c.display_authors.clone())
-        .unwrap_or_default();
+/// Where the active GitHub token was resolved from. PATs win over OAuth.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthSource {
+    EnvGithubToken,
+    EnvGhToken,
+    GitConfig,
+    ConfigHostToken,
+    ConfigDefaultToken, // classic/fine-grained PAT
+    ConfigOauth { scope: Option<String> },
+}
 
+/// Resolve the active token and where it came from (PAT-wins order).
+fn resolve_github_auth(host: &str) -> Option<(String, AuthSource)> {
     // 1. Check GITHUB_TOKEN env var
     if let Ok(token) = std::env::var("GITHUB_TOKEN")
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GITHUB_TOKEN env var");
-        return Ok((token, display_authors));
+        return Some((token, AuthSource::EnvGithubToken));
     }
 
     // 2. Check GH_TOKEN env var (used by gh CLI)
@@ -783,7 +788,7 @@ fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> 
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GH_TOKEN env var");
-        return Ok((token, display_authors));
+        return Some((token, AuthSource::EnvGhToken));
     }
 
     // 3. Check git config github.token
@@ -795,27 +800,51 @@ fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> 
         let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !token.is_empty() {
             tracing::debug!("Using GitHub token from git config");
-            return Ok((token, display_authors));
+            return Some((token, AuthSource::GitConfig));
         }
     }
 
-    // 4. Check XDG config file for token
-    if let Some(config) = config_file {
-        // Check for host-specific token first
+    // 4-6. Check XDG config file for tokens
+    if let Some(config) = load_github_config_file() {
+        // 4. Host-specific token first
         if let Some(hosts) = &config.hosts
             && let Some(token) = hosts.get(host)
         {
             tracing::debug!("Using GitHub token from config file (host-specific)");
-            return Ok((token.clone(), display_authors));
+            return Some((token.clone(), AuthSource::ConfigHostToken));
         }
-        // Fall back to default token
+        // 5. Default token (PAT) wins over OAuth
         if let Some(token) = config.default_token {
             tracing::debug!("Using GitHub token from config file (default)");
-            return Ok((token, display_authors));
+            return Some((token, AuthSource::ConfigDefaultToken));
+        }
+        // 6. OAuth device-flow token
+        if let Some(token) = config.oauth_token {
+            tracing::debug!("Using GitHub token from config file (oauth)");
+            return Some((
+                token,
+                AuthSource::ConfigOauth {
+                    scope: config.oauth_scope,
+                },
+            ));
         }
     }
 
-    Err(GitHubError::NoToken)
+    None
+}
+
+/// Report the active auth method for `auth status` (no token leaked).
+pub fn find_auth_source(host: &str) -> Option<AuthSource> {
+    resolve_github_auth(host).map(|(_, src)| src)
+}
+
+/// Find GitHub token and config from various sources
+fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> {
+    let display_authors = load_display_authors();
+    match resolve_github_auth(host) {
+        Some((token, _)) => Ok((token, display_authors)),
+        None => Err(GitHubError::NoToken),
+    }
 }
 
 /// GitHub config file structure
@@ -827,6 +856,12 @@ struct GitHubConfigFile {
     /// When set, PRs from other authors will be shown dimmed/collapsed.
     #[serde(default)]
     display_authors: Vec<String>,
+    /// OAuth device-flow token (distinct from `default_token`, which holds a PAT).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_token: Option<String>,
+    /// Scope granted to the OAuth token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_scope: Option<String>,
 }
 
 /// Get path to GitHub config file
@@ -855,6 +890,59 @@ pub fn save_github_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Save an OAuth device-flow token to the config file.
+///
+/// Writes only the OAuth fields; `default_token` (a PAT) is never touched.
+pub fn save_github_oauth_token(token: &str, scope: &str) -> Result<()> {
+    let base_dirs = xdg::BaseDirectories::with_prefix("git-stack");
+    let config_path = base_dirs
+        .place_config_file("github.yaml")
+        .context("Failed to create config directory")?;
+
+    // Load existing config to preserve other settings (PAT, display_authors).
+    let mut config = load_github_config_file().unwrap_or_default();
+    config.oauth_token = Some(token.to_string());
+    config.oauth_scope = Some(scope.to_string());
+
+    let contents = serde_yaml::to_string(&config)?;
+    write_file_secure(&config_path, &contents)?;
+
+    println!("OAuth token saved to {}", config_path.display());
+    Ok(())
+}
+
+/// Clear stored tokens from the config file.
+///
+/// Clears OAuth and/or PAT (`default_token`) per the flags; when neither flag
+/// is set, both are cleared. `display_authors` and other settings are preserved.
+pub fn clear_github_tokens(oauth: bool, pat: bool) -> Result<()> {
+    let config_path = get_github_config_path()?;
+    let Some(mut config) = load_github_config_file() else {
+        println!("No stored GitHub token found.");
+        return Ok(());
+    };
+
+    // When no selector is given, clear both.
+    let (clear_oauth, clear_pat) = if !oauth && !pat {
+        (true, true)
+    } else {
+        (oauth, pat)
+    };
+
+    if clear_oauth {
+        config.oauth_token = None;
+        config.oauth_scope = None;
+    }
+    if clear_pat {
+        config.default_token = None;
+    }
+
+    let contents = serde_yaml::to_string(&config)?;
+    write_file_secure(&config_path, &contents)?;
+    println!("Cleared stored token(s) in {}", config_path.display());
+    Ok(())
+}
+
 /// Check if GitHub token is configured
 pub fn has_github_token(host: &str) -> bool {
     find_github_config(host).is_ok()
@@ -865,6 +953,9 @@ pub fn setup_github_token_interactive() -> Result<String> {
     println!(
         "No GitHub token found. To manage PRs, git-stack needs a GitHub Personal Access Token."
     );
+    println!();
+    println!("Tip: `git stack auth login` offers browser-based OAuth login (recommended),");
+    println!("which works even where classic personal access tokens are disallowed.");
     println!();
     println!("Steps to create a token:");
     println!("1. Go to: https://github.com/settings/tokens/new");
@@ -910,6 +1001,145 @@ pub fn open_in_browser(url: &str) -> Result<()> {
         Command::new("cmd").args(["/c", "start", url]).spawn()?;
     }
     Ok(())
+}
+
+// ============== OAuth Device Flow ==============
+
+const GITHUB_OAUTH_CLIENT_ID: &str = "Ov23liPTCxzZTCwOphVj";
+const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const DEVICE_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const OAUTH_SCOPE: &str = "repo";
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    expires_in: u64, // default 900
+    interval: u64, // poll seconds
+}
+
+/// Raw access-token poll response: carries either a token or an `error`.
+#[derive(Debug, Deserialize)]
+struct TokenPollResponse {
+    access_token: Option<String>,
+    #[allow(dead_code)]
+    token_type: Option<String>,
+    scope: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PollOutcome {
+    Pending,  // authorization_pending -> keep polling
+    SlowDown, // slow_down -> +5s interval, keep polling
+    Success { token: String, scope: String },
+    Expired,        // expired_token -> abort, re-run login
+    Denied,         // access_denied -> abort
+    Failed(String), // any other error string
+}
+
+fn classify_poll_response(resp: TokenPollResponse) -> PollOutcome {
+    if let Some(token) = resp.access_token {
+        return PollOutcome::Success {
+            token,
+            scope: resp.scope.unwrap_or_default(),
+        };
+    }
+    match resp.error.as_deref() {
+        Some("authorization_pending") => PollOutcome::Pending,
+        Some("slow_down") => PollOutcome::SlowDown,
+        Some("expired_token") => PollOutcome::Expired,
+        Some("access_denied") => PollOutcome::Denied,
+        Some(other) => PollOutcome::Failed(other.to_string()),
+        None => PollOutcome::Failed("empty response from GitHub".to_string()),
+    }
+}
+
+fn request_device_code() -> Result<DeviceCodeResponse> {
+    let mut resp = ureq::post(DEVICE_CODE_URL)
+        .header("Accept", "application/json")
+        .header("User-Agent", "git-stack")
+        .send_form([
+            ("client_id", GITHUB_OAUTH_CLIENT_ID),
+            ("scope", OAUTH_SCOPE),
+        ])
+        .context("requesting device code from GitHub")?;
+    resp.body_mut()
+        .read_json()
+        .context("parsing device-code response")
+}
+
+fn poll_for_token(device_code: &str, mut interval: u64) -> Result<(String, String)> {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+        let mut resp = ureq::post(DEVICE_TOKEN_URL)
+            .header("Accept", "application/json")
+            .header("User-Agent", "git-stack")
+            .send_form([
+                ("client_id", GITHUB_OAUTH_CLIENT_ID),
+                ("device_code", device_code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+            .context("polling GitHub for access token")?;
+        let parsed: TokenPollResponse = resp
+            .body_mut()
+            .read_json()
+            .context("parsing token poll response")?;
+        match classify_poll_response(parsed) {
+            PollOutcome::Pending => continue,
+            PollOutcome::SlowDown => {
+                interval += 5;
+                continue;
+            }
+            PollOutcome::Success { token, scope } => return Ok((token, scope)),
+            PollOutcome::Expired => {
+                bail!("Device code expired. Run `git stack auth login` again.")
+            }
+            PollOutcome::Denied => bail!("Authorization was denied."),
+            PollOutcome::Failed(e) => bail!("GitHub device-flow error: {e}"),
+        }
+    }
+}
+
+/// Run the full device flow; returns (token, scope) on success.
+pub fn login_via_device_flow() -> Result<(String, String)> {
+    let dc = request_device_code()?;
+    println!(
+        "\nTo authorize git-stack, visit:\n  {}",
+        dc.verification_uri
+    );
+    println!("and enter the code: {}\n", dc.user_code); // user_code shown prominently
+    let _ = open_in_browser(&dc.verification_uri); // best-effort convenience
+    println!("Waiting for authorization in your browser...");
+    poll_for_token(&dc.device_code, dc.interval)
+}
+
+/// Interactive login menu: choose browser OAuth or paste a token.
+///
+/// Returns the active token on success.
+pub fn login_interactive() -> Result<String> {
+    println!("How would you like to authenticate with GitHub?");
+    println!("  [1] Browser login (recommended)");
+    println!("  [2] Paste a token");
+    print!("Enter choice [1]: ");
+    io::stdout().flush()?;
+
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+
+    match choice {
+        "" | "1" => {
+            let (token, scope) = login_via_device_flow()?;
+            save_github_oauth_token(&token, &scope)?;
+            Ok(token)
+        }
+        "2" => setup_github_token_interactive(),
+        other => bail!("Invalid choice: {other}"),
+    }
 }
 
 // ============== PR Cache Functions ==============
@@ -1048,5 +1278,78 @@ mod tests {
         assert_eq!(repo.host, "github.mycompany.com");
         assert_eq!(repo.owner, "team");
         assert_eq!(repo.repo, "project");
+    }
+
+    #[test]
+    fn test_device_code_response_parses() {
+        let json = r#"{
+            "device_code": "3584d83530557fdd1f46af8289938c8ef79f9dc5",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        }"#;
+        let dc: DeviceCodeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(dc.device_code, "3584d83530557fdd1f46af8289938c8ef79f9dc5");
+        assert_eq!(dc.user_code, "WDJB-MJHT");
+        assert_eq!(dc.verification_uri, "https://github.com/login/device");
+        assert_eq!(dc.expires_in, 900);
+        assert_eq!(dc.interval, 5);
+    }
+
+    fn parse_poll(json: &str) -> PollOutcome {
+        let resp: TokenPollResponse = serde_json::from_str(json).unwrap();
+        classify_poll_response(resp)
+    }
+
+    #[test]
+    fn test_classify_authorization_pending() {
+        assert_eq!(
+            parse_poll(r#"{"error":"authorization_pending"}"#),
+            PollOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn test_classify_slow_down() {
+        assert_eq!(
+            parse_poll(r#"{"error":"slow_down"}"#),
+            PollOutcome::SlowDown
+        );
+    }
+
+    #[test]
+    fn test_classify_expired_token() {
+        assert_eq!(
+            parse_poll(r#"{"error":"expired_token"}"#),
+            PollOutcome::Expired
+        );
+    }
+
+    #[test]
+    fn test_classify_access_denied() {
+        assert_eq!(
+            parse_poll(r#"{"error":"access_denied"}"#),
+            PollOutcome::Denied
+        );
+    }
+
+    #[test]
+    fn test_classify_unknown_error() {
+        assert_eq!(
+            parse_poll(r#"{"error":"unmapped_thing"}"#),
+            PollOutcome::Failed("unmapped_thing".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_success() {
+        assert_eq!(
+            parse_poll(r#"{"access_token":"gho_abc123","token_type":"bearer","scope":"repo"}"#),
+            PollOutcome::Success {
+                token: "gho_abc123".to_string(),
+                scope: "repo".to_string(),
+            }
+        );
     }
 }
