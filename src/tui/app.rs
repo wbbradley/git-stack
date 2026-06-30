@@ -21,8 +21,7 @@ use super::input::{AppAction, handle_event};
 use crate::{
     github::PrDisplayState,
     render::{
-        RenderableBranch,
-        RenderableTree,
+        RenderableBranch, RenderableTree,
         colors::{string_to_color, theme},
     },
 };

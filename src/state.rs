@@ -1,8 +1,7 @@
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    default,
-    fs,
+    default, fs,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,

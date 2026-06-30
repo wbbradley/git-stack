@@ -1347,11 +1347,7 @@ fn handle_pr_command(
     action: PrAction,
 ) -> Result<()> {
     use github::{
-        CreatePrRequest,
-        GitHubClient,
-        get_repo_identifier,
-        has_github_token,
-        login_interactive,
+        CreatePrRequest, GitHubClient, get_repo_identifier, has_github_token, login_interactive,
         open_in_browser,
     };
 
@@ -1706,11 +1702,7 @@ fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a m
 
 fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
     use github::{
-        AuthSource,
-        clear_github_tokens,
-        find_auth_source,
-        get_repo_identifier,
-        login_interactive,
+        AuthSource, clear_github_tokens, find_auth_source, get_repo_identifier, login_interactive,
         setup_github_token_interactive,
     };
 

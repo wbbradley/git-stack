@@ -22,14 +22,8 @@ use crate::{
     git::{git_trunk, run_git},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
-        GitHubClient,
-        PrState,
-        PullRequest,
-        RepoIdentifier,
-        UpdatePrRequest,
-        get_repo_identifier,
-        load_pr_cache,
-        save_pr_cache,
+        GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest, get_repo_identifier,
+        load_pr_cache, save_pr_cache,
     },
     state::{Branch, State},
 };
