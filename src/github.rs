@@ -872,6 +872,14 @@ pub fn setup_github_token_interactive() -> Result<String> {
     println!("3. Scopes needed: repo (full control of private repos)");
     println!("4. Click \"Generate token\" and copy the value");
     println!();
+    println!("Alternatively, set GITHUB_TOKEN or GH_TOKEN in your environment,");
+    println!("or manually create the config file with:");
+    if let Ok(config_path) = get_github_config_path() {
+        println!("  {}", config_path.display());
+    }
+    println!("Contents:");
+    println!("  default_token: ghp_yourtoken");
+    println!();
     print!("Enter your token: ");
     io::stdout().flush()?;
 

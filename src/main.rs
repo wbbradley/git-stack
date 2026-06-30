@@ -1348,7 +1348,7 @@ fn handle_pr_command(
 
     // Ensure we have auth configured
     if !has_github_token(&repo_id.host) {
-        println!("{}", "GitHub authentication required.".yellow());
+        println!("{}", "GitHub authentication required (needs a Personal Access Token with the 'repo' scope).".yellow());
         setup_github_token_interactive()?;
     }
 
