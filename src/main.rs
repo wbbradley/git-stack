@@ -19,6 +19,7 @@ use crate::{
 mod git;
 mod git2_ops;
 mod github;
+mod lock;
 mod render;
 mod state;
 mod stats;
@@ -901,6 +902,11 @@ fn restack(
     all_parents: bool,
     squash: bool,
 ) -> Result<(), anyhow::Error> {
+    // Hold a repo-scoped advisory lock for the whole restack so a second
+    // git-stack invocation can't race us on ref updates (e.g. the fetch below,
+    // or the checkout/branch updates that follow).
+    let _lock = git_repo.lock()?;
+
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
 
     // Track what changes occurred during restack (branch_name, status)

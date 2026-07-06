@@ -204,6 +204,10 @@ pub struct SyncOptions {
 
 /// Main sync entry point
 pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOptions) -> Result<()> {
+    // Hold a repo-scoped advisory lock for the whole sync so a second git-stack
+    // invocation can't race us on ref updates (e.g. concurrent fetch --prune).
+    let _lock = git_repo.lock()?;
+
     // Get repo identifier for GitHub API
     let repo_id = get_repo_identifier(git_repo)?;
     let client = GitHubClient::from_env(&repo_id)?;

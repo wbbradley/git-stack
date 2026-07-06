@@ -8,7 +8,7 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 
-use crate::stats::GitBenchmark;
+use crate::{lock::RepoLock, stats::GitBenchmark};
 
 pub const DEFAULT_REMOTE: &str = "origin";
 
@@ -39,6 +39,15 @@ impl GitRepo {
         let repo = Repository::open(path.as_ref())
             .with_context(|| format!("Failed to open repository at {:?}", path.as_ref()))?;
         Ok(Self { repo })
+    }
+
+    /// Acquire a repo-scoped advisory lock (see [`crate::lock::RepoLock`]).
+    ///
+    /// Held across mutating operations so two git-stack invocations can't race
+    /// on ref updates (e.g. concurrent `fetch --prune`). Scoped to the common
+    /// git dir so linked worktrees of the same repo serialize together.
+    pub fn lock(&self) -> Result<RepoLock> {
+        RepoLock::acquire(self.repo.commondir())
     }
 
     /// Get the SHA of a reference (branch name, tag, or other ref).

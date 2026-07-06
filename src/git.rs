@@ -61,11 +61,20 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
         .with_context(|| format!("running git {args:?}"))?;
     record_git_command(args, start.elapsed());
     if !out.status.success() {
-        tracing::debug!(
-            ?args,
-            "git error: {}",
-            std::str::from_utf8(&out.stderr).unwrap_or("")
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::debug!(?args, "git error: {}", stderr);
+        if is_ref_lock_contention(&stderr) {
+            bail!(
+                "`git {}` failed: could not lock a git ref.\n{}\n\
+                 Another git process may be running, or a previous one was interrupted \
+                 and left a stale lock.\n\
+                 If nothing else is using this repo, clear stale locks with:\n    \
+                 find .git -name '*.lock' -delete\n\
+                 then try again.",
+                args.join(" "),
+                stderr.trim(),
+            );
+        }
         bail!(
             "`git {}` failed with exit status: {}",
             args.join(" "),
@@ -75,6 +84,13 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
     Ok(GitOutput {
         stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
     })
+}
+
+/// Detect git's "cannot lock ref" / stale-lock failure in stderr so we can give
+/// the user an actionable hint instead of a raw non-zero exit status.
+fn is_ref_lock_contention(stderr: &str) -> bool {
+    stderr.contains("cannot lock ref")
+        || (stderr.contains("Unable to create") && stderr.contains(".lock"))
 }
 
 pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitStatus> {
@@ -235,4 +251,25 @@ pub(crate) fn git_trunk(git_repo: &GitRepo) -> Option<GitTrunk> {
         remote_main,
         main_branch,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_cannot_lock_ref_error() {
+        // The exact shape git emits when a ref lock is contended or stale.
+        let stderr = "error: could not delete references: cannot lock ref \
+            'refs/remotes/origin/foo': Unable to create \
+            '/repo/.git/refs/remotes/origin/foo.lock': File exists.";
+        assert!(is_ref_lock_contention(stderr));
+    }
+
+    #[test]
+    fn ignores_unrelated_errors() {
+        assert!(!is_ref_lock_contention(
+            "fatal: couldn't find remote ref refs/heads/nope"
+        ));
+    }
 }
