@@ -76,6 +76,27 @@ git stack delete <branch>    # remove a branch from the stack
 Note that `git stack sync` will automatically prune local branches that are duplicates of the remote
 branch, or have already been merged.
 
+## Authentication
+
+Commands that talk to GitHub (`sync`, `pr create`) need a token. Set one up with:
+
+```bash
+git stack auth login         # interactive OAuth device flow (recommended)
+git stack auth login --pat   # paste a personal access token instead
+git stack auth status        # show the active auth method
+git stack auth logout        # clear git-stack's stored tokens
+```
+
+git-stack resolves a token from the first source that provides one, in order:
+
+1. `GITHUB_TOKEN` environment variable
+2. `GH_TOKEN` environment variable
+3. `git config --get github.token`
+4. Config file (`~/.config/git-stack/github.yaml`): host-specific token, then PAT, then OAuth token
+5. The [`gh` CLI](https://cli.github.com/): if none of the above resolve and you've run `gh auth
+   login`, git-stack borrows `gh`'s token automatically (via `gh auth token`). Use `gh auth logout`
+   to sign out of `gh`.
+
 ## Workflow Example
 
 ```bash
