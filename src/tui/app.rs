@@ -1,6 +1,7 @@
 //! TUI application state and rendering.
 
 use std::io::{self, Stdout};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -26,6 +27,9 @@ use crate::{
     },
 };
 
+/// How long a transient status message remains visible.
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(2);
+
 /// TUI application state.
 pub struct App {
     /// The renderable tree data.
@@ -40,6 +44,8 @@ pub struct App {
     pub verbose: bool,
     /// List state for ratatui.
     list_state: ListState,
+    /// Transient status/error message shown in the help bar, with its expiry time.
+    status_message: Option<(String, Instant)>,
 }
 
 impl App {
@@ -57,6 +63,7 @@ impl App {
             checkout_branch: None,
             verbose,
             list_state,
+            status_message: None,
         }
     }
 
@@ -89,12 +96,51 @@ impl App {
         self.should_quit = true;
     }
 
+    /// Set a transient status message to display in the help bar.
+    fn set_status(&mut self, msg: String) {
+        self.status_message = Some((msg, Instant::now() + STATUS_MESSAGE_TTL));
+    }
+
+    /// Returns the currently-active (non-expired) status message, if any.
+    fn active_status(&self) -> Option<&str> {
+        self.status_message
+            .as_ref()
+            .filter(|(_, exp)| Instant::now() < *exp)
+            .map(|(m, _)| m.as_str())
+    }
+
+    /// Resolve the PR URL for the selected branch, or set a status message if none.
+    fn selected_pr_url(&mut self) -> Option<String> {
+        match self.tree.branches.get(self.cursor) {
+            Some(b) => match &b.pr_info {
+                Some(pr) => Some(pr.html_url.clone()),
+                None => {
+                    self.set_status(format!("No PR for branch '{}'", b.name));
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
+    /// Open the selected branch's PR in the default browser.
+    fn open_selected_in_browser(&mut self) {
+        if let Some(url) = self.selected_pr_url()
+            && let Err(e) = crate::github::open_in_browser(&url)
+        {
+            self.set_status(format!("Failed to open browser: {e}"));
+        }
+    }
+
     /// Handle an action.
     pub fn handle_action(&mut self, action: AppAction) {
+        // Any keypress dismisses an existing status message; the action may set a fresh one.
+        self.status_message = None;
         match action {
             AppAction::MoveUp => self.move_up(),
             AppAction::MoveDown => self.move_down(),
             AppAction::Select => self.select(),
+            AppAction::OpenInBrowser => self.open_selected_in_browser(),
             AppAction::Quit => self.quit(),
             AppAction::None => {}
         }
@@ -186,8 +232,8 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     frame.render_stateful_widget(list, inner_area, &mut app.list_state);
 
-    // Render help text at bottom
-    render_help(frame, area);
+    // Render help text (or a transient status message) at bottom
+    render_help(frame, area, app.active_status());
 }
 
 /// Render a single branch as a ListItem.
@@ -318,18 +364,26 @@ fn render_branch_item(
     ListItem::new(Line::from(spans))
 }
 
-/// Render help text at the bottom.
-fn render_help(frame: &mut Frame, area: Rect) {
-    let help_text = Line::from(vec![
-        Span::styled(" j/↓", Style::default().fg(Color::Yellow)),
-        Span::raw(" down  "),
-        Span::styled("k/↑", Style::default().fg(Color::Yellow)),
-        Span::raw(" up  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(" checkout  "),
-        Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(" quit"),
-    ]);
+/// Render help text (or a transient status message) at the bottom.
+fn render_help(frame: &mut Frame, area: Rect, status: Option<&str>) {
+    let help_text = match status {
+        Some(msg) => Line::from(vec![Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::Red),
+        )]),
+        None => Line::from(vec![
+            Span::styled(" j/↓", Style::default().fg(Color::Yellow)),
+            Span::raw(" down  "),
+            Span::styled("k/↑", Style::default().fg(Color::Yellow)),
+            Span::raw(" up  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" checkout  "),
+            Span::styled("o", Style::default().fg(Color::Yellow)),
+            Span::raw(" open  "),
+            Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" quit"),
+        ]),
+    };
 
     let help_area = Rect {
         x: area.x + 2,
@@ -345,4 +399,85 @@ fn render_help(frame: &mut Frame, area: Rect) {
 fn apply_dim(color: crate::render::ThemeColor, factor: f32) -> Color {
     let dimmed = color.apply_dim(factor);
     Color::Rgb(dimmed.0, dimmed.1, dimmed.2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PrDisplayState;
+    use crate::render::tree_data::PrRenderInfo;
+
+    /// Build a minimal `RenderableBranch` with the given name and optional PR info.
+    fn branch(name: &str, index: usize, pr_info: Option<PrRenderInfo>) -> RenderableBranch {
+        RenderableBranch {
+            name: name.to_string(),
+            depth: 0,
+            is_current: false,
+            is_dimmed: false,
+            is_remote_only: false,
+            status: None,
+            diff_stats: None,
+            local_status: None,
+            pr_info,
+            note_preview: None,
+            verbose: None,
+            index,
+        }
+    }
+
+    /// Build an `App` over two branches: one with a PR, one without.
+    fn app_with_two_branches() -> App {
+        let with_pr = branch(
+            "feature-a",
+            0,
+            Some(PrRenderInfo {
+                number: 42,
+                state: PrDisplayState::Open,
+                author: "octocat".to_string(),
+                html_url: "https://github.com/o/r/pull/42".to_string(),
+            }),
+        );
+        let without_pr = branch("feature-b", 1, None);
+        let tree = RenderableTree {
+            branches: vec![with_pr, without_pr],
+            current_branch_index: Some(0),
+        };
+        App::new(tree, false)
+    }
+
+    #[test]
+    fn selected_pr_url_returns_url_and_sets_no_message() {
+        let mut app = app_with_two_branches();
+        app.cursor = 0;
+        assert_eq!(
+            app.selected_pr_url().as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert!(app.active_status().is_none());
+    }
+
+    #[test]
+    fn selected_pr_url_without_pr_sets_status() {
+        let mut app = app_with_two_branches();
+        app.cursor = 1;
+        assert!(app.selected_pr_url().is_none());
+        let status = app.active_status().expect("status message should be set");
+        assert!(status.contains("feature-b"), "status was: {status}");
+    }
+
+    #[test]
+    fn handle_action_clears_existing_status() {
+        let mut app = app_with_two_branches();
+        app.set_status("something".to_string());
+        assert!(app.active_status().is_some());
+        app.handle_action(AppAction::MoveUp);
+        assert!(app.active_status().is_none());
+    }
+
+    #[test]
+    fn active_status_returns_message_after_set() {
+        let mut app = app_with_two_branches();
+        app.set_status("hello".to_string());
+        assert_eq!(app.active_status(), Some("hello"));
+    }
 }

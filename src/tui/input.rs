@@ -11,6 +11,8 @@ pub enum AppAction {
     MoveDown,
     /// Select the current item (checkout branch).
     Select,
+    /// Open the selected branch's PR in the default browser.
+    OpenInBrowser,
     /// Quit without action.
     Quit,
     /// No action.
@@ -38,6 +40,9 @@ fn handle_key(key: KeyEvent) -> AppAction {
 
         // Selection
         KeyCode::Enter => AppAction::Select,
+
+        // Open PR in browser
+        KeyCode::Char('o') => AppAction::OpenInBrowser,
 
         // Quit
         KeyCode::Char('q') | KeyCode::Esc => AppAction::Quit,

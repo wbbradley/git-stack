@@ -26,6 +26,7 @@ pub struct PrRenderInfo {
     pub number: u64,
     pub state: PrDisplayState,
     pub author: String,
+    pub html_url: String,
 }
 
 /// Diff statistics (additions, deletions).
@@ -230,6 +231,7 @@ fn flatten_tree(
             number: pr.number,
             state: pr.display_state(),
             author: pr.user.login.clone(),
+            html_url: pr.html_url.clone(),
         });
 
     // Get note preview
