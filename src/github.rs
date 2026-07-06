@@ -771,12 +771,61 @@ pub enum AuthSource {
     ConfigHostToken,
     ConfigDefaultToken, // classic/fine-grained PAT
     ConfigOauth { scope: Option<String> },
+    GhCli,
+}
+
+/// Ask the `gh` CLI for a token for `host`. Returns None if `gh` is absent,
+/// not logged in for the host, or prints nothing. A single `gh auth token`
+/// invocation both detects availability and yields the token.
+fn gh_auth_token(host: &str) -> Option<String> {
+    let output = Command::new("gh")
+        .args(["auth", "token", "--hostname", host])
+        .output()
+        .ok()?; // command-not-found -> None
+    if !output.status.success() {
+        return None; // not logged in for host -> None
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
 }
 
 /// Resolve the active token and where it came from (PAT-wins order).
 fn resolve_github_auth(host: &str) -> Option<(String, AuthSource)> {
+    let env_github_token = std::env::var("GITHUB_TOKEN").ok();
+    let env_gh_token = std::env::var("GH_TOKEN").ok();
+
+    // git config github.token
+    let git_config_token = Command::new("git")
+        .args(["config", "--get", "github.token"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    let config_file = load_github_config_file();
+
+    resolve_auth_core(
+        host,
+        env_github_token,
+        env_gh_token,
+        git_config_token,
+        config_file,
+        gh_auth_token,
+    )
+}
+
+/// Pure resolution core — all sources injected so it is deterministic and testable.
+/// Empty-string tokens are treated as absent, matching the live source guards.
+fn resolve_auth_core(
+    host: &str,
+    env_github_token: Option<String>,
+    env_gh_token: Option<String>,
+    git_config_token: Option<String>,
+    config_file: Option<GitHubConfigFile>,
+    gh_token: impl FnOnce(&str) -> Option<String>,
+) -> Option<(String, AuthSource)> {
     // 1. Check GITHUB_TOKEN env var
-    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+    if let Some(token) = env_github_token
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GITHUB_TOKEN env var");
@@ -784,7 +833,7 @@ fn resolve_github_auth(host: &str) -> Option<(String, AuthSource)> {
     }
 
     // 2. Check GH_TOKEN env var (used by gh CLI)
-    if let Ok(token) = std::env::var("GH_TOKEN")
+    if let Some(token) = env_gh_token
         && !token.is_empty()
     {
         tracing::debug!("Using GitHub token from GH_TOKEN env var");
@@ -792,20 +841,15 @@ fn resolve_github_auth(host: &str) -> Option<(String, AuthSource)> {
     }
 
     // 3. Check git config github.token
-    if let Ok(output) = Command::new("git")
-        .args(["config", "--get", "github.token"])
-        .output()
-        && output.status.success()
+    if let Some(token) = git_config_token
+        && !token.is_empty()
     {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !token.is_empty() {
-            tracing::debug!("Using GitHub token from git config");
-            return Some((token, AuthSource::GitConfig));
-        }
+        tracing::debug!("Using GitHub token from git config");
+        return Some((token, AuthSource::GitConfig));
     }
 
     // 4-6. Check XDG config file for tokens
-    if let Some(config) = load_github_config_file() {
+    if let Some(config) = config_file {
         // 4. Host-specific token first
         if let Some(hosts) = &config.hosts
             && let Some(token) = hosts.get(host)
@@ -827,6 +871,15 @@ fn resolve_github_auth(host: &str) -> Option<(String, AuthSource)> {
                     scope: config.oauth_scope,
                 },
             ));
+        }
+    }
+
+    // 7. Last resort: borrow the gh CLI's token.
+    if let Some(token) = gh_token(host) {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            tracing::debug!("Using GitHub token from gh CLI");
+            return Some((token, AuthSource::GhCli));
         }
     }
 
@@ -1247,6 +1300,75 @@ impl From<&CachedPullRequest> for PullRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::Cell;
+
+    #[test]
+    fn gh_fallback_reached_when_all_empty() {
+        let result = resolve_auth_core("github.com", None, None, None, None, |_| {
+            Some("ghtok".to_string())
+        });
+        assert_eq!(result, Some(("ghtok".to_string(), AuthSource::GhCli)));
+    }
+
+    #[test]
+    fn github_token_env_wins_over_gh() {
+        let gh_called = Cell::new(false);
+        let result = resolve_auth_core(
+            "github.com",
+            Some("envtok".to_string()),
+            None,
+            None,
+            None,
+            |_| {
+                gh_called.set(true);
+                Some("ghtok".to_string())
+            },
+        );
+        assert_eq!(
+            result,
+            Some(("envtok".to_string(), AuthSource::EnvGithubToken))
+        );
+        assert!(
+            !gh_called.get(),
+            "gh CLI must not be consulted when an earlier source resolves"
+        );
+    }
+
+    #[test]
+    fn no_token_when_gh_also_empty() {
+        let result = resolve_auth_core("github.com", None, None, None, None, |_| None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn gh_empty_string_treated_as_absent() {
+        let result = resolve_auth_core("github.com", None, None, None, None, |_| {
+            Some("  ".to_string())
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn config_default_wins_over_gh() {
+        let gh_called = Cell::new(false);
+        let config = GitHubConfigFile {
+            default_token: Some("cfgtok".to_string()),
+            ..Default::default()
+        };
+        let result = resolve_auth_core("github.com", None, None, None, Some(config), |_| {
+            gh_called.set(true);
+            Some("ghtok".to_string())
+        });
+        assert_eq!(
+            result,
+            Some(("cfgtok".to_string(), AuthSource::ConfigDefaultToken))
+        );
+        assert!(
+            !gh_called.get(),
+            "gh CLI must not be consulted when config resolves"
+        );
+    }
 
     #[test]
     fn test_parse_ssh_url() {

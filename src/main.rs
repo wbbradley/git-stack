@@ -1717,6 +1717,9 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
                 "{}",
                 "GitHub authentication configured successfully.".green()
             );
+            println!(
+                "Tip: if you already run `gh auth login`, git-stack will borrow gh's token automatically — no separate setup needed."
+            );
             Ok(())
         }
         AuthAction::Status => {
@@ -1727,7 +1730,7 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
 
             match find_auth_source(&host) {
                 Some(source) => {
-                    let desc = match source {
+                    let desc = match &source {
                         AuthSource::EnvGithubToken => {
                             "GITHUB_TOKEN environment variable".to_string()
                         }
@@ -1743,12 +1746,22 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
                             Some(s) => format!("config file (OAuth, scope: {s})"),
                             None => "config file (OAuth)".to_string(),
                         },
+                        AuthSource::GhCli => {
+                            format!("gh CLI (delegated credentials for {host})")
+                        }
                     };
                     println!(
                         "{} Active method: {}.",
                         "GitHub token is configured.".green(),
                         desc
                     );
+                    // For borrowed gh credentials, show gh's own status summary
+                    // rather than implying git-stack owns the token.
+                    if source == AuthSource::GhCli {
+                        let _ = std::process::Command::new("gh")
+                            .args(["auth", "status"])
+                            .status();
+                    }
                 }
                 None => {
                     println!("{}", "No GitHub token configured.".yellow());
@@ -1758,10 +1771,18 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
             Ok(())
         }
         AuthAction::Logout { oauth, pat } => {
+            let host = get_repo_identifier(git_repo)
+                .map(|r| r.host)
+                .unwrap_or_else(|_| "github.com".to_string());
             clear_github_tokens(oauth, pat)?;
             println!(
                 "Note: Tokens in environment variables (GITHUB_TOKEN, GH_TOKEN) or git config are not affected."
             );
+            if find_auth_source(&host) == Some(AuthSource::GhCli) {
+                println!(
+                    "Note: git-stack is borrowing credentials from the gh CLI, which it does not manage. Run `gh auth logout` to sign out of gh."
+                );
+            }
             Ok(())
         }
     }
