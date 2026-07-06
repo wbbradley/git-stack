@@ -50,8 +50,18 @@ pub(crate) fn run_git_passthrough(args: &[&str]) -> Result<ExitStatus> {
     Ok(result)
 }
 
-/// Run a git command and return the output. If the git command fails, this will return an error.
-pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
+/// Raw captured output from a git command, returned regardless of exit status
+/// (no bail). Lets callers inspect stderr and the status directly.
+struct RawGitOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a git command and capture stdout/stderr/status without bailing on
+/// failure. Used by callers (e.g. the fetch path) that need to react to the
+/// raw stderr instead of a pre-formatted error message.
+fn run_git_capture(args: &[&str]) -> Result<RawGitOutput> {
     let start = Instant::now();
     tracing::debug!("Running `git {}`", args.join(" "));
     let out = Command::new("git")
@@ -61,28 +71,46 @@ pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
         .with_context(|| format!("running git {args:?}"))?;
     record_git_command(args, start.elapsed());
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        tracing::debug!(?args, "git error: {}", stderr);
-        if is_ref_lock_contention(&stderr) {
-            bail!(
-                "`git {}` failed: could not lock a git ref.\n{}\n\
-                 Another git process may be running, or a previous one was interrupted \
-                 and left a stale lock.\n\
-                 If nothing else is using this repo, clear stale locks with:\n    \
-                 find .git -name '*.lock' -delete\n\
-                 then try again.",
-                args.join(" "),
-                stderr.trim(),
-            );
-        }
-        bail!(
+        tracing::debug!(?args, "git error: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(RawGitOutput {
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+    })
+}
+
+/// Convert a failed git invocation into an error, routing stale-lock contention
+/// to an actionable hint and everything else to a generic exit-status message.
+fn git_failure_error(args: &[&str], stderr: &str, status: ExitStatus) -> anyhow::Error {
+    if is_ref_lock_contention(stderr) {
+        anyhow!(
+            "`git {}` failed: could not lock a git ref.\n{}\n\
+             Another git process may be running, or a previous one was interrupted \
+             and left a stale lock.\n\
+             If nothing else is using this repo, clear stale locks with:\n    \
+             find .git -name '*.lock' -delete\n\
+             then try again.",
+            args.join(" "),
+            stderr.trim(),
+        )
+    } else {
+        anyhow!(
             "`git {}` failed with exit status: {}",
             args.join(" "),
-            out.status
-        );
+            status
+        )
+    }
+}
+
+/// Run a git command and return the output. If the git command fails, this will return an error.
+pub(crate) fn run_git(args: &[&str]) -> Result<GitOutput> {
+    let out = run_git_capture(args)?;
+    if !out.status.success() {
+        return Err(git_failure_error(args, &out.stderr, out.status));
     }
     Ok(GitOutput {
-        stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        stdout: out.stdout.trim().to_string(),
     })
 }
 
@@ -123,8 +151,232 @@ pub(crate) fn run_git_status(args: &[&str], stdin: Option<&str>) -> Result<ExitS
 }
 
 pub(crate) fn git_fetch() -> Result<()> {
-    let _ = run_git(&["fetch", "--prune"])?;
-    Ok(())
+    fetch_with_recovery(&["fetch", "--prune"])
+}
+
+/// Run a fetch, and if it fails specifically because of a case-insensitive
+/// remote-ref collision, attempt to self-heal (delete stale twins) and retry
+/// once. The happy path runs the fetch and returns immediately — no extra ref
+/// scan or network call.
+pub(crate) fn fetch_with_recovery(args: &[&str]) -> Result<()> {
+    let out = run_git_capture(args)?;
+    if out.status.success() {
+        // HAPPY PATH — zero extra work.
+        return Ok(());
+    }
+    if is_ref_lock_contention(&out.stderr) {
+        // Failure path only: O(n) in-memory scan of remote-tracking refs.
+        let refs = list_remote_tracking_refs()?;
+        let names: Vec<String> = refs.iter().map(|(_, n)| n.clone()).collect();
+        if is_case_collision_failure(&out.stderr, &names) {
+            return recover_case_collision(args, &refs, &out);
+        }
+    }
+    Err(git_failure_error(args, &out.stderr, out.status))
+}
+
+/// List all remote-tracking refs for the default remote as `(oid, refname)`
+/// pairs via a single `git for-each-ref`.
+fn list_remote_tracking_refs() -> Result<Vec<(String, String)>> {
+    let refs_glob = format!("refs/remotes/{DEFAULT_REMOTE}");
+    let out = run_git(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        &refs_glob,
+    ])?;
+    let mut result = Vec::new();
+    for line in out.stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((oid, refname)) = line.split_once(' ') {
+            result.push((oid.to_string(), refname.to_string()));
+        }
+    }
+    Ok(result)
+}
+
+/// Parse the ref names git reported it could not lock from `cannot lock ref
+/// '...'`. Handles the name being wrapped onto the next line. Keeps only
+/// `refs/...` names.
+fn parse_locked_refs(stderr: &str) -> Vec<String> {
+    const NEEDLE: &str = "cannot lock ref";
+    let mut refs = Vec::new();
+    let mut rest = stderr;
+    while let Some(pos) = rest.find(NEEDLE) {
+        // Everything after the needle, potentially spanning newlines, up to the
+        // closing quote of the quoted ref name.
+        let after = &rest[pos + NEEDLE.len()..];
+        if let Some(open) = after.find('\'') {
+            let quoted = &after[open + 1..];
+            if let Some(close) = quoted.find('\'') {
+                let name = quoted[..close].trim();
+                if name.starts_with("refs/") {
+                    refs.push(name.to_string());
+                }
+                rest = &quoted[close + 1..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    refs
+}
+
+/// Group ref names that are equal ignoring ASCII case; return only groups with
+/// more than one member (collisions), preserving original names. Keyed by
+/// `to_ascii_lowercase`.
+fn collision_groups(refs: &[String]) -> Vec<Vec<String>> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for name in refs {
+        groups
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(name.clone());
+    }
+    groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect()
+}
+
+/// True iff a ref git failed to lock has a case-twin in `refs` (case-collision),
+/// as opposed to a genuine stale lock (no twin). Pure: stderr + ref list only.
+fn is_case_collision_failure(stderr: &str, refs: &[String]) -> bool {
+    let locked = parse_locked_refs(stderr);
+    if locked.is_empty() {
+        return false;
+    }
+    for locked_ref in &locked {
+        let lower = locked_ref.to_ascii_lowercase();
+        let twins = refs
+            .iter()
+            .filter(|r| r.to_ascii_lowercase() == lower)
+            .count();
+        if twins > 1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Recover from a confirmed case-collision fetch failure: delete stale twins
+/// (branches gone from the remote) via single-ref `update-ref -d` calls, then
+/// retry the fetch once. Warns (without deleting) when all twins are still live.
+fn recover_case_collision(
+    args: &[&str],
+    refs: &[(String, String)],
+    original: &RawGitOutput,
+) -> Result<()> {
+    let names: Vec<String> = refs.iter().map(|(_, n)| n.clone()).collect();
+    let groups = collision_groups(&names);
+
+    let prefix = format!("refs/remotes/{DEFAULT_REMOTE}/");
+    let strip =
+        |refname: &str| -> Option<String> { refname.strip_prefix(&prefix).map(|s| s.to_string()) };
+
+    // Collect the branch names of all colliding twins for a single ls-remote.
+    let mut branch_query: Vec<String> = Vec::new();
+    for group in &groups {
+        for refname in group {
+            if let Some(branch) = strip(refname) {
+                branch_query.push(branch);
+            }
+        }
+    }
+
+    let live = live_remote_branches(&branch_query)?;
+
+    let oid_of = |refname: &str| -> Option<String> {
+        refs.iter()
+            .find(|(_, n)| n == refname)
+            .map(|(oid, _)| oid.clone())
+    };
+
+    let mut deleted_any = false;
+    for group in &groups {
+        // Partition twins into stale (branch absent from remote) and live.
+        let (stale, still_live): (Vec<&String>, Vec<&String>) =
+            group.iter().partition(|refname| match strip(refname) {
+                Some(branch) => !live.contains(&branch),
+                // A ref we can't map to a branch is treated as live (don't delete).
+                None => false,
+            });
+
+        if stale.is_empty() {
+            // Both/all twins are live on the remote — unresolvable locally.
+            eprintln!(
+                "warning: remote refs differ only in case and both exist on the remote:\n    {}\n\
+                 On a case-insensitive filesystem these map to the same path, so `git fetch` \
+                 cannot lock them.\n\
+                 git-stack cannot resolve this automatically. The only fix is to rename one of \
+                 these branches upstream (e.g. via org policy or a server-side pre-receive hook); \
+                 there is no GitHub-side toggle to forbid case-only branch names.",
+                still_live
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n    "),
+            );
+            continue;
+        }
+
+        for refname in stale {
+            let Some(oid) = oid_of(refname) else {
+                continue;
+            };
+            // Single-ref transaction dodges the case collision.
+            match run_git(&["update-ref", "-d", refname, &oid]) {
+                Ok(_) => {
+                    deleted_any = true;
+                    println!("Pruned stale remote-tracking ref '{refname}' (case-collision).");
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to prune stale ref '{refname}': {e}");
+                }
+            }
+        }
+    }
+
+    if deleted_any {
+        // Retry the fetch exactly once — no recursion, cannot loop.
+        let retry = run_git_capture(args)?;
+        if retry.status.success() {
+            return Ok(());
+        }
+        return Err(git_failure_error(args, &retry.stderr, retry.status));
+    }
+
+    // Nothing deleted (every group was both-live); the warning is already
+    // printed, so surface the original failure rather than swallow it.
+    Err(git_failure_error(args, &original.stderr, original.status))
+}
+
+/// Query which of the given branch names still exist on the default remote via
+/// a single `git ls-remote --heads` scoped to that small set (never a full
+/// remote enumeration). Returns the set of live branch names.
+fn live_remote_branches(branches: &[String]) -> Result<std::collections::HashSet<String>> {
+    use std::collections::HashSet;
+    if branches.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut args: Vec<&str> = vec!["ls-remote", "--heads", DEFAULT_REMOTE];
+    for b in branches {
+        args.push(b.as_str());
+    }
+    let out = run_git(&args)?;
+    let mut live = HashSet::new();
+    for line in out.stdout.lines() {
+        // Each line: "<oid>\trefs/heads/<branch>"
+        if let Some((_, refname)) = line.split_once('\t')
+            && let Some(branch) = refname.trim().strip_prefix("refs/heads/")
+        {
+            live.insert(branch.to_string());
+        }
+    }
+    Ok(live)
 }
 
 pub(crate) fn git_branch_exists(repo: &GitRepo, branch: &str) -> bool {
@@ -271,5 +523,71 @@ mod tests {
         assert!(!is_ref_lock_contention(
             "fatal: couldn't find remote ref refs/heads/nope"
         ));
+    }
+
+    #[test]
+    fn collision_groups_finds_case_twins() {
+        let refs = vec![
+            "refs/remotes/origin/Jacob/x".to_string(),
+            "refs/remotes/origin/jacob/x".to_string(),
+            "refs/remotes/origin/unique".to_string(),
+        ];
+        let groups = collision_groups(&refs);
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(
+            group,
+            vec![
+                "refs/remotes/origin/Jacob/x".to_string(),
+                "refs/remotes/origin/jacob/x".to_string(),
+            ]
+        );
+        // 'unique' is excluded from any collision group.
+        assert!(!groups.iter().flatten().any(|r| r.contains("unique")));
+    }
+
+    #[test]
+    fn collision_groups_empty_when_all_distinct() {
+        let refs = vec![
+            "refs/remotes/origin/foo".to_string(),
+            "refs/remotes/origin/bar".to_string(),
+            "refs/remotes/origin/baz".to_string(),
+        ];
+        assert!(collision_groups(&refs).is_empty());
+    }
+
+    #[test]
+    fn parse_locked_refs_handles_wrapped_name() {
+        // git wraps the ref name onto the next line.
+        let stderr = "error: could not delete references: cannot lock ref\n\
+            'refs/remotes/origin/jacob/slack-sprint-v1-run-continuation':\n\
+            Unable to create '.../slack-sprint-v1-run-continuation.lock': File exists.";
+        assert_eq!(
+            parse_locked_refs(stderr),
+            vec!["refs/remotes/origin/jacob/slack-sprint-v1-run-continuation".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_case_collision_failure_true_with_twin() {
+        let stderr = "error: could not delete references: cannot lock ref\n\
+            'refs/remotes/origin/jacob/slack-sprint-v1-run-continuation':\n\
+            Unable to create '.../slack-sprint-v1-run-continuation.lock': File exists.";
+        let refs = vec![
+            "refs/remotes/origin/Jacob/slack-sprint-v1-run-continuation".to_string(),
+            "refs/remotes/origin/jacob/slack-sprint-v1-run-continuation".to_string(),
+            "refs/remotes/origin/other".to_string(),
+        ];
+        assert!(is_case_collision_failure(stderr, &refs));
+    }
+
+    #[test]
+    fn is_case_collision_failure_false_for_genuine_stale_lock() {
+        // No case-twin of 'foo' → genuine stale lock, not a collision.
+        let stderr = "error: cannot lock ref 'refs/heads/foo': Unable to create \
+            '/repo/.git/refs/heads/foo.lock': File exists.";
+        let refs = vec!["refs/heads/foo".to_string(), "refs/heads/bar".to_string()];
+        assert!(!is_case_collision_failure(stderr, &refs));
     }
 }

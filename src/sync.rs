@@ -19,7 +19,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::seq::SliceRandom;
 
 use crate::{
-    git::{git_trunk, run_git},
+    git::{fetch_with_recovery, git_trunk, run_git},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
         GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest, get_repo_identifier,
@@ -214,7 +214,7 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
 
     // Fetch with prune to ensure remote tracking refs are up-to-date
     println!("Fetching from remote...");
-    run_git(&["fetch", "--tags", "-f", "--prune", DEFAULT_REMOTE])?;
+    fetch_with_recovery(&["fetch", "--tags", "-f", "--prune", DEFAULT_REMOTE])?;
 
     // Stage 1: Read current state
     println!("Reading local state...");
