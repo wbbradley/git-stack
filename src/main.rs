@@ -655,6 +655,80 @@ fn collect_branches_without_author(
     }
 }
 
+/// Builds the renderable tree shared by `status()`/`interactive()`: fetches PR data from GitHub
+/// and computes local git status/diff/sort, overlapping the two when hiding/dimming don't
+/// require the fetch to finish first (i.e. whenever display_authors filtering isn't active).
+fn build_renderable_tree(
+    git_repo: &GitRepo,
+    repo: &str,
+    tree: &Branch,
+    orig_branch: &str,
+    verbose: bool,
+    show_all: bool,
+    display_authors: &[String],
+) -> render::RenderableTree {
+    let hiding_active = !show_all && !display_authors.is_empty();
+
+    let (mut renderable, pr_cache) = if hiding_active {
+        // pr_authors depends on the fetch result plus further network calls below, so there's
+        // no local work left to overlap the fetch with in this mode.
+        let pr_result = fetch_pr_cache(git_repo);
+        let open_authors = pr_result
+            .as_ref()
+            .map(|r| r.all_authors.clone())
+            .unwrap_or_default();
+        let mut pr_authors = add_closed_pr_authors(git_repo, open_authors);
+        add_commit_authors(git_repo, tree, &mut pr_authors);
+
+        let renderable = render::compute_renderable_tree(
+            git_repo,
+            tree,
+            orig_branch,
+            verbose,
+            display_authors,
+            &pr_authors,
+            show_all,
+        );
+        (renderable, pr_result.map(|r| r.prs))
+    } else {
+        // No author filter active, so hiding/dimming/sort need only an empty pr_authors map —
+        // the local git walk has nothing to wait on. Overlap it with the PR fetch.
+        let repo_path = repo.to_string();
+        let pr_authors = std::collections::HashMap::new();
+
+        let (renderable, pr_result, fetch_stats) = std::thread::scope(|scope| {
+            let fetch_handle = scope.spawn(move || {
+                // Own GitRepo handle: git2::Repository is Send but not Sync, and the main
+                // thread is using `git_repo` concurrently below.
+                let result = GitRepo::open(&repo_path)
+                    .ok()
+                    .and_then(|fresh_repo| fetch_pr_cache(&fresh_repo));
+                (result, crate::stats::get_stats())
+            });
+
+            let renderable = render::compute_renderable_tree(
+                git_repo,
+                tree,
+                orig_branch,
+                verbose,
+                display_authors,
+                &pr_authors,
+                show_all,
+            );
+
+            let (pr_result, fetch_stats) = fetch_handle
+                .join()
+                .unwrap_or_else(|_| (None, crate::stats::GitStats::default()));
+            (renderable, pr_result, fetch_stats)
+        });
+        crate::stats::merge_into_current(&fetch_stats);
+        (renderable, pr_result.map(|r| r.prs))
+    };
+
+    render::apply_pr_cache(&mut renderable, pr_cache.as_ref());
+    renderable
+}
+
 fn status(
     git_repo: &GitRepo,
     mut state: State,
@@ -673,9 +747,6 @@ fn status(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Try to fetch PR info from GitHub (graceful degradation on failure)
-    let pr_result = fetch_pr_cache(git_repo);
-
     // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
 
@@ -684,31 +755,14 @@ fn status(
         return Ok(());
     };
 
-    // Only pay for the closed/merged-PR and commit-author lookups when hiding is actually
-    // active; they're no-op inputs when display_authors is empty or --show-all is passed.
-    let pr_authors = if show_all || display_authors.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        let open_authors = pr_result
-            .as_ref()
-            .map(|r| r.all_authors.clone())
-            .unwrap_or_default();
-        let mut authors = add_closed_pr_authors(git_repo, open_authors);
-        add_commit_authors(git_repo, tree, &mut authors);
-        authors
-    };
-    let pr_cache = pr_result.map(|r| r.prs);
-
-    // Compute renderable tree
-    let renderable = render::compute_renderable_tree(
+    let renderable = build_renderable_tree(
         git_repo,
+        repo,
         tree,
         orig_branch,
         verbose,
-        pr_cache.as_ref(),
-        &display_authors,
-        &pr_authors,
         show_all,
+        &display_authors,
     );
 
     // Render to CLI
@@ -740,9 +794,6 @@ fn interactive(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Try to fetch PR info from GitHub (graceful degradation on failure)
-    let pr_result = fetch_pr_cache(git_repo);
-
     // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
 
@@ -751,31 +802,14 @@ fn interactive(
         return Ok(());
     };
 
-    // Only pay for the closed/merged-PR and commit-author lookups when hiding is actually
-    // active; they're no-op inputs when display_authors is empty or --show-all is passed.
-    let pr_authors = if show_all || display_authors.is_empty() {
-        std::collections::HashMap::new()
-    } else {
-        let open_authors = pr_result
-            .as_ref()
-            .map(|r| r.all_authors.clone())
-            .unwrap_or_default();
-        let mut authors = add_closed_pr_authors(git_repo, open_authors);
-        add_commit_authors(git_repo, tree, &mut authors);
-        authors
-    };
-    let pr_cache = pr_result.map(|r| r.prs);
-
-    // Compute renderable tree
-    let renderable = render::compute_renderable_tree(
+    let renderable = build_renderable_tree(
         git_repo,
+        repo,
         tree,
         orig_branch,
         verbose,
-        pr_cache.as_ref(),
-        &display_authors,
-        &pr_authors,
         show_all,
+        &display_authors,
     );
 
     // Run TUI and handle checkout if user selected a branch

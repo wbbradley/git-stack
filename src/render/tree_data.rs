@@ -187,14 +187,16 @@ fn mark_hidden(
     }
 }
 
-/// Compute a renderable tree from the branch tree.
+/// Compute a renderable tree from the branch tree. PR badge info (`pr_info`) is not populated
+/// here — call `apply_pr_cache` afterward. This split lets callers overlap the PR fetch (network)
+/// with this local git walk when `pr_authors` doesn't depend on the fetch (see
+/// `build_renderable_tree` in main.rs).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_renderable_tree(
     git_repo: &GitRepo,
     tree: &Branch,
     current_branch: &str,
     verbose: bool,
-    pr_cache: Option<&HashMap<String, PullRequest>>,
     display_authors: &[String],
     pr_authors: &HashMap<String, String>,
     show_all: bool,
@@ -211,7 +213,6 @@ pub fn compute_renderable_tree(
         0,
         current_branch,
         verbose,
-        pr_cache,
         display_authors,
         pr_authors,
         &hidden,
@@ -225,6 +226,22 @@ pub fn compute_renderable_tree(
     }
 }
 
+/// Populate PR badge info (`pr_info`) on an already-computed tree, by branch-name lookup. Split
+/// out from `flatten_tree` so the PR fetch (network) and the local git walk can run concurrently
+/// when hiding/dimming don't need the fetch's author data first (see `build_renderable_tree` in
+/// main.rs).
+pub fn apply_pr_cache(tree: &mut RenderableTree, pr_cache: Option<&HashMap<String, PullRequest>>) {
+    let Some(cache) = pr_cache else { return };
+    for branch in &mut tree.branches {
+        branch.pr_info = cache.get(&branch.name).map(|pr| PrRenderInfo {
+            number: pr.number,
+            state: pr.display_state(),
+            author: pr.user.login.clone(),
+            html_url: pr.html_url.clone(),
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flatten_tree(
     git_repo: &GitRepo,
@@ -233,7 +250,6 @@ fn flatten_tree(
     depth: usize,
     current_branch: &str,
     verbose: bool,
-    pr_cache: Option<&HashMap<String, PullRequest>>,
     display_authors: &[String],
     pr_authors: &HashMap<String, String>,
     hidden: &HashSet<String>,
@@ -295,15 +311,8 @@ fn flatten_tree(
             None
         };
 
-        // Get PR info
-        let pr_info = pr_cache
-            .and_then(|cache| cache.get(&branch.name))
-            .map(|pr| PrRenderInfo {
-                number: pr.number,
-                state: pr.display_state(),
-                author: pr.user.login.clone(),
-                html_url: pr.html_url.clone(),
-            });
+        // PR badge info is filled in afterward by `apply_pr_cache`.
+        let pr_info = None;
 
         // Get note preview
         let note_preview = branch
@@ -400,7 +409,6 @@ fn flatten_tree(
             child_depth,
             current_branch,
             verbose,
-            pr_cache,
             display_authors,
             pr_authors,
             hidden,
@@ -597,5 +605,86 @@ mod tests {
         let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
 
         assert!(hidden.contains("mallory-1"));
+    }
+
+    fn sample_pr(number: u64, login: &str) -> PullRequest {
+        use crate::github::{PrBranchRef, PrState, PrUser};
+
+        PullRequest {
+            number,
+            state: PrState::Open,
+            title: "test PR".to_string(),
+            html_url: format!("https://github.com/example/repo/pull/{number}"),
+            base: PrBranchRef {
+                ref_name: "main".to_string(),
+                sha: "deadbeef".to_string(),
+                repo: None,
+            },
+            head: PrBranchRef {
+                ref_name: "feature".to_string(),
+                sha: "cafebabe".to_string(),
+                repo: None,
+            },
+            user: PrUser {
+                login: login.to_string(),
+            },
+            draft: false,
+            merged: false,
+            merged_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_renderable_branch(name: &str, index: usize) -> RenderableBranch {
+        RenderableBranch {
+            name: name.to_string(),
+            depth: 0,
+            is_current: false,
+            is_dimmed: false,
+            is_remote_only: false,
+            status: None,
+            diff_stats: None,
+            local_status: None,
+            pr_info: None,
+            note_preview: None,
+            verbose: None,
+            index,
+        }
+    }
+
+    #[test]
+    fn apply_pr_cache_sets_pr_info_only_for_matching_branches() {
+        let mut tree = RenderableTree {
+            branches: vec![
+                sample_renderable_branch("alice-1", 0),
+                sample_renderable_branch("no-pr-branch", 1),
+            ],
+            current_branch_index: None,
+        };
+
+        let mut pr_cache = HashMap::new();
+        pr_cache.insert("alice-1".to_string(), sample_pr(42, "alice"));
+
+        apply_pr_cache(&mut tree, Some(&pr_cache));
+
+        let pr_info = tree.branches[0]
+            .pr_info
+            .as_ref()
+            .expect("alice-1 should have pr_info");
+        assert_eq!(pr_info.number, 42);
+        assert_eq!(pr_info.author, "alice");
+        assert!(tree.branches[1].pr_info.is_none());
+    }
+
+    #[test]
+    fn apply_pr_cache_none_leaves_all_pr_info_none() {
+        let mut tree = RenderableTree {
+            branches: vec![sample_renderable_branch("alice-1", 0)],
+            current_branch_index: None,
+        };
+
+        apply_pr_cache(&mut tree, None);
+
+        assert!(tree.branches[0].pr_info.is_none());
     }
 }

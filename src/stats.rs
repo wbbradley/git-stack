@@ -110,6 +110,23 @@ pub fn reset_stats() {
     });
 }
 
+/// Merge another thread's stats snapshot into this thread's `GIT_STATS` (e.g. after joining a
+/// worker thread that did its own git2 calls on a separate `GitRepo` handle).
+pub fn merge_into_current(other: &GitStats) {
+    GIT_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        for (cmd, cmd_stats) in &other.by_command {
+            let entry = stats.by_command.entry(cmd.clone()).or_default();
+            entry.count += cmd_stats.count;
+            entry.total_duration += cmd_stats.total_duration;
+            entry.max_duration = entry.max_duration.max(cmd_stats.max_duration);
+        }
+        stats.total.count += other.total.count;
+        stats.total.total_duration += other.total.total_duration;
+        stats.total.max_duration = stats.total.max_duration.max(other.total.max_duration);
+    });
+}
+
 /// Print a benchmark summary to stderr
 pub fn print_summary() {
     let stats = get_stats();
