@@ -223,9 +223,17 @@ work — `git stack status` renders the tree, just without PR numbers/state.
 
 `display_authors` (list of GitHub logins) in `github.yaml` — when non-empty,
 `status`/`interactive` hide branches whose PR author isn't listed, except the
-current branch and its ancestor chain to trunk, and any branch with no PR yet.
-A hidden branch's visible descendants reparent to the nearest visible ancestor
-for display purposes only. `--show-all` disables this for one invocation.
+current branch and its ancestor chain to trunk, and any branch whose author
+can't be determined at all. A hidden branch's visible descendants reparent to
+the nearest visible ancestor for display purposes only. `--show-all` disables
+this for one invocation.
+
+Author resolution for hiding isn't limited to open PRs: it also checks
+closed/merged PRs (via the same on-disk watermark cache `sync` uses), and, for
+branches with no PR match by exact branch name, falls back to asking GitHub
+who authored the branch's tip commit. Only a branch whose author truly can't
+be resolved by any of these (e.g. unpushed local work) stays protected as
+"no PR yet."
 
 ## 7. PR workflow
 

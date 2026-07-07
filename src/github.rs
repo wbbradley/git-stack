@@ -347,6 +347,40 @@ impl GitHubClient {
             .map_err(|e| GitHubError::Network(e.to_string()))
     }
 
+    /// Resolve the GitHub login GitHub associates with a commit (via a verified email on the
+    /// committer's account), independent of any PR. Returns `Ok(None)` if GitHub has no author
+    /// association for the commit (e.g. an unverified/unregistered email) — that's not an error,
+    /// just an unresolvable author.
+    pub fn get_commit_author(
+        &self,
+        repo: &RepoIdentifier,
+        sha: &str,
+    ) -> Result<Option<String>, GitHubError> {
+        #[derive(Deserialize)]
+        struct CommitResponse {
+            author: Option<PrUser>,
+        }
+
+        let url = format!(
+            "{}/repos/{}/{}/commits/{}",
+            self.config.api_base, repo.owner, repo.repo, sha
+        );
+
+        let mut response = ureq::get(&url)
+            .header("Authorization", &format!("Bearer {}", self.config.token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .header("User-Agent", "git-stack")
+            .call()
+            .map_err(|e| self.handle_ureq_error(e))?;
+
+        let parsed: CommitResponse = response
+            .body_mut()
+            .read_json()
+            .map_err(|e| GitHubError::Network(e.to_string()))?;
+
+        Ok(parsed.author.map(|u| u.login))
+    }
+
     /// Find open PR for a branch (returns None if no PR exists)
     pub fn find_pr_for_branch(
         &self,

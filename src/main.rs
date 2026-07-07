@@ -601,6 +601,60 @@ fn add_closed_pr_authors(
     authors
 }
 
+/// Resolve authors for branches that still have no PR-based entry in `authors`, via GitHub's
+/// commit-author API on each branch's tip commit. A PR-based lookup alone misses two real
+/// cases: branches that never had a PR at all, and branches whose open PR lives under a
+/// different (e.g. renamed) head ref than the tracked branch name — both looked
+/// indistinguishable from "this is my own unpublished WIP" before this fallback existed, so they
+/// stayed visible even when they belonged to someone else. Resolving by commit author fixes
+/// both: your own unpublished commits resolve to your own login (so local WIP stays protected),
+/// while another author's stray/renamed branch resolves to them and gets hidden. A commit that
+/// GitHub can't attribute to any account (unpushed, or a non-GitHub-verified email) leaves
+/// `authors` unchanged for that branch, which keeps it protected — "can't tell" still means
+/// "don't hide". Mutates `authors` in place; does one API call per still-unresolved branch.
+fn add_commit_authors(
+    git_repo: &GitRepo,
+    tree: &Branch,
+    authors: &mut std::collections::HashMap<String, String>,
+) {
+    let Ok(repo_id) = github::get_repo_identifier(git_repo) else {
+        return;
+    };
+    let Ok(client) = github::GitHubClient::from_env(&repo_id) else {
+        return;
+    };
+
+    let mut unresolved = Vec::new();
+    collect_branches_without_author(tree, authors, &mut unresolved);
+
+    for branch_name in unresolved {
+        let sha = git_repo.sha(&branch_name).ok().or_else(|| {
+            git_repo
+                .sha(&format!("{DEFAULT_REMOTE}/{branch_name}"))
+                .ok()
+        });
+        let Some(sha) = sha else { continue };
+        if let Ok(Some(login)) = client.get_commit_author(&repo_id, &sha) {
+            authors.insert(branch_name, login);
+        }
+    }
+}
+
+/// Collect names of `tree`'s descendants (not `tree` itself — the trunk is always protected, so
+/// its author is never consulted) that have no entry in `authors` yet.
+fn collect_branches_without_author(
+    tree: &Branch,
+    authors: &std::collections::HashMap<String, String>,
+    unresolved: &mut Vec<String>,
+) {
+    for child in &tree.branches {
+        if !authors.contains_key(&child.name) {
+            unresolved.push(child.name.clone());
+        }
+        collect_branches_without_author(child, authors, unresolved);
+    }
+}
+
 fn status(
     git_repo: &GitRepo,
     mut state: State,
@@ -625,8 +679,13 @@ fn status(
     // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
 
-    // Only pay for the closed/merged-PR author lookup when hiding is actually active; it's a
-    // no-op input when display_authors is empty or --show-all is passed.
+    let Some(tree) = state.get_tree(repo) else {
+        println!("No stack configured for this repository.");
+        return Ok(());
+    };
+
+    // Only pay for the closed/merged-PR and commit-author lookups when hiding is actually
+    // active; they're no-op inputs when display_authors is empty or --show-all is passed.
     let pr_authors = if show_all || display_authors.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -634,14 +693,11 @@ fn status(
             .as_ref()
             .map(|r| r.all_authors.clone())
             .unwrap_or_default();
-        add_closed_pr_authors(git_repo, open_authors)
+        let mut authors = add_closed_pr_authors(git_repo, open_authors);
+        add_commit_authors(git_repo, tree, &mut authors);
+        authors
     };
     let pr_cache = pr_result.map(|r| r.prs);
-
-    let Some(tree) = state.get_tree(repo) else {
-        println!("No stack configured for this repository.");
-        return Ok(());
-    };
 
     // Compute renderable tree
     let renderable = render::compute_renderable_tree(
@@ -690,8 +746,13 @@ fn interactive(
     // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
 
-    // Only pay for the closed/merged-PR author lookup when hiding is actually active; it's a
-    // no-op input when display_authors is empty or --show-all is passed.
+    let Some(tree) = state.get_tree(repo) else {
+        println!("No stack configured for this repository.");
+        return Ok(());
+    };
+
+    // Only pay for the closed/merged-PR and commit-author lookups when hiding is actually
+    // active; they're no-op inputs when display_authors is empty or --show-all is passed.
     let pr_authors = if show_all || display_authors.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -699,14 +760,11 @@ fn interactive(
             .as_ref()
             .map(|r| r.all_authors.clone())
             .unwrap_or_default();
-        add_closed_pr_authors(git_repo, open_authors)
+        let mut authors = add_closed_pr_authors(git_repo, open_authors);
+        add_commit_authors(git_repo, tree, &mut authors);
+        authors
     };
     let pr_cache = pr_result.map(|r| r.prs);
-
-    let Some(tree) = state.get_tree(repo) else {
-        println!("No stack configured for this repository.");
-        return Ok(());
-    };
 
     // Compute renderable tree
     let renderable = render::compute_renderable_tree(
@@ -1903,5 +1961,59 @@ fn handle_cache_command(
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn branch(name: &str, branches: Vec<Branch>) -> Branch {
+        Branch {
+            name: name.to_string(),
+            stack_method: StackMethod::ApplyMerge,
+            note: None,
+            lkg_parent: None,
+            pr_number: None,
+            branches,
+        }
+    }
+
+    #[test]
+    fn collect_branches_without_author_skips_the_root_and_known_authors() {
+        // main (root, always excluded)
+        // ├─ alice-1 (known author)
+        // │  └─ mystery-1 (no author yet)
+        // └─ mystery-2 (no author yet)
+        let tree = branch(
+            "main",
+            vec![
+                branch("alice-1", vec![branch("mystery-1", vec![])]),
+                branch("mystery-2", vec![]),
+            ],
+        );
+        let mut authors = std::collections::HashMap::new();
+        authors.insert("alice-1".to_string(), "alice".to_string());
+
+        let mut unresolved = Vec::new();
+        collect_branches_without_author(&tree, &authors, &mut unresolved);
+
+        unresolved.sort();
+        assert_eq!(
+            unresolved,
+            vec!["mystery-1".to_string(), "mystery-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_branches_without_author_returns_nothing_when_all_resolved() {
+        let tree = branch("main", vec![branch("alice-1", vec![])]);
+        let mut authors = std::collections::HashMap::new();
+        authors.insert("alice-1".to_string(), "alice".to_string());
+
+        let mut unresolved = Vec::new();
+        collect_branches_without_author(&tree, &authors, &mut unresolved);
+
+        assert!(unresolved.is_empty());
     }
 }
