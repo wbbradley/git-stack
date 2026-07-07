@@ -324,12 +324,12 @@ impl State {
         git_repo: &GitRepo,
         repo: &str,
         starting_branch: &str,
-        all_parents: bool,
+        ancestors: bool,
     ) -> Result<Vec<RestackStep<'_>>> {
-        tracing::debug!("Planning restack for {starting_branch} (all_parents={all_parents})");
+        tracing::debug!("Planning restack for {starting_branch} (ancestors={ancestors})");
 
         // Single-step mode: only restack the target branch onto its immediate parent
-        if !all_parents {
+        if !ancestors {
             let parent = self
                 .get_parent_branch_of(repo, starting_branch)
                 .ok_or_else(|| {

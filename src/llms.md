@@ -96,7 +96,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
   - `-b`/`--branch <name>` — restack this branch instead of the current one.
   - `-f`/`--fetch` — fetch from the remote first.
   - `-p`/`--push` — push the branch(es) to the remote after a successful restack.
-  - `-a`/`--all-parents` — recursively restack every ancestor from trunk up.
+  - `-a`/`--ancestors` — recursively restack every ancestor from trunk up.
   - `-s`/`--squash` — squash all of the branch's commits into one.
   - `--continue` — resume a squash interrupted by a conflict (after resolving).
   - `--abort` — cancel an in-progress squash and restore the original state.

@@ -75,9 +75,9 @@ enum Command {
         /// Push any changes up to the remote after restacking.
         #[arg(long, short)]
         push: bool,
-        /// Restack all parent branches recursively up to trunk.
+        /// Recursively restack all ancestors from trunk up to this branch.
         #[arg(long, short = 'a', default_value_t = false)]
-        all_parents: bool,
+        ancestors: bool,
         /// Squash all commits in the branch into a single commit.
         #[arg(long, short = 's', default_value_t = false)]
         squash: bool,
@@ -348,7 +348,7 @@ fn inner_main() -> Result<()> {
             branch,
             fetch,
             push,
-            all_parents,
+            ancestors,
             squash,
             r#continue,
             abort,
@@ -372,7 +372,7 @@ fn inner_main() -> Result<()> {
                 current_branch,
                 fetch,
                 push,
-                all_parents,
+                ancestors,
                 squash,
             )
         }
@@ -908,7 +908,7 @@ fn restack(
     orig_branch: String,
     fetch: bool,
     push: bool,
-    all_parents: bool,
+    ancestors: bool,
     squash: bool,
 ) -> Result<(), anyhow::Error> {
     // Hold a repo-scoped advisory lock for the whole restack so a second
@@ -950,7 +950,7 @@ fn restack(
     }
 
     // Find starting_branch in the stacks of branches to determine which stack to use.
-    let plan = state.plan_restack(git_repo, repo, &restack_branch, all_parents)?;
+    let plan = state.plan_restack(git_repo, repo, &restack_branch, ancestors)?;
 
     // Collect plan into owned data to allow mutable access to state during the loop
     let plan_owned: Vec<(String, state::Branch)> = plan
