@@ -21,6 +21,7 @@ mod git2_ops;
 mod github;
 mod llms;
 mod lock;
+mod pr_cache;
 mod render;
 mod state;
 mod stats;
@@ -248,8 +249,7 @@ fn main() {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_file(true)
-                .with_line_number(true)
-                .without_time(),
+                .with_line_number(true),
         )
         // Allow usage of RUST_LOG environment variable to set the log level.
         .with(
@@ -592,10 +592,11 @@ fn add_closed_pr_authors(
         return authors;
     };
 
-    let mut pr_cache = github::load_pr_cache().unwrap_or_default();
-    if let Ok(result) = client.list_closed_prs_with_cache(&repo_id, &mut pr_cache, None) {
+    let Ok(cache) = crate::pr_cache::PrCacheHandle::open() else {
+        return authors;
+    };
+    if let Ok(result) = client.list_closed_prs_with_cache(&repo_id, &cache, None) {
         authors.extend(result.all_authors);
-        let _ = github::save_pr_cache(&pr_cache);
     }
 
     authors
@@ -1984,7 +1985,7 @@ fn handle_cache_command(
             // Clear PR cache for this repo
             let repo_id = github::get_repo_identifier(git_repo)?;
             let repo_full_name = format!("{}/{}", repo_id.owner, repo_id.repo);
-            github::clear_pr_cache(&repo_full_name)?;
+            crate::pr_cache::clear_pr_cache(&repo_full_name)?;
             println!("Cleared PR cache for {}.", repo_full_name);
 
             // Clear seen SHAs for current repo

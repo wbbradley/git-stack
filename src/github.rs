@@ -177,32 +177,13 @@ pub struct UpdatePrRequest<'a> {
 }
 
 // ============== PR Cache Types ==============
-
-/// Cache for closed PR data, keyed by repo full name (e.g., "owner/repo")
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct PrCache {
-    /// Version for cache format migrations
-    #[serde(default)]
-    pub version: u32,
-    /// Per-repo PR caches
-    #[serde(default)]
-    pub repos: std::collections::HashMap<String, RepoPrCache>,
-}
-
-/// Cache for a single repository's closed PRs
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RepoPrCache {
-    /// Watermark: the `updated_at` timestamp of the most recently updated PR we've seen
-    /// Format: ISO 8601 string (e.g., "2025-01-02T15:30:00Z")
-    #[serde(default)]
-    pub watermark: String,
-    /// Cached closed PRs, keyed by head branch name
-    #[serde(default)]
-    pub closed_prs: std::collections::HashMap<String, CachedPullRequest>,
-}
+//
+// The cache storage itself (schema, per-repo scoped access) lives in `crate::pr_cache`. The
+// types below are the cached PR shapes it stores; they stay here since they mirror the API
+// response types (`PullRequest` et al.) above.
 
 /// Full PR metadata for caching (mirrors PullRequest with Serialize)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedPullRequest {
     pub number: u64,
     pub state: PrState,
@@ -221,7 +202,7 @@ pub struct CachedPullRequest {
 }
 
 /// Cached branch reference (mirrors PrBranchRef with Serialize)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedPrBranchRef {
     pub ref_name: String,
     pub sha: String,
@@ -229,13 +210,13 @@ pub struct CachedPrBranchRef {
 }
 
 /// Cached repo reference
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedPrRepoRef {
     pub full_name: String,
 }
 
 /// Cached user reference
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachedPrUser {
     pub login: String,
 }
@@ -519,38 +500,51 @@ impl GitHubClient {
     /// List closed PRs with caching support.
     ///
     /// Uses a watermark timestamp strategy:
-    /// 1. Loads cached closed PRs from the provided cache
+    /// 1. Loads cached closed PRs for this repo from the cache handle
     /// 2. Fetches PRs from API sorted by `updated_at` descending
     /// 3. Stops fetching when encountering a PR older than the watermark
     /// 4. Merges fresh data with cache (fresh data wins for any branch name)
-    /// 5. Updates watermark to most recent `updated_at` seen
+    /// 5. Persists the merged data and an updated watermark (best-effort; a persistence
+    ///    failure only costs the *next* call's warm cache, not this call's result)
     pub fn list_closed_prs_with_cache(
         &self,
         repo: &RepoIdentifier,
-        cache: &mut PrCache,
+        cache: &crate::pr_cache::PrCacheHandle,
         on_progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<PrListResult, GitHubError> {
         let repo_key = repo.full_name();
 
-        // Get existing cache for this repo
-        let repo_cache = cache.repos.entry(repo_key.clone()).or_default();
-
-        let watermark = if repo_cache.watermark.is_empty() {
+        let mut closed_prs = cache.closed_prs_for_repo(&repo_key).unwrap_or_else(|e| {
+            tracing::warn!("Failed to read PR cache for {}: {}", repo_key, e);
+            std::collections::HashMap::new()
+        });
+        let watermark = cache.watermark(&repo_key).unwrap_or_else(|e| {
+            tracing::warn!("Failed to read PR cache watermark for {}: {}", repo_key, e);
             None
-        } else {
-            Some(repo_cache.watermark.clone())
-        };
+        });
+        tracing::debug!(
+            "PR cache for {}: {} cached closed PRs, watermark={:?}",
+            repo_key,
+            closed_prs.len(),
+            watermark
+        );
 
         // Fetch PRs with early termination based on watermark
         let fresh_prs =
             self.list_prs_until_watermark(repo, "closed", watermark.as_deref(), on_progress)?;
+        tracing::debug!(
+            "Fetched {} fresh closed PRs for {} (a small number means the watermark cache hit; \
+             a number near the repo's total closed-PR count means a full backfill happened)",
+            fresh_prs.len(),
+            repo_key
+        );
 
         // Track the newest updated_at for new watermark
         let mut newest_updated_at: Option<String> = None;
+        let mut fresh_cached: std::collections::HashMap<String, CachedPullRequest> =
+            std::collections::HashMap::new();
 
-        // Merge fresh PRs into cache
         for (branch_name, pr) in &fresh_prs {
-            // Track newest timestamp
             if newest_updated_at
                 .as_ref()
                 .is_none_or(|ts| pr.updated_at > *ts)
@@ -558,29 +552,39 @@ impl GitHubClient {
                 newest_updated_at = Some(pr.updated_at.clone());
             }
 
-            // Update cache with fresh data
-            repo_cache
-                .closed_prs
-                .insert(branch_name.clone(), CachedPullRequest::from(pr));
+            let cached_pr = CachedPullRequest::from(pr);
+            closed_prs.insert(branch_name.clone(), cached_pr.clone());
+            fresh_cached.insert(branch_name.clone(), cached_pr);
         }
 
-        // Update watermark if we saw newer data
-        if let Some(ts) = newest_updated_at
-            && (repo_cache.watermark.is_empty() || ts > repo_cache.watermark)
-        {
-            repo_cache.watermark = ts;
+        let new_watermark = match (&watermark, &newest_updated_at) {
+            (None, Some(ts)) => Some(ts.clone()),
+            (Some(current), Some(ts)) if ts > current => Some(ts.clone()),
+            _ => None,
+        };
+
+        tracing::debug!(
+            "Updated PR cache watermark for {}: {:?} -> {:?}",
+            repo_key,
+            watermark,
+            new_watermark
+        );
+        if let Err(e) = cache.commit_fresh_prs(
+            &repo_key,
+            fresh_cached.iter().map(|(k, v)| (k.as_str(), v)),
+            new_watermark.as_deref(),
+        ) {
+            tracing::warn!("Failed to persist PR cache for {}: {}", repo_key, e);
         }
 
         // Collect all authors from cache before filtering (for pruning decisions)
-        let all_authors: std::collections::HashMap<String, String> = repo_cache
-            .closed_prs
+        let all_authors: std::collections::HashMap<String, String> = closed_prs
             .iter()
             .map(|(branch, cached_pr)| (branch.clone(), cached_pr.user.login.clone()))
             .collect();
 
         // Convert cache to return type, applying filters
-        let prs: std::collections::HashMap<String, PullRequest> = repo_cache
-            .closed_prs
+        let prs: std::collections::HashMap<String, PullRequest> = closed_prs
             .iter()
             .map(|(k, v)| (k.clone(), PullRequest::from(v)))
             .filter(|(_, pr)| self.should_include_pr(pr))
@@ -1231,42 +1235,6 @@ pub fn login_interactive() -> Result<String> {
         "2" => setup_github_token_interactive(),
         other => bail!("Invalid choice: {other}"),
     }
-}
-
-// ============== PR Cache Functions ==============
-
-/// Get path to PR cache file
-fn get_pr_cache_path() -> Result<PathBuf> {
-    let base_dirs = xdg::BaseDirectories::with_prefix(env!("CARGO_PKG_NAME"));
-    base_dirs
-        .place_state_file("pr_cache.yaml")
-        .context("Failed to determine PR cache file path")
-}
-
-/// Load PR cache from disk
-pub fn load_pr_cache() -> Result<PrCache> {
-    let cache_path = get_pr_cache_path()?;
-    if !cache_path.exists() {
-        return Ok(PrCache::default());
-    }
-    let contents = fs::read_to_string(&cache_path).context("Failed to read PR cache file")?;
-    serde_yaml::from_str(&contents).context("Failed to parse PR cache file")
-}
-
-/// Save PR cache to disk
-pub fn save_pr_cache(cache: &PrCache) -> Result<()> {
-    let cache_path = get_pr_cache_path()?;
-    let contents = serde_yaml::to_string(cache)?;
-    write_file_secure(&cache_path, &contents)?;
-    Ok(())
-}
-
-/// Clear PR cache for a specific repo
-pub fn clear_pr_cache(repo_full_name: &str) -> Result<()> {
-    let mut cache = load_pr_cache().unwrap_or_default();
-    cache.repos.remove(repo_full_name);
-    save_pr_cache(&cache)?;
-    Ok(())
 }
 
 // ============== Cache Conversion Traits ==============

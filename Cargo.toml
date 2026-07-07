@@ -22,6 +22,7 @@ indicatif = "0.18.3"
 md5 = "0.8"
 rand = "0.10"
 ratatui = "0.30"
+redb = "4.1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9.34"

@@ -23,7 +23,6 @@ use crate::{
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
         GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest, get_repo_identifier,
-        load_pr_cache, save_pr_cache,
     },
     state::{Branch, State},
 };
@@ -565,17 +564,11 @@ fn read_remote_state(
         }
     };
 
-    // Load PR cache
-    let mut pr_cache = load_pr_cache().unwrap_or_default();
+    let cache = crate::pr_cache::PrCacheHandle::open().context("Failed to open PR cache")?;
 
     let closed_result = client
-        .list_closed_prs_with_cache(repo_id, &mut pr_cache, Some(&closed_progress))
+        .list_closed_prs_with_cache(repo_id, &cache, Some(&closed_progress))
         .map_err(|e| anyhow!("{}", e))?;
-
-    // Save updated cache (ignore errors - caching is best-effort)
-    if let Err(e) = save_pr_cache(&pr_cache) {
-        tracing::warn!("Failed to save PR cache: {}", e);
-    }
 
     let closed_prs: HashMap<String, RemotePr> = closed_result
         .prs
