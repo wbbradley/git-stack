@@ -714,12 +714,16 @@ impl State {
             .and_then(|r| find_parent_of_branch_mut(&mut r.tree, branch_name))
     }
 
-    pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
-        // For each sub-branch in the tree, check if the parent
-
-        tracing::debug!("Refreshing lkgs for all branches...");
+    /// Compute the lkg_parent updates for every branch in the tree, without applying or
+    /// persisting them. Split out from `refresh_lkgs` so tests can exercise the BFS logic
+    /// without triggering a `save_state()` write to the real XDG state file.
+    fn compute_lkg_updates(
+        &self,
+        git_repo: &GitRepo,
+        repo: &str,
+    ) -> Result<HashMap<String, Option<String>>> {
         let Some(trunk) = git_trunk(git_repo) else {
-            return Ok(());
+            return Ok(HashMap::default());
         };
 
         let mut parent_lkgs: HashMap<String, Option<String>> = HashMap::default();
@@ -761,6 +765,17 @@ impl State {
                     );
                     // Save the LKG parent for the branch.
                     parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
+                } else if !matches!(parent_lkgs.get(&branch), Some(Some(_)))
+                    && let Ok(merge_base) = git_repo.merge_base(&parent_ref, &branch_ref)
+                {
+                    tracing::debug!(
+                        lkg_parent = ?merge_base,
+                        "Branch {} has no fast-forward lkg parent; backfilling from merge-base \
+                        with {}",
+                        branch.yellow(),
+                        parent.yellow(),
+                    );
+                    parent_lkgs.insert(branch.clone(), Some(merge_base));
                 }
             }
             if let Some(branch) = self.get_tree_branch(repo, &branch) {
@@ -769,6 +784,12 @@ impl State {
                 }
             }
         }
+        Ok(parent_lkgs)
+    }
+
+    pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
+        tracing::debug!("Refreshing lkgs for all branches...");
+        let parent_lkgs = self.compute_lkg_updates(git_repo, repo)?;
         // Update the LKGs in the tree.
         for (branch, lkg_parent) in parent_lkgs {
             let branch = self
@@ -1126,5 +1147,157 @@ mod tests {
         assert_eq!(repo_state.tree.name, "main");
         assert_eq!(repo_state.tree.stack_method, StackMethod::ApplyMerge);
         assert_eq!(repo_state.tree.pr_number, None);
+    }
+
+    /// Initialize a temp repo with a root commit on `main`, plus a fake `origin` remote-tracking
+    /// ref so `git_trunk` resolves without a real network remote.
+    fn init_test_repo(dir: &Path) {
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "root"]);
+        git(&["update-ref", "refs/remotes/origin/main", "main"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+    }
+
+    fn git_rev_parse(dir: &Path, rev: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn git_run(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn repo_key(dir: &Path) -> String {
+        dir.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn compute_lkg_updates_backfills_via_merge_base() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let sha_a = git_rev_parse(dir.path(), "main");
+
+        // Branch `feature` off of `main` at commit A, then add a commit to `feature` (B) and a
+        // divergent commit to `main` (C), so `feature` is no longer a fast-forward descendant of
+        // `main`'s current tip.
+        git_run(dir.path(), &["checkout", "-b", "feature"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "feature commit"],
+        );
+        git_run(dir.path(), &["checkout", "main"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "main commit"],
+        );
+
+        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch
+            .branches
+            .push(Branch::new("feature".to_string(), None));
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
+    }
+
+    #[test]
+    fn compute_lkg_updates_does_not_overwrite_valid_lkg_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let sha_a = git_rev_parse(dir.path(), "main");
+
+        git_run(dir.path(), &["checkout", "-b", "feature"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "feature commit"],
+        );
+        git_run(dir.path(), &["checkout", "main"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "main commit"],
+        );
+
+        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch
+            .branches
+            .push(Branch::new("feature".to_string(), Some(sha_a.clone())));
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
+    }
+
+    #[test]
+    fn compute_lkg_updates_leaves_no_entry_when_no_common_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        // Create `feature` as an orphan branch with unrelated history, so `main` and `feature`
+        // share no common ancestor.
+        git_run(dir.path(), &["checkout", "--orphan", "feature"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "orphan commit"],
+        );
+        git_run(dir.path(), &["checkout", "main"]);
+
+        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch
+            .branches
+            .push(Branch::new("feature".to_string(), None));
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        assert!(matches!(updates.get("feature"), None | Some(None)));
     }
 }
