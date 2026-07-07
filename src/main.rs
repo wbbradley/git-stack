@@ -19,6 +19,7 @@ use crate::{
 mod git;
 mod git2_ops;
 mod github;
+mod llms;
 mod lock;
 mod render;
 mod state;
@@ -154,6 +155,8 @@ enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
+    /// Print an exhaustive markdown reference for LLM/agent consumers.
+    Llms(llms::LlmsArgs),
     /// Sync local git-stack state with GitHub PRs.
     /// Default: weak push then weak pull (bidirectional sync).
     Sync {
@@ -288,6 +291,11 @@ fn inner_main() -> Result<()> {
         let mut cmd = Args::command();
         generate(shell, &mut cmd, "git-stack", &mut std::io::stdout());
         return Ok(());
+    }
+
+    // Handle llms early (doesn't require git repo)
+    if let Some(Command::Llms(a)) = args.command {
+        return llms::run(a);
     }
 
     let repo = canonicalize(
@@ -465,6 +473,7 @@ fn inner_main() -> Result<()> {
             sync::sync(&git_repo, &mut state, &repo, options)
         }
         Some(Command::Completions { .. }) => unreachable!("handled above"),
+        Some(Command::Llms(_)) => unreachable!("handled above"),
         None => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
             status(
