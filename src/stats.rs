@@ -57,14 +57,6 @@ impl CommandStats {
             self.total_duration / self.count as u32
         }
     }
-
-    pub fn merge(&mut self, other: &CommandStats) {
-        self.count += other.count;
-        self.total_duration += other.total_duration;
-        if other.max_duration > self.max_duration {
-            self.max_duration = other.max_duration;
-        }
-    }
 }
 
 /// Aggregated statistics for all git commands
@@ -83,16 +75,6 @@ impl GitStats {
             .entry(command.to_string())
             .or_default()
             .record(duration);
-    }
-
-    pub fn merge(&mut self, other: &GitStats) {
-        self.total.merge(&other.total);
-        for (command, cmd_stats) in &other.by_command {
-            self.by_command
-                .entry(command.clone())
-                .or_default()
-                .merge(cmd_stats);
-        }
     }
 }
 
@@ -126,14 +108,6 @@ pub fn reset_stats() {
     GIT_STATS.with(|stats| {
         *stats.borrow_mut() = GitStats::default();
     });
-}
-
-/// Fold another thread's stats snapshot into the calling thread's accumulator. Used to recover
-/// git-op stats recorded on worker threads (spawned for parallel per-branch git ops in
-/// `render::tree_data`) back into the main thread's totals, since `--benchmark` only reads the
-/// calling thread's `GIT_STATS`.
-pub fn merge_into_current(other: &GitStats) {
-    GIT_STATS.with(|stats| stats.borrow_mut().merge(other));
 }
 
 /// Print a benchmark summary to stderr

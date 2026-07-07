@@ -3,10 +3,7 @@
 //! This module provides a `GitRepo` struct that wraps git2::Repository
 //! for fast read-only operations without spawning git processes.
 
-use std::{
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::{path::Path, time::Instant};
 
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
@@ -33,7 +30,6 @@ pub(crate) struct GitBranchStatus {
 /// Wrapper around git2::Repository for fast read-only git operations.
 pub struct GitRepo {
     repo: Repository,
-    path: PathBuf,
 }
 
 impl GitRepo {
@@ -42,16 +38,7 @@ impl GitRepo {
         let _bench = GitBenchmark::start("git2:open");
         let repo = Repository::open(path.as_ref())
             .with_context(|| format!("Failed to open repository at {:?}", path.as_ref()))?;
-        Ok(Self {
-            repo,
-            path: path.as_ref().to_path_buf(),
-        })
-    }
-
-    /// The path this repo was opened from. `git2::Repository` is `Send` but not `Sync`, so a
-    /// worker thread can't share this handle — it reopens its own via this path instead.
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok(Self { repo })
     }
 
     /// Acquire a repo-scoped advisory lock (see [`crate::lock::RepoLock`]).
