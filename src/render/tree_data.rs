@@ -106,18 +106,18 @@ fn subtree_contains(
     branch: &Branch,
     target_branch: &str,
     display_authors: &[String],
-    pr_cache: Option<&HashMap<String, PullRequest>>,
+    pr_authors: &HashMap<String, String>,
 ) -> (bool, bool) {
     let is_target = branch.name == target_branch;
-    let has_author = pr_cache
-        .and_then(|cache| cache.get(&branch.name))
-        .map(|pr| display_authors.contains(&pr.user.login))
+    let has_author = pr_authors
+        .get(&branch.name)
+        .map(|author| display_authors.contains(author))
         .unwrap_or(false);
 
     let (child_has_target, child_has_author) = branch
         .branches
         .iter()
-        .map(|b| subtree_contains(b, target_branch, display_authors, pr_cache))
+        .map(|b| subtree_contains(b, target_branch, display_authors, pr_authors))
         .fold((false, false), |(t1, a1), (t2, a2)| (t1 || t2, a1 || a2));
 
     (
@@ -143,12 +143,17 @@ fn mark_ancestor_path(branch: &Branch, target: &str, path: &mut HashSet<String>)
 /// Compute the set of branch names to hide entirely from rendering because their PR author
 /// isn't in `display_authors`. A branch is protected from hiding if it is `current_branch`, one
 /// of its ancestors, or the tree root — regardless of author. Branches with no PR (no entry in
-/// `pr_cache`) are never hidden.
+/// `pr_authors`) are never hidden.
+///
+/// `pr_authors` is expected to span open, closed, and merged PRs (unlike the open-only
+/// `pr_cache` used elsewhere for rendering PR badges) — otherwise a branch whose PR was already
+/// merged or closed by someone else would look indistinguishable from a branch that never had a
+/// PR, and would wrongly stay visible.
 fn compute_hidden_branches(
     tree: &Branch,
     current_branch: &str,
     display_authors: &[String],
-    pr_cache: Option<&HashMap<String, PullRequest>>,
+    pr_authors: &HashMap<String, String>,
     show_all: bool,
 ) -> HashSet<String> {
     let mut hidden = HashSet::new();
@@ -160,27 +165,25 @@ fn compute_hidden_branches(
     mark_ancestor_path(tree, current_branch, &mut protected);
     protected.insert(tree.name.clone()); // defensive: never hide trunk (e.g. stale current_branch)
 
-    mark_hidden(tree, display_authors, pr_cache, &protected, &mut hidden);
+    mark_hidden(tree, display_authors, pr_authors, &protected, &mut hidden);
     hidden
 }
 
 fn mark_hidden(
     branch: &Branch,
     display_authors: &[String],
-    pr_cache: Option<&HashMap<String, PullRequest>>,
+    pr_authors: &HashMap<String, String>,
     protected: &HashSet<String>,
     hidden: &mut HashSet<String>,
 ) {
     if !protected.contains(&branch.name) {
-        let pr_author = pr_cache
-            .and_then(|cache| cache.get(&branch.name))
-            .map(|pr| pr.user.login.as_str());
+        let pr_author = pr_authors.get(&branch.name).map(|s| s.as_str());
         if pr_author.is_some_and(|author| !display_authors.contains(&author.to_string())) {
             hidden.insert(branch.name.clone());
         }
     }
     for child in &branch.branches {
-        mark_hidden(child, display_authors, pr_cache, protected, hidden);
+        mark_hidden(child, display_authors, pr_authors, protected, hidden);
     }
 }
 
@@ -193,11 +196,13 @@ pub fn compute_renderable_tree(
     verbose: bool,
     pr_cache: Option<&HashMap<String, PullRequest>>,
     display_authors: &[String],
+    pr_authors: &HashMap<String, String>,
     show_all: bool,
 ) -> RenderableTree {
     let mut branches = Vec::new();
     let mut current_branch_index = None;
-    let hidden = compute_hidden_branches(tree, current_branch, display_authors, pr_cache, show_all);
+    let hidden =
+        compute_hidden_branches(tree, current_branch, display_authors, pr_authors, show_all);
 
     flatten_tree(
         git_repo,
@@ -208,6 +213,7 @@ pub fn compute_renderable_tree(
         verbose,
         pr_cache,
         display_authors,
+        pr_authors,
         &hidden,
         &mut branches,
         &mut current_branch_index,
@@ -229,6 +235,7 @@ fn flatten_tree(
     verbose: bool,
     pr_cache: Option<&HashMap<String, PullRequest>>,
     display_authors: &[String],
+    pr_authors: &HashMap<String, String>,
     hidden: &HashSet<String>,
     result: &mut Vec<RenderableBranch>,
     current_branch_index: &mut Option<usize>,
@@ -244,9 +251,7 @@ fn flatten_tree(
         }
 
         // Check if this branch should be dimmed (filtered by display_authors)
-        let pr_author = pr_cache
-            .and_then(|cache| cache.get(&branch.name))
-            .map(|pr| pr.user.login.as_str());
+        let pr_author = pr_authors.get(&branch.name).map(|s| s.as_str());
         let is_dimmed = if display_authors.is_empty() {
             false
         } else {
@@ -351,7 +356,7 @@ fn flatten_tree(
         .map(|b| {
             (
                 b.name.as_str(),
-                subtree_contains(b, current_branch, display_authors, pr_cache),
+                subtree_contains(b, current_branch, display_authors, pr_authors),
             )
         })
         .collect();
@@ -397,6 +402,7 @@ fn flatten_tree(
             verbose,
             pr_cache,
             display_authors,
+            pr_authors,
             hidden,
             result,
             current_branch_index,
@@ -433,10 +439,7 @@ fn compute_diff_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        github::{PrBranchRef, PrState, PrUser},
-        state::StackMethod,
-    };
+    use crate::state::StackMethod;
 
     fn branch(name: &str, branches: Vec<Branch>) -> Branch {
         Branch {
@@ -446,32 +449,6 @@ mod tests {
             lkg_parent: None,
             pr_number: None,
             branches,
-        }
-    }
-
-    fn make_pr(author: &str) -> PullRequest {
-        PullRequest {
-            number: 1,
-            state: PrState::Open,
-            title: "title".to_string(),
-            html_url: "https://example.com/pr/1".to_string(),
-            base: PrBranchRef {
-                ref_name: "main".to_string(),
-                sha: "0000000000000000000000000000000000000000".to_string(),
-                repo: None,
-            },
-            head: PrBranchRef {
-                ref_name: "head".to_string(),
-                sha: "0000000000000000000000000000000000000000".to_string(),
-                repo: None,
-            },
-            user: PrUser {
-                login: author.to_string(),
-            },
-            draft: false,
-            merged: false,
-            merged_at: None,
-            updated_at: "2024-01-01T00:00:00Z".to_string(),
         }
     }
 
@@ -502,24 +479,27 @@ mod tests {
         )
     }
 
-    fn fixture_pr_cache() -> HashMap<String, PullRequest> {
-        let mut cache = HashMap::new();
-        cache.insert("alice-1".to_string(), make_pr("alice"));
-        cache.insert("bob-1".to_string(), make_pr("bob"));
-        cache.insert("carol-1".to_string(), make_pr("carol"));
-        cache.insert("carol-1-child".to_string(), make_pr("alice"));
-        cache.insert("eve-1".to_string(), make_pr("eve"));
-        cache
+    /// The `pr_authors` map is state-agnostic by design: the caller (`main.rs`) merges authors
+    /// from open, closed, and merged PRs before hiding decisions are made, so a branch whose PR
+    /// was merged by an unlisted author is hidden exactly like one with a still-open PR from
+    /// that author. These fixtures don't distinguish PR state for that reason.
+    fn fixture_pr_authors() -> HashMap<String, String> {
+        let mut authors = HashMap::new();
+        authors.insert("alice-1".to_string(), "alice".to_string());
+        authors.insert("bob-1".to_string(), "bob".to_string());
+        authors.insert("carol-1".to_string(), "carol".to_string());
+        authors.insert("carol-1-child".to_string(), "alice".to_string());
+        authors.insert("eve-1".to_string(), "eve".to_string());
+        authors
     }
 
     #[test]
     fn hides_branches_with_unlisted_pr_author() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
         let display_authors = vec!["alice".to_string()];
 
-        let hidden =
-            compute_hidden_branches(&tree, "bob-1", &display_authors, Some(&pr_cache), false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
 
         let expected: HashSet<String> =
             ["carol-1", "eve-1"].iter().map(|s| s.to_string()).collect();
@@ -529,11 +509,10 @@ mod tests {
     #[test]
     fn protects_current_branch_and_its_ancestors() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
         let display_authors = vec!["alice".to_string()];
 
-        let hidden =
-            compute_hidden_branches(&tree, "bob-1", &display_authors, Some(&pr_cache), false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
 
         assert!(!hidden.contains("bob-1"));
         assert!(!hidden.contains("alice-1"));
@@ -542,11 +521,10 @@ mod tests {
     #[test]
     fn never_hides_branches_without_a_pr() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
         let display_authors = vec!["alice".to_string()];
 
-        let hidden =
-            compute_hidden_branches(&tree, "bob-1", &display_authors, Some(&pr_cache), false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
 
         assert!(!hidden.contains("main"));
         assert!(!hidden.contains("dave-1"));
@@ -555,11 +533,10 @@ mod tests {
     #[test]
     fn hidden_branch_does_not_hide_its_own_listed_author_child() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
         let display_authors = vec!["alice".to_string()];
 
-        let hidden =
-            compute_hidden_branches(&tree, "bob-1", &display_authors, Some(&pr_cache), false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
 
         assert!(hidden.contains("carol-1"));
         assert!(!hidden.contains("carol-1-child"));
@@ -568,9 +545,9 @@ mod tests {
     #[test]
     fn empty_display_authors_hides_nothing() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &[], Some(&pr_cache), false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &[], &pr_authors, false);
 
         assert!(hidden.is_empty());
     }
@@ -578,19 +555,18 @@ mod tests {
     #[test]
     fn show_all_disables_hiding() {
         let tree = fixture_tree();
-        let pr_cache = fixture_pr_cache();
+        let pr_authors = fixture_pr_authors();
         let display_authors = vec!["alice".to_string()];
 
-        let hidden =
-            compute_hidden_branches(&tree, "bob-1", &display_authors, Some(&pr_cache), true);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, true);
 
         assert!(hidden.is_empty());
     }
 
     #[test]
     fn tree_root_is_never_hidden() {
-        let mut cache = HashMap::new();
-        cache.insert("main".to_string(), make_pr("mallory"));
+        let mut pr_authors = HashMap::new();
+        pr_authors.insert("main".to_string(), "mallory".to_string());
         let tree = branch("main", vec![]);
         let display_authors = vec!["alice".to_string()];
 
@@ -599,10 +575,27 @@ mod tests {
             &tree,
             "does-not-exist",
             &display_authors,
-            Some(&cache),
+            &pr_authors,
             false,
         );
 
         assert!(!hidden.contains(&tree.name));
+    }
+
+    #[test]
+    fn hides_branch_whose_pr_author_came_only_from_the_merged_or_closed_lookup() {
+        // Regression test: a branch whose PR was merged/closed by an unlisted author must be
+        // hidden even though it would never appear in an open-PRs-only cache. `pr_authors` is
+        // exactly the data the caller builds by merging open + closed/merged author lookups, so
+        // this is indistinguishable at this layer from `hides_branches_with_unlisted_pr_author`
+        // — the fix lives in what main.rs feeds into `pr_authors`, not in this function.
+        let tree = branch("main", vec![branch("mallory-1", vec![])]);
+        let mut pr_authors = HashMap::new();
+        pr_authors.insert("mallory-1".to_string(), "mallory".to_string());
+        let display_authors = vec!["alice".to_string()];
+
+        let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
+
+        assert!(hidden.contains("mallory-1"));
     }
 }

@@ -553,10 +553,10 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch PR cache from GitHub, returning None on any error (graceful degradation)
-fn fetch_pr_cache(
-    git_repo: &GitRepo,
-) -> Option<std::collections::HashMap<String, github::PullRequest>> {
+/// Fetch open PRs from GitHub, returning None on any error (graceful degradation). Carries
+/// `all_authors` (branch -> author, including fork PRs filtered out of `.prs`) alongside the
+/// render-ready `.prs` map so `add_closed_pr_authors` doesn't need a second open-PR fetch.
+fn fetch_pr_cache(git_repo: &GitRepo) -> Option<github::PrListResult> {
     // Try to get repo identifier from remote URL
     let repo_id = github::get_repo_identifier(git_repo).ok()?;
 
@@ -565,12 +565,40 @@ fn fetch_pr_cache(
 
     // Try to fetch all open PRs
     match client.list_open_prs(&repo_id, None) {
-        Ok(result) => Some(result.prs),
+        Ok(result) => Some(result),
         Err(e) => {
             tracing::debug!("Failed to fetch PR info: {}", e);
             None
         }
     }
+}
+
+/// Extend an open-PR author lookup (from `fetch_pr_cache`'s `all_authors`) with authors of
+/// closed/merged PRs, for display_authors-based hiding. Open-only author data can't tell
+/// whether a branch with no open PR was never turned into one (must stay visible) from one
+/// whose PR was merged or closed by someone else (should be hidden) — this fills that gap.
+/// Closed PRs are fetched through the same on-disk watermark cache `git stack sync` uses, so
+/// only the very first call after enabling `display_authors` pays the full historical fetch
+/// cost; subsequent calls only page until the watermark. Returns `authors` unchanged on any
+/// error (graceful degradation — hides nothing beyond what the input already allows).
+fn add_closed_pr_authors(
+    git_repo: &GitRepo,
+    mut authors: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let Ok(repo_id) = github::get_repo_identifier(git_repo) else {
+        return authors;
+    };
+    let Ok(client) = github::GitHubClient::from_env(&repo_id) else {
+        return authors;
+    };
+
+    let mut pr_cache = github::load_pr_cache().unwrap_or_default();
+    if let Ok(result) = client.list_closed_prs_with_cache(&repo_id, &mut pr_cache, None) {
+        authors.extend(result.all_authors);
+        let _ = github::save_pr_cache(&pr_cache);
+    }
+
+    authors
 }
 
 fn status(
@@ -592,10 +620,23 @@ fn status(
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
     // Try to fetch PR info from GitHub (graceful degradation on failure)
-    let pr_cache = fetch_pr_cache(git_repo);
+    let pr_result = fetch_pr_cache(git_repo);
 
-    // Load display_authors for filtering (show other authors dimmed)
+    // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
+
+    // Only pay for the closed/merged-PR author lookup when hiding is actually active; it's a
+    // no-op input when display_authors is empty or --show-all is passed.
+    let pr_authors = if show_all || display_authors.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let open_authors = pr_result
+            .as_ref()
+            .map(|r| r.all_authors.clone())
+            .unwrap_or_default();
+        add_closed_pr_authors(git_repo, open_authors)
+    };
+    let pr_cache = pr_result.map(|r| r.prs);
 
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
@@ -610,6 +651,7 @@ fn status(
         verbose,
         pr_cache.as_ref(),
         &display_authors,
+        &pr_authors,
         show_all,
     );
 
@@ -643,10 +685,23 @@ fn interactive(
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
     // Try to fetch PR info from GitHub (graceful degradation on failure)
-    let pr_cache = fetch_pr_cache(git_repo);
+    let pr_result = fetch_pr_cache(git_repo);
 
-    // Load display_authors for filtering (show other authors dimmed)
+    // Load display_authors for filtering (hides branches whose PR author isn't listed)
     let display_authors = github::load_display_authors();
+
+    // Only pay for the closed/merged-PR author lookup when hiding is actually active; it's a
+    // no-op input when display_authors is empty or --show-all is passed.
+    let pr_authors = if show_all || display_authors.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let open_authors = pr_result
+            .as_ref()
+            .map(|r| r.all_authors.clone())
+            .unwrap_or_default();
+        add_closed_pr_authors(git_repo, open_authors)
+    };
+    let pr_cache = pr_result.map(|r| r.prs);
 
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
@@ -661,6 +716,7 @@ fn interactive(
         verbose,
         pr_cache.as_ref(),
         &display_authors,
+        &pr_authors,
         show_all,
     );
 
