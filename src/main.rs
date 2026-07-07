@@ -42,6 +42,13 @@ struct Args {
     )]
     json: bool,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Show all branches, bypassing display_authors-based hiding"
+    )]
+    show_all: bool,
+
     /// Subcommand to run.
     #[command(subcommand)]
     command: Option<Command>,
@@ -416,11 +423,19 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 fetch,
                 args.verbose,
+                args.show_all,
             )
         }
         Some(Command::Interactive) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
-            interactive(&git_repo, state, &repo, &current_branch, args.verbose)
+            interactive(
+                &git_repo,
+                state,
+                &repo,
+                &current_branch,
+                args.verbose,
+                args.show_all,
+            )
         }
         Some(Command::Up) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
@@ -483,6 +498,7 @@ fn inner_main() -> Result<()> {
                 &current_branch,
                 false,
                 args.verbose,
+                args.show_all,
             )
         }
     }
@@ -564,6 +580,7 @@ fn status(
     orig_branch: &str,
     fetch: bool,
     verbose: bool,
+    show_all: bool,
 ) -> Result<()> {
     if fetch {
         git_fetch()?;
@@ -593,6 +610,7 @@ fn status(
         verbose,
         pr_cache.as_ref(),
         &display_authors,
+        show_all,
     );
 
     // Render to CLI
@@ -616,6 +634,7 @@ fn interactive(
     repo: &str,
     orig_branch: &str,
     verbose: bool,
+    show_all: bool,
 ) -> Result<()> {
     // ensure_trunk creates the tree if it doesn't exist (no-op if no remote)
     let _trunk = state.ensure_trunk(git_repo, repo);
@@ -642,6 +661,7 @@ fn interactive(
         verbose,
         pr_cache.as_ref(),
         &display_authors,
+        show_all,
     );
 
     // Run TUI and handle checkout if user selected a branch

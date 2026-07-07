@@ -125,7 +125,8 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 
 Global flags (valid on any subcommand): `-v`/`--verbose`, `--benchmark` (print
 git-command timing stats), `--json` (emit those stats as JSON, implies
-`--benchmark`).
+`--benchmark`), `--show-all` (bypasses `display_authors`-based hiding for this
+invocation).
 
 ## 4. State file
 
@@ -219,6 +220,12 @@ PR columns in `status`) need a token. Config lives at
 
 Graceful degradation: with **no** resolvable token, read-only commands still
 work — `git stack status` renders the tree, just without PR numbers/state.
+
+`display_authors` (list of GitHub logins) in `github.yaml` — when non-empty,
+`status`/`interactive` hide branches whose PR author isn't listed, except the
+current branch and its ancestor chain to trunk, and any branch with no PR yet.
+A hidden branch's visible descendants reparent to the nearest visible ancestor
+for display purposes only. `--show-all` disables this for one invocation.
 
 ## 7. PR workflow
 

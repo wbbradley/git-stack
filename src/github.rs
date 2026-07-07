@@ -23,7 +23,9 @@ pub struct GitHubConfig {
     pub token: String,
     pub api_base: String,
     /// GitHub usernames whose PRs should be displayed prominently in status.
-    /// When non-empty, PRs from other authors will be shown dimmed/collapsed.
+    /// When non-empty, branches whose PR author isn't listed are hidden from
+    /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
+    /// branches with no PR yet. `--show-all` bypasses this for one invocation.
     /// No longer used for filtering during sync.
     pub display_authors: Vec<String>,
 }
@@ -906,7 +908,9 @@ struct GitHubConfigFile {
     default_token: Option<String>,
     hosts: Option<std::collections::HashMap<String, String>>,
     /// GitHub usernames whose PRs should be displayed prominently in status.
-    /// When set, PRs from other authors will be shown dimmed/collapsed.
+    /// When non-empty, branches whose PR author isn't listed are hidden from
+    /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
+    /// branches with no PR yet. `--show-all` bypasses this for one invocation.
     #[serde(default)]
     display_authors: Vec<String>,
     /// OAuth device-flow token (distinct from `default_token`, which holds a PAT).
