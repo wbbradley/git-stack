@@ -187,6 +187,19 @@ fn mark_hidden(
     }
 }
 
+/// A visible branch after ordering/hiding/depth are resolved, before its git-derived fields
+/// (`status`, `diff_stats`, etc.) are computed. Produced by the pure `plan_tree` pass; consumed
+/// in parallel by `compute_branches_parallel`.
+struct PlannedBranch<'a> {
+    branch: &'a Branch,
+    parent_branch: Option<&'a str>,
+    depth: usize,
+    is_current: bool,
+    is_dimmed: bool,
+    pr_info: Option<PrRenderInfo>,
+    note_preview: Option<String>,
+}
+
 /// Compute a renderable tree from the branch tree.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_renderable_tree(
@@ -199,25 +212,25 @@ pub fn compute_renderable_tree(
     pr_authors: &HashMap<String, String>,
     show_all: bool,
 ) -> RenderableTree {
-    let mut branches = Vec::new();
-    let mut current_branch_index = None;
     let hidden =
         compute_hidden_branches(tree, current_branch, display_authors, pr_authors, show_all);
 
-    flatten_tree(
-        git_repo,
+    let mut planned = Vec::new();
+    let mut current_branch_index = None;
+    plan_tree(
         tree,
         None,
         0,
         current_branch,
-        verbose,
         pr_cache,
         display_authors,
         pr_authors,
         &hidden,
-        &mut branches,
+        &mut planned,
         &mut current_branch_index,
     );
+
+    let branches = compute_branches_parallel(git_repo, &planned, verbose);
 
     RenderableTree {
         branches,
@@ -225,19 +238,21 @@ pub fn compute_renderable_tree(
     }
 }
 
+/// Pure ordering/hiding/depth pass: decides which branches are visible, their display order and
+/// depth, and precomputes everything that needs no git calls. No git ops happen here, so this can
+/// run entirely on the calling thread before the parallel git-op pass in
+/// `compute_branches_parallel`.
 #[allow(clippy::too_many_arguments)]
-fn flatten_tree(
-    git_repo: &GitRepo,
-    branch: &Branch,
-    parent_branch: Option<&str>,
+fn plan_tree<'a>(
+    branch: &'a Branch,
+    parent_branch: Option<&'a str>,
     depth: usize,
     current_branch: &str,
-    verbose: bool,
     pr_cache: Option<&HashMap<String, PullRequest>>,
     display_authors: &[String],
     pr_authors: &HashMap<String, String>,
     hidden: &HashSet<String>,
-    result: &mut Vec<RenderableBranch>,
+    result: &mut Vec<PlannedBranch<'a>>,
     current_branch_index: &mut Option<usize>,
 ) {
     let is_current = branch.name == current_branch;
@@ -258,43 +273,6 @@ fn flatten_tree(
             pr_author.is_some_and(|author| !display_authors.contains(&author.to_string()))
         };
 
-        // Check if branch is remote-only (not local)
-        let is_remote_only = !git_repo.branch_exists(&branch.name);
-
-        // Get branch status
-        let status = git_repo
-            .branch_status(parent_branch, &branch.name)
-            .ok()
-            .map(|bs| BranchRenderStatus {
-                exists: bs.exists,
-                is_descendent: bs.is_descendent,
-                sha: bs.sha,
-                parent_branch: bs.parent_branch,
-                upstream_synced: bs.upstream_status.as_ref().map(|us| us.synced),
-                upstream_name: bs.upstream_status.map(|us| us.symbolic_name),
-            });
-
-        // Compute diff stats
-        let diff_stats = if let Some(ref status) = status {
-            compute_diff_stats(git_repo, branch, status)
-        } else {
-            None
-        };
-
-        // Get local status (only for current branch)
-        let local_status = if is_current {
-            get_local_status()
-                .ok()
-                .filter(|s| !s.is_clean())
-                .map(|s| LocalStatus {
-                    staged: s.staged,
-                    unstaged: s.unstaged,
-                    untracked: s.untracked,
-                })
-        } else {
-            None
-        };
-
         // Get PR info
         let pr_info = pr_cache
             .and_then(|cache| cache.get(&branch.name))
@@ -312,38 +290,14 @@ fn flatten_tree(
             .and_then(|note| note.lines().next())
             .map(|s| s.to_string());
 
-        // Compute verbose details if requested
-        let verbose_details = if verbose {
-            status.as_ref().map(|s| VerboseDetails {
-                stacked_on: s.parent_branch.clone(),
-                is_diverged: !s.is_descendent,
-                upstream_status: s
-                    .upstream_name
-                    .as_ref()
-                    .map(|name| (name.clone(), s.upstream_synced.unwrap_or(false))),
-                lkg_parent: branch.lkg_parent.as_ref().map(|s| s[..8].to_string()),
-                stack_method: match branch.stack_method {
-                    crate::state::StackMethod::ApplyMerge => "apply-merge".to_string(),
-                    crate::state::StackMethod::Merge => "merge".to_string(),
-                },
-            })
-        } else {
-            None
-        };
-
-        result.push(RenderableBranch {
-            name: branch.name.clone(),
+        result.push(PlannedBranch {
+            branch,
+            parent_branch,
             depth,
             is_current,
             is_dimmed,
-            is_remote_only,
-            status,
-            diff_stats,
-            local_status,
             pr_info,
             note_preview,
-            verbose: verbose_details,
-            index,
         });
     }
 
@@ -393,13 +347,11 @@ fn flatten_tree(
     // is untouched).
     let child_depth = if is_hidden { depth } else { depth + 1 };
     for child in children {
-        flatten_tree(
-            git_repo,
+        plan_tree(
             child,
-            Some(&branch.name),
+            Some(branch.name.as_str()),
             child_depth,
             current_branch,
-            verbose,
             pr_cache,
             display_authors,
             pr_authors,
@@ -407,6 +359,152 @@ fn flatten_tree(
             result,
             current_branch_index,
         );
+    }
+}
+
+/// Cap on parallel git-op workers, independent of core count.
+///
+/// Benchmarked against a 402-branch repo on an 18-core machine: raising worker count past ~4-6
+/// stops helping and past ~10 actively regresses wall-clock (18 workers: aggregate git-op time
+/// balloons from 5.5s serial to ~49s and involuntary context switches explode ~1000x, while
+/// wall-clock barely improves over 1 worker). This is libgit2-level contention from many threads
+/// each independently reopening and reading the same on-disk repository (its object/pack-file
+/// access paths share process-global state), not something this crate can tune away — increasing
+/// libgit2's mmap-window limits (`git2::opts::set_mwindow_mapped_limit`/`set_mwindow_file_limit`)
+/// had no measurable effect in testing. 4 workers is the smallest count that captures nearly all
+/// of the measured speedup (~2.5-3x on the local-compute portion) with the least contention
+/// overhead, so it's a safe fixed cap rather than scaling with `available_parallelism()`.
+const MAX_GIT_OP_WORKERS: usize = 4;
+
+/// Git-op pass: computes the git-derived fields (`is_remote_only`, `status`, `diff_stats`,
+/// `local_status`, `verbose`) for every planned branch, spread across worker threads. Each worker
+/// opens its own `GitRepo` handle since `git2::Repository` is `Send` but not `Sync`.
+fn compute_branches_parallel(
+    git_repo: &GitRepo,
+    planned: &[PlannedBranch<'_>],
+    verbose: bool,
+) -> Vec<RenderableBranch> {
+    if planned.is_empty() {
+        return Vec::new();
+    }
+
+    let repo_path = git_repo.path().to_path_buf();
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX_GIT_OP_WORKERS)
+        .min(planned.len());
+    let chunk_size = planned.len().div_ceil(num_workers);
+
+    let mut results = Vec::with_capacity(planned.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = planned
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let repo_path = repo_path.clone();
+                scope.spawn(move || {
+                    let worker_repo = GitRepo::open(&repo_path)
+                        .expect("git-stack: failed to reopen repository on worker thread");
+                    let rendered: Vec<RenderableBranch> = chunk
+                        .iter()
+                        .map(|planned| compute_branch_render_data(&worker_repo, planned, verbose))
+                        .collect();
+                    (rendered, crate::stats::get_stats())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (rendered, worker_stats) = handle
+                .join()
+                .expect("git-stack: worker thread panicked computing branch status");
+            crate::stats::merge_into_current(&worker_stats);
+            results.extend(rendered);
+        }
+    });
+
+    for (index, branch) in results.iter_mut().enumerate() {
+        branch.index = index;
+    }
+    results
+}
+
+fn compute_branch_render_data(
+    git_repo: &GitRepo,
+    planned: &PlannedBranch<'_>,
+    verbose: bool,
+) -> RenderableBranch {
+    let branch = planned.branch;
+
+    // Check if branch is remote-only (not local)
+    let is_remote_only = !git_repo.branch_exists(&branch.name);
+
+    // Get branch status
+    let status = git_repo
+        .branch_status(planned.parent_branch, &branch.name)
+        .ok()
+        .map(|bs| BranchRenderStatus {
+            exists: bs.exists,
+            is_descendent: bs.is_descendent,
+            sha: bs.sha,
+            parent_branch: bs.parent_branch,
+            upstream_synced: bs.upstream_status.as_ref().map(|us| us.synced),
+            upstream_name: bs.upstream_status.map(|us| us.symbolic_name),
+        });
+
+    // Compute diff stats
+    let diff_stats = if let Some(ref status) = status {
+        compute_diff_stats(git_repo, branch, status)
+    } else {
+        None
+    };
+
+    // Get local status (only for current branch)
+    let local_status = if planned.is_current {
+        get_local_status()
+            .ok()
+            .filter(|s| !s.is_clean())
+            .map(|s| LocalStatus {
+                staged: s.staged,
+                unstaged: s.unstaged,
+                untracked: s.untracked,
+            })
+    } else {
+        None
+    };
+
+    // Compute verbose details if requested
+    let verbose_details = if verbose {
+        status.as_ref().map(|s| VerboseDetails {
+            stacked_on: s.parent_branch.clone(),
+            is_diverged: !s.is_descendent,
+            upstream_status: s
+                .upstream_name
+                .as_ref()
+                .map(|name| (name.clone(), s.upstream_synced.unwrap_or(false))),
+            lkg_parent: branch.lkg_parent.as_ref().map(|s| s[..8].to_string()),
+            stack_method: match branch.stack_method {
+                crate::state::StackMethod::ApplyMerge => "apply-merge".to_string(),
+                crate::state::StackMethod::Merge => "merge".to_string(),
+            },
+        })
+    } else {
+        None
+    };
+
+    RenderableBranch {
+        name: branch.name.clone(),
+        depth: planned.depth,
+        is_current: planned.is_current,
+        is_dimmed: planned.is_dimmed,
+        is_remote_only,
+        status,
+        diff_stats,
+        local_status,
+        pr_info: planned.pr_info.clone(),
+        note_preview: planned.note_preview.clone(),
+        verbose: verbose_details,
+        index: 0, // fixed up in compute_branches_parallel after concatenation
     }
 }
 
@@ -439,7 +537,7 @@ fn compute_diff_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::StackMethod;
+    use crate::{state::StackMethod, stats};
 
     fn branch(name: &str, branches: Vec<Branch>) -> Branch {
         Branch {
@@ -597,5 +695,159 @@ mod tests {
         let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
 
         assert!(hidden.contains("mallory-1"));
+    }
+
+    fn commit_with_file(
+        repo: &git2::Repository,
+        sig: &git2::Signature,
+        base_tree: Option<&git2::Tree>,
+        file_name: &str,
+        file_contents: &str,
+        parent: Option<&git2::Commit>,
+    ) -> git2::Oid {
+        let mut builder = repo.treebuilder(base_tree).unwrap();
+        let blob = repo.blob(file_contents.as_bytes()).unwrap();
+        builder.insert(file_name, blob, 0o100644).unwrap();
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let parents: Vec<&git2::Commit> = parent.into_iter().collect();
+        repo.commit(None, sig, sig, "msg", &tree, &parents).unwrap()
+    }
+
+    /// main -> feature-a (lkg_parent set) -> feature-b (no lkg_parent, exercises merge_base
+    /// fallback); main -> feature-c (lkg_parent set, sibling of feature-a).
+    fn build_fixture_repo() -> (tempfile::TempDir, GitRepo, Branch) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+
+        let main_id = commit_with_file(&repo, &sig, None, "README.md", "root\n", None);
+        let main_commit = repo.find_commit(main_id).unwrap();
+        repo.branch("main", &main_commit, false).unwrap();
+
+        let a_id = commit_with_file(
+            &repo,
+            &sig,
+            Some(&main_commit.tree().unwrap()),
+            "a.txt",
+            "a\n",
+            Some(&main_commit),
+        );
+        let a_commit = repo.find_commit(a_id).unwrap();
+        repo.branch("feature-a", &a_commit, false).unwrap();
+
+        let b_id = commit_with_file(
+            &repo,
+            &sig,
+            Some(&a_commit.tree().unwrap()),
+            "b.txt",
+            "b\nb2\n",
+            Some(&a_commit),
+        );
+        repo.branch("feature-b", &repo.find_commit(b_id).unwrap(), false)
+            .unwrap();
+
+        let c_id = commit_with_file(
+            &repo,
+            &sig,
+            Some(&main_commit.tree().unwrap()),
+            "c.txt",
+            "c\n",
+            Some(&main_commit),
+        );
+        repo.branch("feature-c", &repo.find_commit(c_id).unwrap(), false)
+            .unwrap();
+
+        let tree = branch(
+            "main",
+            vec![
+                {
+                    let mut a = branch("feature-a", vec![branch("feature-b", vec![])]);
+                    a.lkg_parent = Some(main_id.to_string());
+                    a
+                },
+                {
+                    let mut c = branch("feature-c", vec![]);
+                    c.lkg_parent = Some(main_id.to_string());
+                    c
+                },
+            ],
+        );
+
+        let git_repo = GitRepo::open(dir.path()).unwrap();
+        (dir, git_repo, tree)
+    }
+
+    #[test]
+    fn parallel_pass_matches_expected_order_depth_and_diff_stats() {
+        stats::reset_stats();
+        let (_dir, git_repo, tree) = build_fixture_repo();
+
+        let renderable = compute_renderable_tree(
+            &git_repo,
+            &tree,
+            "not-a-real-branch",
+            false,
+            None,
+            &[],
+            &HashMap::new(),
+            true,
+        );
+
+        let names: Vec<&str> = renderable
+            .branches
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(names, ["main", "feature-a", "feature-b", "feature-c"]);
+        assert_eq!(
+            renderable
+                .branches
+                .iter()
+                .map(|b| b.depth)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 1]
+        );
+        assert_eq!(renderable.current_branch_index, None);
+
+        let by_name: HashMap<&str, &RenderableBranch> = renderable
+            .branches
+            .iter()
+            .map(|b| (b.name.as_str(), b))
+            .collect();
+
+        let a_stats = by_name["feature-a"].diff_stats.as_ref().unwrap();
+        assert_eq!(
+            (a_stats.additions, a_stats.deletions, a_stats.reliable),
+            (1, 0, true)
+        );
+
+        let b_stats = by_name["feature-b"].diff_stats.as_ref().unwrap();
+        assert_eq!(
+            (b_stats.additions, b_stats.deletions, b_stats.reliable),
+            (2, 0, false)
+        );
+
+        let c_stats = by_name["feature-c"].diff_stats.as_ref().unwrap();
+        assert_eq!(
+            (c_stats.additions, c_stats.deletions, c_stats.reliable),
+            (1, 0, true)
+        );
+
+        // Regression guard for the thread-local GIT_STATS aggregation: without merging worker
+        // stats back into the main thread, `git2:diff-stats`/`git2:open` counts below would be
+        // near zero (only whatever ran on the main thread itself).
+        let stats = stats::get_stats();
+        assert_eq!(
+            stats.by_command.get("git2:diff-stats").map(|s| s.count),
+            Some(3)
+        );
+        assert!(
+            stats
+                .by_command
+                .get("git2:open")
+                .map(|s| s.count)
+                .unwrap_or(0)
+                >= 2
+        );
     }
 }
