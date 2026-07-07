@@ -787,17 +787,34 @@ impl State {
         Ok(parent_lkgs)
     }
 
-    pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
-        tracing::debug!("Refreshing lkgs for all branches...");
-        let parent_lkgs = self.compute_lkg_updates(git_repo, repo)?;
-        // Update the LKGs in the tree.
+    /// Apply computed `lkg_parent` updates to the tree. Returns whether any branch's value
+    /// actually changed, so callers can skip a `save_state()` write when the BFS just recomputed
+    /// the same values the tree already had.
+    fn apply_lkg_updates(
+        &mut self,
+        repo: &str,
+        parent_lkgs: HashMap<String, Option<String>>,
+    ) -> Result<bool> {
+        let mut changed = false;
         for (branch, lkg_parent) in parent_lkgs {
             let branch = self
                 .get_tree_branch_mut(repo, &branch)
                 .ok_or_else(|| anyhow!("Branch {branch} not found in the git-stack tree."))?;
-            branch.lkg_parent = lkg_parent;
+            if branch.lkg_parent != lkg_parent {
+                branch.lkg_parent = lkg_parent;
+                changed = true;
+            }
         }
-        self.save_state()?;
+        Ok(changed)
+    }
+
+    pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
+        let _bench = crate::stats::GitBenchmark::start("state:refresh-lkgs");
+        tracing::debug!("Refreshing lkgs for all branches...");
+        let parent_lkgs = self.compute_lkg_updates(git_repo, repo)?;
+        if self.apply_lkg_updates(repo, parent_lkgs)? {
+            self.save_state()?;
+        }
         Ok(())
     }
 
@@ -1299,5 +1316,53 @@ mod tests {
 
         let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
         assert!(matches!(updates.get("feature"), None | Some(None)));
+    }
+
+    #[test]
+    fn apply_lkg_updates_reports_no_change_when_values_match() {
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches.push(Branch::new(
+            "feature".to_string(),
+            Some("abc123".to_string()),
+        ));
+        let mut state = State {
+            repos: [("repo".to_string(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = [("feature".to_string(), Some("abc123".to_string()))]
+            .into_iter()
+            .collect();
+        let changed = state.apply_lkg_updates("repo", updates).unwrap();
+        assert!(!changed);
+        assert_eq!(
+            state.get_tree_branch("repo", "feature").unwrap().lkg_parent,
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_lkg_updates_reports_change_when_value_differs() {
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches.push(Branch::new(
+            "feature".to_string(),
+            Some("abc123".to_string()),
+        ));
+        let mut state = State {
+            repos: [("repo".to_string(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = [("feature".to_string(), Some("def456".to_string()))]
+            .into_iter()
+            .collect();
+        let changed = state.apply_lkg_updates("repo", updates).unwrap();
+        assert!(changed);
+        assert_eq!(
+            state.get_tree_branch("repo", "feature").unwrap().lkg_parent,
+            Some("def456".to_string())
+        );
     }
 }
