@@ -753,10 +753,12 @@ fn add_closed_pr_authors(
 /// while another author's stray/renamed branch resolves to them and gets hidden. A commit that
 /// GitHub can't attribute to any account (unpushed, or a non-GitHub-verified email) leaves
 /// `authors` unchanged for that branch, which keeps it protected — "can't tell" still means
-/// "don't hide". Mutates `authors` in place; does one API call per still-unresolved branch.
+/// "don't hide". Mutates `authors` in place; makes the per-branch commit-author calls in parallel
+/// (mirroring `list_open_prs_for_branches`) and bounds the total to `MAX_COMMIT_AUTHOR_LOOKUPS`.
 fn add_commit_authors(
     git_repo: &GitRepo,
     tree: &Branch,
+    orig_branch: &str,
     authors: &mut std::collections::HashMap<String, String>,
 ) {
     let Ok(repo_id) = github::get_repo_identifier(git_repo) else {
@@ -769,17 +771,108 @@ fn add_commit_authors(
     let mut unresolved = Vec::new();
     collect_branches_without_author(tree, authors, &mut unresolved);
 
-    for branch_name in unresolved {
-        let sha = git_repo.sha(&branch_name).ok().or_else(|| {
-            git_repo
-                .sha(&format!("{DEFAULT_REMOTE}/{branch_name}"))
-                .ok()
-        });
-        let Some(sha) = sha else { continue };
-        if let Ok(Some(login)) = client.get_commit_author(&repo_id, &sha) {
-            authors.insert(branch_name, login);
-        }
+    // Protected branches (current branch + ancestors + trunk) are never consulted by hiding, so
+    // resolving their author is pure waste — drop them, then cap the remainder.
+    let protected = render::compute_protected_branches(tree, orig_branch);
+    let (to_resolve, skipped) =
+        plan_commit_author_lookups(unresolved, &protected, MAX_COMMIT_AUTHOR_LOOKUPS);
+    if !skipped.is_empty() {
+        // No silent caps: surface the branches we're deliberately not resolving. They stay
+        // visible ("can't tell ⇒ don't hide") — safe degradation, never a wrong hide.
+        eprintln!(
+            "Warning: skipping commit-author lookup for {} branch(es) over the cap of {} \
+             (they stay visible): {}",
+            skipped.len(),
+            MAX_COMMIT_AUTHOR_LOOKUPS,
+            skipped.join(", ")
+        );
     }
+
+    // Resolve tip SHAs on the main thread: git2 `GitRepo::sha` is Send but not Sync, so it can't
+    // be shared across the network workers. It's cheap local work anyway.
+    let pairs: Vec<(String, String)> = to_resolve
+        .into_iter()
+        .filter_map(|branch_name| {
+            let sha = git_repo.sha(&branch_name).ok().or_else(|| {
+                git_repo
+                    .sha(&format!("{DEFAULT_REMOTE}/{branch_name}"))
+                    .ok()
+            })?;
+            Some((branch_name, sha))
+        })
+        .collect();
+
+    if pairs.is_empty() {
+        return;
+    }
+
+    // Parallelize the network calls only. `GitHubClient`/`ureq::Agent` is Sync (unlike GitRepo),
+    // so workers can share `&client` + `&repo_id`. Mirrors `list_open_prs_for_branches`.
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(pairs.len())
+        .min(8);
+
+    let mut buckets: Vec<Vec<&(String, String)>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (i, pair) in pairs.iter().enumerate() {
+        buckets[i % worker_count].push(pair);
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                let client = &client;
+                let repo_id = &repo_id;
+                scope.spawn(move || {
+                    let mut found: Vec<(String, String)> = Vec::new();
+                    for (branch, sha) in bucket {
+                        if let Ok(Some(login)) = client.get_commit_author(repo_id, sha) {
+                            found.push((branch.clone(), login));
+                        }
+                    }
+                    // `GitBenchmark` records into thread-local stats, so hand this worker's
+                    // `github:get-commit-author` spans back for merging into the caller's thread.
+                    (found, crate::stats::get_stats())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            if let Ok((found, stats)) = handle.join() {
+                for (branch, login) in found {
+                    authors.insert(branch, login);
+                }
+                crate::stats::merge_into_current(&stats);
+            }
+        }
+    });
+}
+
+/// Maximum number of per-branch commit-author API calls the fallback will make in one render.
+/// Generous enough that real stacks never hit it, small enough to bound the pathological case to
+/// ~`ceil(cap / 8)` round-trips.
+const MAX_COMMIT_AUTHOR_LOOKUPS: usize = 50;
+
+/// Split unresolved branches into those we'll resolve and those we'll skip: drop `protected`
+/// branches (hiding never consults their author), then cap the remainder so a pathological branch
+/// count can't blow up wall-clock. Skipped branches stay visible ("can't tell ⇒ don't hide").
+fn plan_commit_author_lookups(
+    unresolved: Vec<String>,
+    protected: &std::collections::HashSet<String>,
+    cap: usize,
+) -> (Vec<String>, Vec<String>) {
+    let mut to_resolve: Vec<String> = unresolved
+        .into_iter()
+        .filter(|b| !protected.contains(b))
+        .collect();
+    let skipped = if to_resolve.len() > cap {
+        to_resolve.split_off(cap)
+    } else {
+        Vec::new()
+    };
+    (to_resolve, skipped)
 }
 
 /// Collect names of `tree`'s descendants (not `tree` itself — the trunk is always protected, so
@@ -828,7 +921,7 @@ fn build_renderable_tree(
             .map(|(r, _)| r.all_authors.clone())
             .unwrap_or_default();
         let mut pr_authors = add_closed_pr_authors(git_repo, open_authors);
-        add_commit_authors(git_repo, tree, &mut pr_authors);
+        add_commit_authors(git_repo, tree, orig_branch, &mut pr_authors);
 
         let renderable = render::compute_renderable_tree(
             git_repo,
@@ -2231,5 +2324,43 @@ mod tests {
         collect_branches_without_author(&tree, &authors, &mut unresolved);
 
         assert!(unresolved.is_empty());
+    }
+
+    fn protected_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plan_commit_author_lookups_drops_protected_branches() {
+        let unresolved = vec![
+            "main".to_string(),
+            "alice-1".to_string(),
+            "mystery-1".to_string(),
+        ];
+        let protected = protected_set(&["main", "alice-1"]);
+        let (to_resolve, skipped) = plan_commit_author_lookups(unresolved, &protected, 50);
+        assert_eq!(to_resolve, vec!["mystery-1".to_string()]);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn plan_commit_author_lookups_passes_everything_under_the_cap() {
+        let unresolved = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let protected = protected_set(&[]);
+        let (to_resolve, skipped) = plan_commit_author_lookups(unresolved.clone(), &protected, 50);
+        assert_eq!(to_resolve, unresolved);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn plan_commit_author_lookups_splits_at_the_cap() {
+        let unresolved: Vec<String> = (0..5).map(|i| format!("b{i}")).collect();
+        let protected = protected_set(&[]);
+        let (to_resolve, skipped) = plan_commit_author_lookups(unresolved, &protected, 3);
+        assert_eq!(
+            to_resolve,
+            vec!["b0".to_string(), "b1".to_string(), "b2".to_string()]
+        );
+        assert_eq!(skipped, vec!["b3".to_string(), "b4".to_string()]);
     }
 }

@@ -8,5 +8,5 @@ pub use cli::render_cli;
 pub use colors::ThemeColor;
 pub use tree_data::{
     BranchRenderStatus, PrRenderInfo, RenderableBranch, RenderableTree, apply_pr_cache,
-    compute_renderable_tree,
+    compute_protected_branches, compute_renderable_tree,
 };

@@ -169,12 +169,19 @@ fn compute_hidden_branches(
         return hidden;
     }
 
+    let protected = compute_protected_branches(tree, current_branch);
+    mark_hidden(tree, display_authors, pr_authors, &protected, &mut hidden);
+    hidden
+}
+
+/// Compute the set of branches protected from author-based hiding: `current_branch`, all of its
+/// ancestors up to the root, and the tree root itself. Their author is never consulted by hiding,
+/// so callers can also skip resolving it (e.g. the commit-author fallback in main.rs).
+pub fn compute_protected_branches(tree: &Branch, current_branch: &str) -> HashSet<String> {
     let mut protected = HashSet::new();
     mark_ancestor_path(tree, current_branch, &mut protected);
     protected.insert(tree.name.clone()); // defensive: never hide trunk (e.g. stale current_branch)
-
-    mark_hidden(tree, display_authors, pr_authors, &protected, &mut hidden);
-    hidden
+    protected
 }
 
 fn mark_hidden(
@@ -528,6 +535,30 @@ mod tests {
         authors.insert("carol-1-child".to_string(), "alice".to_string());
         authors.insert("eve-1".to_string(), "eve".to_string());
         authors
+    }
+
+    #[test]
+    fn compute_protected_branches_returns_current_ancestors_and_root() {
+        let tree = fixture_tree();
+        // bob-1's ancestor path up to the root is {bob-1, alice-1, main}; carol-1 and its
+        // descendants are below bob-1 and dave-1/eve-1 are on a different branch, so neither is
+        // protected.
+        let protected = compute_protected_branches(&tree, "bob-1");
+        let expected: HashSet<String> = ["bob-1", "alice-1", "main"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(protected, expected);
+    }
+
+    #[test]
+    fn compute_protected_branches_includes_root_when_current_is_stale() {
+        let tree = fixture_tree();
+        // A stale/absent current_branch resolves no ancestor path, but the root is always
+        // protected defensively.
+        let protected = compute_protected_branches(&tree, "gone-branch");
+        let expected: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(protected, expected);
     }
 
     #[test]
