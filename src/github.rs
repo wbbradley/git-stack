@@ -277,11 +277,15 @@ impl std::error::Error for GitHubError {}
 /// GitHub API client
 pub struct GitHubClient {
     config: GitHubConfig,
+    agent: ureq::Agent,
 }
 
 impl GitHubClient {
     pub fn new(config: GitHubConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            agent: ureq::agent(), // default config: connection pooling + keep-alive
+        }
     }
 
     /// Load config from environment/git config/config file
@@ -316,7 +320,9 @@ impl GitHubClient {
         );
 
         let _bench = GitBenchmark::start("github:get-pr");
-        let mut response = ureq::get(&url)
+        let mut response = self
+            .agent
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "git-stack")
@@ -349,7 +355,9 @@ impl GitHubClient {
         );
 
         let _bench = GitBenchmark::start("github:get-commit-author");
-        let mut response = ureq::get(&url)
+        let mut response = self
+            .agent
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "git-stack")
@@ -376,7 +384,9 @@ impl GitHubClient {
         );
 
         let _bench = GitBenchmark::start("github:find-pr");
-        let mut response = ureq::get(&url)
+        let mut response = self
+            .agent
+            .get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "git-stack")
@@ -403,7 +413,9 @@ impl GitHubClient {
         );
 
         let _bench = GitBenchmark::start("github:create-pr");
-        let mut response = ureq::post(&url)
+        let mut response = self
+            .agent
+            .post(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "git-stack")
@@ -438,7 +450,9 @@ impl GitHubClient {
             );
 
             let _bench = GitBenchmark::start("github:list-prs");
-            let mut response = ureq::get(&url)
+            let mut response = self
+                .agent
+                .get(&url)
                 .header("Authorization", &format!("Bearer {}", self.config.token))
                 .header("Accept", "application/vnd.github.v3+json")
                 .header("User-Agent", "git-stack")
@@ -625,7 +639,9 @@ impl GitHubClient {
             );
 
             let _bench = GitBenchmark::start("github:list-closed-prs");
-            let mut response = ureq::get(&url)
+            let mut response = self
+                .agent
+                .get(&url)
                 .header("Authorization", &format!("Bearer {}", self.config.token))
                 .header("Accept", "application/vnd.github.v3+json")
                 .header("User-Agent", "git-stack")
@@ -686,7 +702,9 @@ impl GitHubClient {
         );
 
         let _bench = GitBenchmark::start("github:update-pr");
-        let mut response = ureq::patch(&url)
+        let mut response = self
+            .agent
+            .patch(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
             .header("User-Agent", "git-stack")
