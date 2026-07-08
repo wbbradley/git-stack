@@ -5,6 +5,7 @@ use std::{
 };
 
 use colored::Colorize;
+use comfy_table::{Attribute, Cell, CellAlignment, Table, presets};
 
 /// RAII guard for timing git commands. Records timing on drop.
 pub struct GitBenchmark {
@@ -142,34 +143,46 @@ pub fn print_summary() {
 
     // Sort commands by total time (descending)
     let mut commands: Vec<_> = stats.by_command.iter().collect();
-    commands.sort_by(|a, b| b.1.total_duration.cmp(&a.1.total_duration));
+    commands.sort_by_key(|(_, s)| std::cmp::Reverse(s.total_duration));
 
-    eprintln!(
-        "{:<20} {:>8} {:>12} {:>12} {:>12}",
-        "Command", "Count", "Total", "Avg", "Max"
+    // Build a right-aligned numeric row; the command label stays left-aligned.
+    let row = |label: Cell, s: &CommandStats| {
+        vec![
+            label,
+            Cell::new(s.count).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.2?}", s.total_duration)).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.2?}", s.avg_duration())).set_alignment(CellAlignment::Right),
+            Cell::new(format!("{:.2?}", s.max_duration)).set_alignment(CellAlignment::Right),
+        ]
+    };
+
+    let mut table = Table::new();
+    table.load_preset(presets::UTF8_FULL);
+    table.set_header(
+        ["Command", "Count", "Total", "Avg", "Max"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let cell = Cell::new(h).add_attribute(Attribute::Bold);
+                if i == 0 {
+                    cell
+                } else {
+                    cell.set_alignment(CellAlignment::Right)
+                }
+            }),
     );
-    eprintln!("{}", "-".repeat(64));
 
     for (cmd, cmd_stats) in commands {
-        eprintln!(
-            "{:<20} {:>8} {:>12.2?} {:>12.2?} {:>12.2?}",
-            cmd,
-            cmd_stats.count,
-            cmd_stats.total_duration,
-            cmd_stats.avg_duration(),
-            cmd_stats.max_duration
-        );
+        table.add_row(row(Cell::new(cmd), cmd_stats));
     }
 
-    eprintln!("{}", "-".repeat(64));
-    eprintln!(
-        "{:<20} {:>8} {:>12.2?} {:>12.2?} {:>12.2?}",
-        "TOTAL".bold(),
-        stats.total.count,
-        stats.total.total_duration,
-        stats.total.avg_duration(),
-        stats.total.max_duration
+    table.add_row(
+        row(Cell::new("TOTAL"), &stats.total)
+            .into_iter()
+            .map(|c| c.add_attribute(Attribute::Bold)),
     );
+
+    eprintln!("{table}");
     eprintln!();
 }
 
