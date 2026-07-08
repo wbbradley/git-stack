@@ -1327,7 +1327,7 @@ fn sync_pr_bases_after_restack(git_repo: &GitRepo, state: &State, repo: &str) ->
 
     // Sort by depth descending (leaves first) for bottom-up processing
     let mut sorted_branches = branches_with_depth;
-    sorted_branches.sort_by(|a, b| b.2.cmp(&a.2));
+    sorted_branches.sort_by_key(|b| std::cmp::Reverse(b.2));
 
     // Track which parents we've already processed/created
     let mut processed_parents: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1756,7 +1756,7 @@ fn handle_pr_command(
 
             // Sort by depth descending (leaves first) for bottom-up processing
             let mut sorted_branches = branches_to_sync;
-            sorted_branches.sort_by(|a, b| b.2.cmp(&a.2));
+            sorted_branches.sort_by_key(|b| std::cmp::Reverse(b.2));
 
             // Track which parents we've already processed/created
             let mut processed_parents: std::collections::HashSet<String> =
