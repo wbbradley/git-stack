@@ -56,6 +56,8 @@ pub struct RemoteState {
     pub prs: HashMap<String, RemotePr>,
     /// Map of head branch name -> PR info (closed/merged PRs)
     pub closed_prs: HashMap<String, RemotePr>,
+    /// Map of head branch name -> open PR author login (for `display_authors` gating)
+    pub authors: HashMap<String, String>,
 }
 
 /// Information about a single remote PR
@@ -219,8 +221,21 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     println!("Reading local state...");
     let local_state = read_local_state(git_repo, state, repo)?;
 
+    // Scope the open-PR fetch + target injection to the user's stack (local tree, plus a
+    // reconstructed base chain on a fresh clone). Gate remote-only injection by display_authors.
+    let current_branch = git_repo.current_branch().unwrap_or_default();
+    let display_authors = client.config().display_authors.clone();
+    let scope_vec = compute_scope_branches(
+        &client,
+        &repo_id,
+        &local_state,
+        &current_branch,
+        !options.push_only,
+    );
+    let scope: HashSet<String> = scope_vec.iter().cloned().collect();
+
     println!("Reading remote state...");
-    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id)?;
+    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id, &scope_vec)?;
 
     // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
@@ -302,7 +317,13 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
 
     // Stage 2: Build target state
     println!("Building target model...");
-    let target_state = build_target_state(git_repo, &local_state, &remote_state);
+    let target_state = build_target_state(
+        git_repo,
+        &local_state,
+        &remote_state,
+        &scope,
+        &display_authors,
+    );
 
     // Stage 3: Compute diffs
     let plan = compute_sync_plan(
@@ -515,11 +536,13 @@ fn collect_local_branches(
     }
 }
 
-/// Read current remote state from GitHub
+/// Read current remote state from GitHub, fetching open PRs only for the `scope` branches
+/// (the user's stack) rather than enumerating every open PR in the repo.
 /// Returns (RemoteState, seen_shas)
 fn read_remote_state(
     client: &GitHubClient,
     repo_id: &RepoIdentifier,
+    scope: &[String],
 ) -> Result<(RemoteState, HashSet<String>)> {
     // Only show spinner if stderr is a TTY
     let spinner = if std::io::stderr().is_terminal() {
@@ -535,23 +558,22 @@ fn read_remote_state(
         None
     };
 
-    // Fetch open PRs
+    // Fetch open PRs, scoped to the stack's branches (cost scales with stack size, not repo
+    // PR count). `list_open_prs_for_branches` early-returns on an empty scope.
     if let Some(s) = &spinner {
         s.set_message("Fetching open PRs...");
     }
-    let open_progress = |_page: usize, count: usize| {
-        if let Some(s) = &spinner {
-            s.set_message(format!("Fetching open PRs... ({count} loaded)"));
-        }
-    };
-    let open_result = client
-        .list_open_prs(repo_id, Some(&open_progress))
-        .map_err(|e| anyhow!("{}", e))?;
+    let scoped = client.list_open_prs_for_branches(repo_id, scope);
 
-    let prs: HashMap<String, RemotePr> = open_result
-        .prs
+    let prs: HashMap<String, RemotePr> = scoped
+        .found
         .iter()
         .map(|(branch, pr)| (branch.clone(), RemotePr::from(pr)))
+        .collect();
+    let authors: HashMap<String, String> = scoped
+        .found
+        .iter()
+        .map(|(branch, pr)| (branch.clone(), pr.user.login.clone()))
         .collect();
 
     // Fetch closed PRs (includes merged) with caching
@@ -581,20 +603,128 @@ fn read_remote_state(
     }
 
     // Collect all PR head SHAs for seen tracking
-    let mut seen_shas: HashSet<String> = open_result
-        .prs
+    let mut seen_shas: HashSet<String> = scoped
+        .found
         .values()
         .map(|pr| pr.head.sha.clone())
         .collect();
     seen_shas.extend(closed_result.prs.values().map(|pr| pr.head.sha.clone()));
 
-    Ok((RemoteState { prs, closed_prs }, seen_shas))
+    Ok((
+        RemoteState {
+            prs,
+            closed_prs,
+            authors,
+        },
+        seen_shas,
+    ))
+}
+
+/// Walk a PR base chain starting from `start`, returning the branch names visited (including
+/// `start`). `lookup_base(branch)` yields the branch's open-PR base ref, or `None` when the
+/// branch has no open PR. The walk stops at `trunk`, at the first branch with no PR, or on a
+/// cycle. Pure over the injected lookup so it is unit-testable without a live client.
+fn walk_pr_base_chain(
+    start: &str,
+    trunk: &str,
+    mut lookup_base: impl FnMut(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut visited: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = start.to_string();
+
+    loop {
+        if current == trunk || !seen.insert(current.clone()) {
+            break;
+        }
+        visited.push(current.clone());
+        match lookup_base(&current) {
+            Some(base) => current = base,
+            None => break,
+        }
+    }
+
+    visited
+}
+
+/// Branch names whose open PRs `sync` should fetch/track: the local tree, plus (on a fresh clone
+/// with an empty tree) the reachable stack reconstructed by walking the current branch's PR base
+/// chain. Never enumerates the whole repo.
+fn compute_scope_branches(
+    client: &GitHubClient,
+    repo_id: &RepoIdentifier,
+    local: &LocalState,
+    current_branch: &str,
+    pull: bool,
+) -> Vec<String> {
+    let mut scope: HashSet<String> = local.branches.keys().cloned().collect();
+
+    // Fresh clone / empty tree (no non-trunk branches tracked): reconstruct the reachable stack
+    // by walking the current branch's PR base chain. `find_pr_for_branch` on trunk returns None.
+    let has_non_trunk = local.branches.keys().any(|b| b != &local.trunk);
+    if pull && !has_non_trunk && !current_branch.is_empty() && current_branch != local.trunk {
+        let chain = walk_pr_base_chain(current_branch, &local.trunk, |branch| {
+            client
+                .find_pr_for_branch(repo_id, branch)
+                .ok()
+                .flatten()
+                .map(|pr| pr.base.ref_name)
+        });
+        scope.extend(chain);
+    }
+
+    scope.into_iter().collect()
 }
 
 // ============== Stage 2: Model Functions ==============
 
+/// Remote-only PR branches eligible to be pulled into the tree, after stack-scoping and
+/// `display_authors` gating. Returns (branch, pr_base, pr_number). Pure and testable — no
+/// `git_repo`. Rules for each remote open PR branch not already in `local.branches`:
+/// - skip if not in `scope` (stack-scoping; defensive even though the fetch is scoped);
+/// - skip if `display_authors` is non-empty and the branch's author is missing or not listed
+///   ("can't tell / not mine ⇒ don't track");
+/// - otherwise include with the PR's base / number.
+fn remote_only_branches_to_inject(
+    local: &LocalState,
+    remote: &RemoteState,
+    scope: &HashSet<String>,
+    display_authors: &[String],
+) -> Vec<(String, String, u64)> {
+    let mut result: Vec<(String, String, u64)> = Vec::new();
+
+    for (branch, pr) in &remote.prs {
+        if local.branches.contains_key(branch) {
+            continue;
+        }
+        if !scope.contains(branch) {
+            continue;
+        }
+        if !display_authors.is_empty() {
+            let author_listed = remote
+                .authors
+                .get(branch)
+                .is_some_and(|author| display_authors.contains(author));
+            if !author_listed {
+                continue;
+            }
+        }
+        result.push((branch.clone(), pr.base.clone(), pr.number));
+    }
+
+    // Deterministic ordering for stable plans/tests.
+    result.sort();
+    result
+}
+
 /// Build target state by merging local and remote
-fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteState) -> TargetState {
+fn build_target_state(
+    git_repo: &GitRepo,
+    local: &LocalState,
+    remote: &RemoteState,
+    scope: &HashSet<String>,
+    display_authors: &[String],
+) -> TargetState {
     let mut branches = HashMap::new();
 
     // First, collect all branches from remote PRs to know what's being pulled
@@ -639,23 +769,24 @@ fn build_target_state(git_repo: &GitRepo, local: &LocalState, remote: &RemoteSta
         );
     }
 
-    // Process remote PRs that aren't in local tree (for pull)
-    for (branch_name, pr) in &remote.prs {
-        if !branches.contains_key(branch_name) {
-            // This PR's branch is not in our local tree
-            let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
-            let pushed_to_remote = git_repo.ref_exists(&remote_ref);
+    // Process remote-only PR branches eligible for pulling (stack-scoped + author-gated).
+    // Because tracked branches are always in `local.branches`, this only ever injects
+    // reconstructed-chain branches — never an arbitrary `main`-based PR.
+    for (branch_name, pr_base, pr_number) in
+        remote_only_branches_to_inject(local, remote, scope, display_authors)
+    {
+        let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
+        let pushed_to_remote = git_repo.ref_exists(&remote_ref);
 
-            branches.insert(
-                branch_name.clone(),
-                TargetBranch {
-                    parent: Some(pr.base.clone()),
-                    pr_number: Some(pr.number),
-                    expected_pr_base: Some(pr.base.clone()),
-                    pushed_to_remote,
-                },
-            );
-        }
+        branches.insert(
+            branch_name,
+            TargetBranch {
+                parent: Some(pr_base.clone()),
+                pr_number: Some(pr_number),
+                expected_pr_base: Some(pr_base),
+                pushed_to_remote,
+            },
+        );
     }
 
     TargetState {
@@ -1543,6 +1674,138 @@ mod tests {
             pr_number: None,
             pushed_to_remote: true,
         }
+    }
+
+    fn remote_pr(number: u64, base: &str) -> RemotePr {
+        RemotePr {
+            number,
+            base: base.to_string(),
+            state: RemotePrState::Open,
+            title: format!("PR #{number}"),
+            html_url: format!("https://example.test/pr/{number}"),
+        }
+    }
+
+    /// Build a `RemoteState` from (branch, base, pr_number, author) tuples for the open PRs.
+    fn remote_state(open: &[(&str, &str, u64, &str)]) -> RemoteState {
+        let mut prs = HashMap::new();
+        let mut authors = HashMap::new();
+        for (branch, base, number, author) in open {
+            prs.insert(branch.to_string(), remote_pr(*number, base));
+            authors.insert(branch.to_string(), author.to_string());
+        }
+        RemoteState {
+            prs,
+            closed_prs: HashMap::new(),
+            authors,
+        }
+    }
+
+    fn local_state(trunk: &str, branches: &[(&str, Option<&str>)]) -> LocalState {
+        let mut map = HashMap::new();
+        for (name, parent) in branches {
+            map.insert(name.to_string(), lb(*parent));
+        }
+        LocalState {
+            branches: map,
+            trunk: trunk.to_string(),
+        }
+    }
+
+    fn scope_of(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn inject_skips_out_of_scope_main_based_pr_and_includes_in_scope_branch() {
+        // Two remote-only open PRs based on main: only `mine` is in scope.
+        let local = local_state("main", &[("main", None)]);
+        let remote = remote_state(&[
+            ("mine", "main", 10, "alice"),
+            ("someone-elses", "main", 99, "carol"),
+        ]);
+
+        // Scope excludes the arbitrary main-based PR ⇒ it is never injected.
+        let scope = scope_of(&["main", "mine"]);
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &[]);
+        assert_eq!(injected, vec![("mine".to_string(), "main".to_string(), 10)]);
+    }
+
+    #[test]
+    fn inject_is_empty_when_scope_excludes_all_remote_branches() {
+        let local = local_state("main", &[("main", None)]);
+        let remote = remote_state(&[("someone-elses", "main", 99, "carol")]);
+        let scope = scope_of(&["main"]);
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &[]);
+        assert!(injected.is_empty());
+    }
+
+    #[test]
+    fn inject_gated_by_display_authors() {
+        let local = local_state("main", &[("main", None)]);
+        let remote = remote_state(&[("feature", "main", 7, "bob")]);
+        let scope = scope_of(&["main", "feature"]);
+
+        // Author "bob" is not in display_authors ⇒ not injected.
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &["alice".into()]);
+        assert!(injected.is_empty());
+
+        // Author "bob" is listed ⇒ injected.
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &["bob".into()]);
+        assert_eq!(
+            injected,
+            vec![("feature".to_string(), "main".to_string(), 7)]
+        );
+
+        // Empty display_authors ⇒ injected regardless of author.
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &[]);
+        assert_eq!(
+            injected,
+            vec![("feature".to_string(), "main".to_string(), 7)]
+        );
+    }
+
+    #[test]
+    fn inject_skips_branch_with_missing_author_when_display_authors_active() {
+        let local = local_state("main", &[("main", None)]);
+        // Remote PR present but no author entry recorded ⇒ "can't tell" ⇒ not injected.
+        let mut remote = remote_state(&[("feature", "main", 7, "bob")]);
+        remote.authors.remove("feature");
+        let scope = scope_of(&["main", "feature"]);
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &["bob".into()]);
+        assert!(injected.is_empty());
+    }
+
+    #[test]
+    fn walk_pr_base_chain_reconstructs_stack_and_stops_at_trunk() {
+        // main ← a ← b ← c ; start at leaf `c`.
+        let bases: HashMap<&str, &str> = [("c", "b"), ("b", "a"), ("a", "main")]
+            .into_iter()
+            .collect();
+        let chain = walk_pr_base_chain("c", "main", |b| bases.get(b).map(|s| s.to_string()));
+        assert_eq!(chain, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn walk_pr_base_chain_stops_when_no_pr() {
+        // `b` has no PR (lookup returns None) ⇒ chain stops after including `b`.
+        let bases: HashMap<&str, &str> = [("c", "b")].into_iter().collect();
+        let chain = walk_pr_base_chain("c", "main", |b| bases.get(b).map(|s| s.to_string()));
+        assert_eq!(chain, vec!["c", "b"]);
+    }
+
+    #[test]
+    fn walk_pr_base_chain_guards_against_cycles() {
+        // c → b → c cycle: each visited once, then the walk terminates.
+        let bases: HashMap<&str, &str> = [("c", "b"), ("b", "c")].into_iter().collect();
+        let chain = walk_pr_base_chain("c", "main", |b| bases.get(b).map(|s| s.to_string()));
+        assert_eq!(chain, vec!["c", "b"]);
+    }
+
+    #[test]
+    fn walk_pr_base_chain_returns_empty_when_start_is_trunk() {
+        let chain = walk_pr_base_chain("main", "main", |_| Some("main".to_string()));
+        assert!(chain.is_empty());
     }
 
     #[test]
