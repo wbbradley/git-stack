@@ -230,6 +230,18 @@ pub struct PrListResult {
     pub all_authors: std::collections::HashMap<String, String>,
 }
 
+/// Per-branch outcome of a stack-scoped open-PR fetch, so the caller can distinguish "this
+/// branch has no open PR" (drop it from the cache) from "the query for this branch failed"
+/// (keep its cached entry as last-known-good).
+#[derive(Debug, Default)]
+pub struct ScopedOpenPrs {
+    /// branch -> open PR (`Ok(Some)`)
+    pub found: std::collections::HashMap<String, PullRequest>,
+    /// branches that definitively have no open PR (`Ok(None)`)
+    pub confirmed_absent: Vec<String>,
+    // Errored branches are omitted from both — the caller falls back to cache for them.
+}
+
 // ============== Error Types ==============
 
 #[derive(Debug)]
@@ -516,6 +528,75 @@ impl GitHubClient {
         self.list_prs(repo, "open", on_progress)
     }
 
+    /// Fetch open PRs for exactly `branches` (the stack's branches) with bounded parallelism,
+    /// scaling with stack size rather than total repo PR activity. Each branch is looked up with
+    /// the single-branch `find_pr_for_branch` query (head=`owner:branch`, non-fork by
+    /// construction). Best-effort: never returns `Result` — a per-branch error omits that branch
+    /// from both outcome lists so the caller keeps its cached (last-known-good) entry.
+    pub fn list_open_prs_for_branches(
+        &self,
+        repo: &RepoIdentifier,
+        branches: &[String],
+    ) -> ScopedOpenPrs {
+        if branches.is_empty() {
+            return ScopedOpenPrs::default();
+        }
+
+        // branches is non-empty (early return above), so this is always >= 1.
+        let worker_count = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(branches.len())
+            .min(8);
+
+        // Partition branches round-robin across workers.
+        let mut buckets: Vec<Vec<&String>> = (0..worker_count).map(|_| Vec::new()).collect();
+        for (i, branch) in branches.iter().enumerate() {
+            buckets[i % worker_count].push(branch);
+        }
+
+        let mut result = ScopedOpenPrs::default();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = buckets
+                .into_iter()
+                .map(|bucket| {
+                    scope.spawn(move || {
+                        let mut found: Vec<(String, PullRequest)> = Vec::new();
+                        let mut absent: Vec<String> = Vec::new();
+                        for branch in bucket {
+                            match self.find_pr_for_branch(repo, branch) {
+                                Ok(Some(pr)) => found.push((branch.clone(), pr)),
+                                Ok(None) => absent.push(branch.clone()),
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "Scoped open-PR fetch failed for branch {}: {}",
+                                        branch,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        // `GitBenchmark` records into thread-local stats, so hand this worker's
+                        // `github:find-pr` spans back for merging into the caller's thread.
+                        (found, absent, crate::stats::get_stats())
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                if let Ok((found, absent, stats)) = handle.join() {
+                    for (branch, pr) in found {
+                        result.found.insert(branch, pr);
+                    }
+                    result.confirmed_absent.extend(absent);
+                    crate::stats::merge_into_current(&stats);
+                }
+            }
+        });
+
+        result
+    }
+
     /// List closed PRs with caching support.
     ///
     /// Uses a watermark timestamp strategy:
@@ -744,6 +825,27 @@ impl GitHubClient {
 }
 
 // ============== Helper Functions ==============
+
+/// Build a render-ready `PrListResult` from cached open PRs, without needing a `GitHubClient`
+/// (so the no-token / offline fallback path can use it). `prs` is the fork-filtered
+/// `PullRequest` map; `all_authors` spans every cached branch's author (forks included, matching
+/// `list_prs`).
+pub fn pr_list_result_from_cached(
+    cached: &std::collections::HashMap<String, CachedPullRequest>,
+) -> PrListResult {
+    let all_authors: std::collections::HashMap<String, String> = cached
+        .iter()
+        .map(|(branch, pr)| (branch.clone(), pr.user.login.clone()))
+        .collect();
+
+    let prs: std::collections::HashMap<String, PullRequest> = cached
+        .iter()
+        .map(|(branch, cached_pr)| (branch.clone(), PullRequest::from(cached_pr)))
+        .filter(|(_, pr)| !pr.is_from_fork())
+        .collect();
+
+    PrListResult { prs, all_authors }
+}
 
 /// Parse GitHub remote URL to extract owner/repo
 pub fn parse_remote_url(url: &str) -> Result<RepoIdentifier> {
@@ -1399,6 +1501,59 @@ mod tests {
             !gh_called.get(),
             "gh CLI must not be consulted when config resolves"
         );
+    }
+
+    fn cached_pr(branch: &str, login: &str, from_fork: bool) -> CachedPullRequest {
+        // Non-fork: head repo full_name matches base repo full_name. Fork: head repo missing.
+        let head_repo = if from_fork {
+            None
+        } else {
+            Some(CachedPrRepoRef {
+                full_name: "acme/app".to_string(),
+            })
+        };
+        CachedPullRequest {
+            number: 1,
+            state: PrState::Open,
+            title: "t".to_string(),
+            html_url: "https://example.com".to_string(),
+            base: CachedPrBranchRef {
+                ref_name: "main".to_string(),
+                sha: "base".to_string(),
+                repo: Some(CachedPrRepoRef {
+                    full_name: "acme/app".to_string(),
+                }),
+            },
+            head: CachedPrBranchRef {
+                ref_name: branch.to_string(),
+                sha: "head".to_string(),
+                repo: head_repo,
+            },
+            user: CachedPrUser {
+                login: login.to_string(),
+            },
+            draft: false,
+            merged: false,
+            merged_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn pr_list_result_from_cached_excludes_forks_from_prs_but_keeps_authors() {
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("mine".to_string(), cached_pr("mine", "alice", false));
+        cached.insert("theirs".to_string(), cached_pr("theirs", "bob", true));
+
+        let result = pr_list_result_from_cached(&cached);
+
+        // Non-fork PR is in `prs`; fork PR is excluded from `prs`...
+        assert!(result.prs.contains_key("mine"));
+        assert!(!result.prs.contains_key("theirs"));
+
+        // ...but both authors are present in `all_authors`.
+        assert_eq!(result.all_authors.get("mine").unwrap(), "alice");
+        assert_eq!(result.all_authors.get("theirs").unwrap(), "bob");
     }
 
     #[test]

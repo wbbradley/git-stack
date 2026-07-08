@@ -607,6 +607,25 @@ mod tests {
         assert!(hidden.contains("mallory-1"));
     }
 
+    #[test]
+    fn descendant_missing_from_scoped_fetch_stays_visible() {
+        // The scoped/offline case: a descendant branch that the stack-scoped open-PR fetch
+        // returned nothing for (and had no cached entry) has no `pr_authors` entry, so it must
+        // never be hidden even with `display_authors` active — "missing data" ⇒ stays visible.
+        let tree = branch(
+            "main",
+            vec![branch("alice-1", vec![branch("scoped-miss", vec![])])],
+        );
+        let mut pr_authors = HashMap::new();
+        pr_authors.insert("alice-1".to_string(), "alice".to_string());
+        // `scoped-miss` deliberately has no entry.
+        let display_authors = vec!["alice".to_string()];
+
+        let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
+
+        assert!(!hidden.contains("scoped-miss"));
+    }
+
     fn sample_pr(number: u64, login: &str) -> PullRequest {
         use crate::github::{PrBranchRef, PrState, PrUser};
 

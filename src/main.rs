@@ -554,24 +554,130 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Fetch open PRs from GitHub, returning None on any error (graceful degradation). Carries
-/// `all_authors` (branch -> author, including fork PRs filtered out of `.prs`) alongside the
-/// render-ready `.prs` map so `add_closed_pr_authors` doesn't need a second open-PR fetch.
-fn fetch_pr_cache(git_repo: &GitRepo) -> Option<github::PrListResult> {
-    // Try to get repo identifier from remote URL
+/// Open-PR fetch feeding the render's PR badges + `display_authors` hiding (never deletion).
+///
+/// Behavior is deterministic per command — no TTL, no staleness clock:
+/// - default (`force_full == false`): a **stack-scoped** parallel fetch (`find_pr_for_branch`
+///   across `branches`), cheap and always fresh for the stack. The redb open-PR cache is a pure
+///   last-known-good fallback: consulted per-branch only when that branch's live query errored,
+///   and refreshed on success so the fallback stays warm.
+/// - `force_full == true` (`gs --fetch`): the old whole-repo `list_open_prs`, which repopulates
+///   the cache authoritatively (dropping branches whose PR has since closed).
+///
+/// Returns `None` when there is nothing to show at all. The `bool` is `served_from_cache`: true
+/// when any displayed PR badge came from the cache fallback rather than this invocation's live
+/// fetch (so the caller can print a "showing cached data" disclaimer). Carries `all_authors`
+/// (branch -> author, incl. fork PRs filtered out of `.prs`) so `add_closed_pr_authors` needs no
+/// second open-PR fetch.
+fn fetch_pr_cache(
+    git_repo: &GitRepo,
+    branches: &[String],
+    force_full: bool,
+) -> Option<(github::PrListResult, bool)> {
+    use crate::pr_cache::PrCacheHandle;
+    use github::CachedPullRequest;
+
     let repo_id = github::get_repo_identifier(git_repo).ok()?;
+    let repo_key = repo_id.full_name();
+    let cache = PrCacheHandle::open().ok();
+    let client = github::GitHubClient::from_env(&repo_id).ok();
 
-    // Try to get GitHub client (may fail if no token configured)
-    let client = github::GitHubClient::from_env(&repo_id).ok()?;
+    // No client (e.g. no token): serve entirely from cache if we have anything.
+    let Some(client) = client else {
+        let cached = cache?.open_prs_for_repo(&repo_key).ok()?;
+        if cached.is_empty() {
+            return None;
+        }
+        return Some((github::pr_list_result_from_cached(&cached), true));
+    };
 
-    // Try to fetch all open PRs
-    match client.list_open_prs(&repo_id, None) {
-        Ok(result) => Some(result),
-        Err(e) => {
-            tracing::debug!("Failed to fetch PR info: {}", e);
-            None
+    if force_full {
+        // Whole-repo fetch, authoritative cache repopulate.
+        match client.list_open_prs(&repo_id, None) {
+            Ok(result) => {
+                if let Some(cache) = &cache {
+                    let fresh: Vec<(&str, CachedPullRequest)> = result
+                        .prs
+                        .iter()
+                        .map(|(branch, pr)| (branch.as_str(), CachedPullRequest::from(pr)))
+                        .collect();
+                    let fresh_refs: Vec<(&str, &CachedPullRequest)> =
+                        fresh.iter().map(|(b, pr)| (*b, pr)).collect();
+                    let _ = cache.replace_open_prs(&repo_key, &fresh_refs);
+                }
+                Some((result, false))
+            }
+            Err(e) => {
+                tracing::debug!("Whole-repo open-PR fetch failed: {}", e);
+                // Fall back to last-known-good.
+                let cached = cache?.open_prs_for_repo(&repo_key).ok()?;
+                if cached.is_empty() {
+                    return None;
+                }
+                Some((github::pr_list_result_from_cached(&cached), true))
+            }
+        }
+    } else {
+        // Stack-scoped fetch. Start from the cached baseline so errored branches degrade to LKG.
+        let mut merged = cache
+            .as_ref()
+            .and_then(|c| c.open_prs_for_repo(&repo_key).ok())
+            .unwrap_or_default();
+
+        let scoped = client.list_open_prs_for_branches(&repo_id, branches);
+
+        // Any stack branch we queried but couldn't resolve (neither found nor confirmed absent)
+        // whose cached entry we're still displaying means we're serving stale data for it.
+        let resolved: std::collections::HashSet<&str> = scoped
+            .found
+            .keys()
+            .map(|s| s.as_str())
+            .chain(scoped.confirmed_absent.iter().map(|s| s.as_str()))
+            .collect();
+        let served_from_cache = branches
+            .iter()
+            .any(|b| !resolved.contains(b.as_str()) && merged.contains_key(b));
+
+        for (branch, pr) in &scoped.found {
+            merged.insert(branch.clone(), CachedPullRequest::from(pr));
+        }
+        for branch in &scoped.confirmed_absent {
+            merged.remove(branch);
+        }
+
+        // Persist the scoped delta (best-effort).
+        if let Some(cache) = &cache {
+            let found_cached: Vec<(&str, CachedPullRequest)> = scoped
+                .found
+                .iter()
+                .map(|(branch, pr)| (branch.as_str(), CachedPullRequest::from(pr)))
+                .collect();
+            let found_refs: Vec<(&str, &CachedPullRequest)> =
+                found_cached.iter().map(|(b, pr)| (*b, pr)).collect();
+            let absent_refs: Vec<&str> =
+                scoped.confirmed_absent.iter().map(|s| s.as_str()).collect();
+            let _ = cache.merge_open_prs(&repo_key, &found_refs, &absent_refs);
+        }
+
+        Some((
+            github::pr_list_result_from_cached(&merged),
+            served_from_cache,
+        ))
+    }
+}
+
+/// Collect the names of every branch in `tree` (trunk included — harmless, since `apply_pr_cache`
+/// looks up by tree branch name). Used to scope the default open-PR fetch to just the stack.
+fn collect_all_branch_names(tree: &Branch) -> Vec<String> {
+    let mut names = Vec::new();
+    fn walk(branch: &Branch, names: &mut Vec<String>) {
+        names.push(branch.name.clone());
+        for child in &branch.branches {
+            walk(child, names);
         }
     }
+    walk(tree, &mut names);
+    names
 }
 
 /// Extend an open-PR author lookup (from `fetch_pr_cache`'s `all_authors`) with authors of
@@ -660,6 +766,11 @@ fn collect_branches_without_author(
 /// Builds the renderable tree shared by `status()`/`interactive()`: fetches PR data from GitHub
 /// and computes local git status/diff/sort, overlapping the two when hiding/dimming don't
 /// require the fetch to finish first (i.e. whenever display_authors filtering isn't active).
+///
+/// The default fetch is stack-scoped (see `fetch_pr_cache`); `force_full` (from `gs --fetch`)
+/// switches it to the authoritative whole-repo fetch. Returns the tree plus `served_from_cache`:
+/// true when any displayed PR badge came from the offline cache fallback (so the caller can warn).
+#[allow(clippy::too_many_arguments)]
 fn build_renderable_tree(
     git_repo: &GitRepo,
     repo: &str,
@@ -668,16 +779,19 @@ fn build_renderable_tree(
     verbose: bool,
     show_all: bool,
     display_authors: &[String],
-) -> render::RenderableTree {
+    force_full: bool,
+) -> (render::RenderableTree, bool) {
     let hiding_active = !show_all && !display_authors.is_empty();
+    let branch_names = collect_all_branch_names(tree);
 
-    let (mut renderable, pr_cache) = if hiding_active {
+    let (mut renderable, pr_cache, served_from_cache) = if hiding_active {
         // pr_authors depends on the fetch result plus further network calls below, so there's
         // no local work left to overlap the fetch with in this mode.
-        let pr_result = fetch_pr_cache(git_repo);
+        let pr_result = fetch_pr_cache(git_repo, &branch_names, force_full);
+        let served_from_cache = pr_result.as_ref().is_some_and(|(_, cached)| *cached);
         let open_authors = pr_result
             .as_ref()
-            .map(|r| r.all_authors.clone())
+            .map(|(r, _)| r.all_authors.clone())
             .unwrap_or_default();
         let mut pr_authors = add_closed_pr_authors(git_repo, open_authors);
         add_commit_authors(git_repo, tree, &mut pr_authors);
@@ -691,7 +805,7 @@ fn build_renderable_tree(
             &pr_authors,
             show_all,
         );
-        (renderable, pr_result.map(|r| r.prs))
+        (renderable, pr_result.map(|(r, _)| r.prs), served_from_cache)
     } else {
         // No author filter active, so hiding/dimming/sort need only an empty pr_authors map —
         // the local git walk has nothing to wait on. Overlap it with the PR fetch.
@@ -699,12 +813,13 @@ fn build_renderable_tree(
         let pr_authors = std::collections::HashMap::new();
 
         let (renderable, pr_result, fetch_stats) = std::thread::scope(|scope| {
+            let fetch_branches = branch_names.clone();
             let fetch_handle = scope.spawn(move || {
                 // Own GitRepo handle: git2::Repository is Send but not Sync, and the main
                 // thread is using `git_repo` concurrently below.
-                let result = GitRepo::open(&repo_path)
-                    .ok()
-                    .and_then(|fresh_repo| fetch_pr_cache(&fresh_repo));
+                let result = GitRepo::open(&repo_path).ok().and_then(|fresh_repo| {
+                    fetch_pr_cache(&fresh_repo, &fetch_branches, force_full)
+                });
                 (result, crate::stats::get_stats())
             });
 
@@ -724,11 +839,12 @@ fn build_renderable_tree(
             (renderable, pr_result, fetch_stats)
         });
         crate::stats::merge_into_current(&fetch_stats);
-        (renderable, pr_result.map(|r| r.prs))
+        let served_from_cache = pr_result.as_ref().is_some_and(|(_, cached)| *cached);
+        (renderable, pr_result.map(|(r, _)| r.prs), served_from_cache)
     };
 
     render::apply_pr_cache(&mut renderable, pr_cache.as_ref());
-    renderable
+    (renderable, served_from_cache)
 }
 
 fn status(
@@ -757,7 +873,7 @@ fn status(
         return Ok(());
     };
 
-    let renderable = build_renderable_tree(
+    let (renderable, served_from_cache) = build_renderable_tree(
         git_repo,
         repo,
         tree,
@@ -765,10 +881,20 @@ fn status(
         verbose,
         show_all,
         &display_authors,
+        fetch,
     );
 
     // Render to CLI
     render::render_cli(&renderable, verbose);
+
+    if served_from_cache {
+        eprintln!(
+            "{}",
+            "note: showing cached PR data (a live fetch failed; run `git stack --fetch` to \
+             refresh)"
+                .yellow()
+        );
+    }
 
     if !state.branch_exists_in_tree(repo, orig_branch) {
         eprintln!(
@@ -804,7 +930,7 @@ fn interactive(
         return Ok(());
     };
 
-    let renderable = build_renderable_tree(
+    let (renderable, served_from_cache) = build_renderable_tree(
         git_repo,
         repo,
         tree,
@@ -812,7 +938,17 @@ fn interactive(
         verbose,
         show_all,
         &display_authors,
+        false,
     );
+
+    if served_from_cache {
+        eprintln!(
+            "{}",
+            "note: showing cached PR data (a live fetch failed; run `git stack --fetch` to \
+             refresh)"
+                .yellow()
+        );
+    }
 
     // Run TUI and handle checkout if user selected a branch
     if let Some(branch_to_checkout) = tui::run_tui(renderable, verbose)? {

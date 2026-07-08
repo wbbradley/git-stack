@@ -15,6 +15,7 @@ use crate::github::CachedPullRequest;
 const WATERMARKS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("watermarks_v1");
 const CLOSED_PRS_TABLE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("closed_prs_v1");
+const OPEN_PRS_TABLE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("open_prs_v1");
 
 pub struct PrCacheHandle {
     db: redb::Database,
@@ -80,6 +81,117 @@ impl PrCacheHandle {
             result.insert(key_branch.to_string(), cached);
         }
         Ok(result)
+    }
+
+    /// All cached open PRs for `repo`, keyed by head branch name. Mirror of
+    /// `closed_prs_for_repo` against `OPEN_PRS_TABLE`; used as the offline/last-known-good
+    /// fallback for the default render fetch.
+    pub fn open_prs_for_repo(&self, repo: &str) -> Result<HashMap<String, CachedPullRequest>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("opening PR cache read transaction")?;
+        let table = match read_txn.open_table(OPEN_PRS_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+            Err(e) => return Err(anyhow::Error::from(e).context("opening open PRs table")),
+        };
+
+        let mut result = HashMap::new();
+        for entry in table
+            .range((repo, "")..)
+            .context("scanning open PRs table")?
+        {
+            let (key, value) = entry.context("reading open PR cache entry")?;
+            let (key_repo, key_branch) = key.value();
+            if key_repo != repo {
+                break;
+            }
+            let cached: CachedPullRequest =
+                serde_json::from_slice(value.value()).context("deserializing cached PR")?;
+            result.insert(key_branch.to_string(), cached);
+        }
+        Ok(result)
+    }
+
+    /// Authoritative full replace of `repo`'s open PRs (used by the whole-repo `--fetch`). In one
+    /// write transaction, deletes every `(repo, *)` row from `OPEN_PRS_TABLE` and inserts `fresh`.
+    /// This correctly drops branches whose PR closed since the last full fetch.
+    pub fn replace_open_prs(&self, repo: &str, fresh: &[(&str, &CachedPullRequest)]) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("opening PR cache write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(OPEN_PRS_TABLE)
+                .context("opening open PRs table")?;
+            let existing: Vec<String> = {
+                let mut branches = Vec::new();
+                for entry in table
+                    .range((repo, "")..)
+                    .context("scanning open PRs table")?
+                {
+                    let (key, _) = entry.context("reading open PR cache entry")?;
+                    let (key_repo, key_branch) = key.value();
+                    if key_repo != repo {
+                        break;
+                    }
+                    branches.push(key_branch.to_string());
+                }
+                branches
+            };
+            for branch in existing {
+                table
+                    .remove((repo, branch.as_str()))
+                    .context("removing cached open PR")?;
+            }
+            for (branch, pr) in fresh {
+                let value = serde_json::to_vec(pr).context("serializing cached PR")?;
+                table
+                    .insert((repo, *branch), value.as_slice())
+                    .context("inserting cached open PR")?;
+            }
+        }
+        write_txn.commit().context("committing open PR replace")?;
+        Ok(())
+    }
+
+    /// Scoped-fetch merge of `repo`'s open PRs (used by the default stack-scoped render fetch).
+    /// Upserts every branch in `found` and removes every branch in `confirmed_absent` (branches
+    /// whose scoped query returned `Ok(None)`). Branches in neither list keep their cached entry
+    /// untouched, so a per-branch query error degrades gracefully to last-known-good.
+    pub fn merge_open_prs(
+        &self,
+        repo: &str,
+        found: &[(&str, &CachedPullRequest)],
+        confirmed_absent: &[&str],
+    ) -> Result<()> {
+        if found.is_empty() && confirmed_absent.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("opening PR cache write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(OPEN_PRS_TABLE)
+                .context("opening open PRs table")?;
+            for (branch, pr) in found {
+                let value = serde_json::to_vec(pr).context("serializing cached PR")?;
+                table
+                    .insert((repo, *branch), value.as_slice())
+                    .context("inserting cached open PR")?;
+            }
+            for branch in confirmed_absent {
+                table
+                    .remove((repo, *branch))
+                    .context("removing cached open PR")?;
+            }
+        }
+        write_txn.commit().context("committing open PR merge")?;
+        Ok(())
     }
 
     /// Single-commit upsert of freshly-fetched PRs plus an optional watermark bump. No-ops if
@@ -155,6 +267,31 @@ impl PrCacheHandle {
         }
         {
             let mut table = write_txn
+                .open_table(OPEN_PRS_TABLE)
+                .context("opening open PRs table")?;
+            let branches: Vec<String> = {
+                let mut branches = Vec::new();
+                for entry in table
+                    .range((repo, "")..)
+                    .context("scanning open PRs table")?
+                {
+                    let (key, _) = entry.context("reading open PR cache entry")?;
+                    let (key_repo, key_branch) = key.value();
+                    if key_repo != repo {
+                        break;
+                    }
+                    branches.push(key_branch.to_string());
+                }
+                branches
+            };
+            for branch in branches {
+                table
+                    .remove((repo, branch.as_str()))
+                    .context("removing cached open PR")?;
+            }
+        }
+        {
+            let mut table = write_txn
                 .open_table(WATERMARKS_TABLE)
                 .context("opening watermarks table")?;
             table.remove(repo).context("removing watermark")?;
@@ -223,6 +360,15 @@ mod tests {
             merged: true,
             merged_at: Some("2024-01-01T00:00:00Z".to_string()),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_open_pr(branch: &str, number: u64) -> CachedPullRequest {
+        CachedPullRequest {
+            state: PrState::Open,
+            merged: false,
+            merged_at: None,
+            ..sample_pr(branch, number)
         }
     }
 
@@ -420,6 +566,147 @@ mod tests {
 
         assert_eq!(handle.watermark("acme/app").unwrap(), None);
         assert!(handle.closed_prs_for_repo("acme/app").unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_prs_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        let b1 = sample_open_pr("b1", 1);
+        let b2 = sample_open_pr("b2", 2);
+        handle
+            .replace_open_prs("acme/app", &[("b1", &b1), ("b2", &b2)])
+            .unwrap();
+
+        let prs = handle.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs.get("b1").unwrap(), &b1);
+        assert_eq!(prs.get("b2").unwrap(), &b2);
+    }
+
+    #[test]
+    fn merge_open_prs_upserts_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        // Seed two branches, plus a third that a later errored query must leave untouched.
+        let b1 = sample_open_pr("b1", 1);
+        let b2 = sample_open_pr("b2", 2);
+        let b3 = sample_open_pr("b3", 3);
+        handle
+            .replace_open_prs("acme/app", &[("b1", &b1), ("b2", &b2), ("b3", &b3)])
+            .unwrap();
+
+        // b1 updated (found), b2 removed (confirmed_absent), b3 in neither list (errored).
+        let b1_updated = sample_open_pr("b1", 11);
+        handle
+            .merge_open_prs("acme/app", &[("b1", &b1_updated)], &["b2"])
+            .unwrap();
+
+        let prs = handle.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs.get("b1").unwrap().number, 11);
+        assert!(!prs.contains_key("b2"));
+        assert_eq!(prs.get("b3").unwrap().number, 3);
+    }
+
+    #[test]
+    fn replace_open_prs_drops_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        let b1 = sample_open_pr("b1", 1);
+        let b2 = sample_open_pr("b2", 2);
+        let b3 = sample_open_pr("b3", 3);
+        handle
+            .replace_open_prs("acme/app", &[("b1", &b1), ("b2", &b2), ("b3", &b3)])
+            .unwrap();
+
+        let only = sample_open_pr("b2", 22);
+        handle
+            .replace_open_prs("acme/app", &[("b2", &only)])
+            .unwrap();
+
+        let prs = handle.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs.get("b2").unwrap().number, 22);
+    }
+
+    #[test]
+    fn clear_repo_wipes_open_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        // Adversarial prefix-colliding sibling: "acme/app" is a prefix of "acme/app2".
+        let app = sample_open_pr("b1", 1);
+        let app2 = sample_open_pr("b1", 2);
+        handle
+            .replace_open_prs("acme/app", &[("b1", &app)])
+            .unwrap();
+        handle
+            .replace_open_prs("acme/app2", &[("b1", &app2)])
+            .unwrap();
+
+        handle.clear_repo("acme/app").unwrap();
+
+        assert!(handle.open_prs_for_repo("acme/app").unwrap().is_empty());
+        let sibling = handle.open_prs_for_repo("acme/app2").unwrap();
+        assert_eq!(sibling.len(), 1);
+        assert_eq!(sibling.get("b1").unwrap().number, 2);
+    }
+
+    #[test]
+    fn open_and_closed_tables_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        let closed = sample_pr("feature", 1);
+        handle
+            .commit_fresh_prs(
+                "acme/app",
+                vec![("feature", &closed)].into_iter(),
+                Some("2024-01-01"),
+            )
+            .unwrap();
+
+        let open = sample_open_pr("feature", 2);
+        handle
+            .replace_open_prs("acme/app", &[("feature", &open)])
+            .unwrap();
+
+        // Writing open PRs left the closed data and watermark untouched.
+        let closed_prs = handle.closed_prs_for_repo("acme/app").unwrap();
+        assert_eq!(closed_prs.len(), 1);
+        assert_eq!(closed_prs.get("feature").unwrap().number, 1);
+        assert_eq!(
+            handle.watermark("acme/app").unwrap(),
+            Some("2024-01-01".to_string())
+        );
+
+        // And the open data is its own row.
+        let open_prs = handle.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(open_prs.len(), 1);
+        assert_eq!(open_prs.get("feature").unwrap().number, 2);
+
+        // A closed-PR merge doesn't disturb the open row either.
+        let closed_updated = sample_pr("feature", 3);
+        handle
+            .commit_fresh_prs(
+                "acme/app",
+                vec![("feature", &closed_updated)].into_iter(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            handle
+                .open_prs_for_repo("acme/app")
+                .unwrap()
+                .get("feature")
+                .unwrap()
+                .number,
+            2
+        );
     }
 
     #[cfg(unix)]
