@@ -317,12 +317,14 @@ fn inner_main() -> Result<()> {
     let git_repo = GitRepo::open(&repo)?;
 
     let mut state = State::load_state().context("loading state")?;
-    state.refresh_lkgs(&git_repo, &repo)?;
 
     tracing::debug!("Current directory: {}", repo);
 
     let run_version = format!("{}", chrono::Utc::now().timestamp());
     let current_branch = git_repo.current_branch()?;
+
+    eager_refresh_lkgs(&git_repo, &mut state, &repo, &current_branch)?;
+
     let current_upstream = git_repo.get_upstream("");
     tracing::debug!(run_version, current_branch, current_upstream);
 
@@ -453,7 +455,7 @@ fn inner_main() -> Result<()> {
         Some(Command::Diff { branch }) => {
             let branch_to_diff = branch.clone().unwrap_or_else(|| current_branch.clone());
             state.try_auto_mount(&git_repo, &repo, &branch_to_diff)?;
-            diff(state, &repo, &branch.unwrap_or(current_branch))
+            diff(&git_repo, state, &repo, &branch.unwrap_or(current_branch))
         }
         Some(Command::Log { branch }) => {
             let branch_to_log = branch.clone().unwrap_or_else(|| current_branch.clone());
@@ -505,7 +507,8 @@ fn inner_main() -> Result<()> {
     }
 }
 
-fn diff(state: State, repo: &str, branch: &str) -> Result<()> {
+fn diff(git_repo: &GitRepo, mut state: State, repo: &str, branch: &str) -> Result<()> {
+    state.refresh_lkg_for_branch(git_repo, repo, branch)?;
     let parent_branch = state
         .get_parent_branch_of(repo, branch)
         .ok_or_else(|| anyhow!("No parent branch found for current branch: {}", branch))?;
@@ -688,6 +691,37 @@ fn collect_all_branch_names(tree: &Branch) -> Vec<String> {
 /// only the very first call after enabling `display_authors` pays the full historical fetch
 /// cost; subsequent calls only page until the watermark. Returns `authors` unchanged on any
 /// error (graceful degradation — hides nothing beyond what the input already allows).
+/// Eager LKG refresh, scoped by display_authors + the local closed-PR cache when configured.
+/// Falls back to a full refresh when display_authors is unset (common case) — no cache read,
+/// no behavior change. Never makes a network call.
+fn eager_refresh_lkgs(
+    git_repo: &GitRepo,
+    state: &mut State,
+    repo: &str,
+    current_branch: &str,
+) -> Result<()> {
+    let display_authors = github::load_display_authors();
+    if display_authors.is_empty() {
+        return state.refresh_lkgs(git_repo, repo);
+    }
+    let closed_pr_authors = load_closed_pr_authors(git_repo).unwrap_or_default();
+    let scope = state.eager_lkg_scope(repo, current_branch, &display_authors, &closed_pr_authors);
+    state.refresh_lkgs_scoped(git_repo, repo, &scope)
+}
+
+/// Read branch -> login from the local redb closed-PR cache. Pure-local, no network.
+fn load_closed_pr_authors(git_repo: &GitRepo) -> Option<std::collections::HashMap<String, String>> {
+    let repo_id = github::get_repo_identifier(git_repo).ok()?;
+    let cache = crate::pr_cache::PrCacheHandle::open().ok()?;
+    let closed = cache.closed_prs_for_repo(&repo_id.full_name()).ok()?;
+    Some(
+        closed
+            .into_iter()
+            .map(|(b, pr)| (b, pr.user.login))
+            .collect(),
+    )
+}
+
 fn add_closed_pr_authors(
     git_repo: &GitRepo,
     mut authors: std::collections::HashMap<String, String>,
@@ -1255,6 +1289,11 @@ fn restack(
         }
     }
 
+    // Lazily refresh LKG for the restack target + its ancestor chain (it may have been skipped
+    // by the eager pass). `plan_owned` below clones Branch values out of this freshly-refreshed
+    // tree, so both the squash path and the "already stacked" fast path see fresh LKG values.
+    state.refresh_lkg_for_branch(git_repo, repo, &restack_branch)?;
+
     // Find starting_branch in the stacks of branches to determine which stack to use.
     let plan = state.plan_restack(git_repo, repo, &restack_branch, ancestors)?;
 
@@ -1435,7 +1474,7 @@ fn restack(
         }
     }
 
-    state.refresh_lkgs(git_repo, repo)?;
+    eager_refresh_lkgs(git_repo, &mut state, repo, &restack_branch)?;
 
     // Note: PR sync is now handled separately via `git stack sync`
     // Run `git stack sync` after `restack -p` to sync PR bases

@@ -722,6 +722,7 @@ impl State {
         &self,
         git_repo: &GitRepo,
         repo: &str,
+        scope: Option<&HashSet<String>>,
     ) -> Result<HashMap<String, Option<String>>> {
         let Some(trunk) = git_trunk(git_repo) else {
             return Ok(HashMap::default());
@@ -733,55 +734,62 @@ impl State {
         let mut queue: VecDeque<(Option<String>, String)> = VecDeque::new();
         queue.push_back((None, trunk.main_branch.clone()));
         while let Some((parent, branch)) = queue.pop_front() {
-            // Resolve branch to local or remote ref
-            let Some(branch_ref) = git_repo.resolve_branch_ref(&branch) else {
-                tracing::debug!("Skipping non-existent branch {} in refresh_lkgs", branch);
-                continue;
-            };
+            // Only recompute the per-branch LKG for in-scope branches, but always enqueue
+            // children below so in-scope descendants of an out-of-scope branch are still reached.
+            if scope.is_none_or(|s| s.contains(&branch)) {
+                // Resolve branch to local or remote ref
+                let Some(branch_ref) = git_repo.resolve_branch_ref(&branch) else {
+                    tracing::debug!("Skipping non-existent branch {} in refresh_lkgs", branch);
+                    // Preserve today's behavior: a nonexistent in-scope branch enqueues no
+                    // children (matching the full-refresh path's `continue`).
+                    continue;
+                };
 
-            if let Some(parent) = parent {
-                // Resolve parent to local or remote ref
-                let parent_ref = git_repo
-                    .resolve_branch_ref(&parent)
-                    .unwrap_or_else(|| parent.clone());
+                if let Some(parent) = parent {
+                    // Resolve parent to local or remote ref
+                    let parent_ref = git_repo
+                        .resolve_branch_ref(&parent)
+                        .unwrap_or_else(|| parent.clone());
 
-                let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
-                if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
-                    if git_repo.is_ancestor(lkg_parent, &branch_ref)? {
-                        parent_lkgs.insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
-                    } else {
-                        parent_lkgs.insert(tree_branch.name.clone(), None);
+                    let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
+                    if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
+                        if git_repo.is_ancestor(lkg_parent, &branch_ref)? {
+                            parent_lkgs
+                                .insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
+                        } else {
+                            parent_lkgs.insert(tree_branch.name.clone(), None);
+                        }
+                    }
+                    if git_repo
+                        .is_ancestor(&parent_ref, &branch_ref)
+                        .unwrap_or(false)
+                        && let Ok(new_lkg_parent) = git_repo.sha(&parent_ref)
+                    {
+                        tracing::debug!(
+                            lkg_parent = ?new_lkg_parent,
+                            "Branch {} is a descendent of {}",
+                            branch.yellow(),
+                            parent.yellow(),
+                        );
+                        // Save the LKG parent for the branch.
+                        parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
+                    } else if !matches!(parent_lkgs.get(&branch), Some(Some(_)))
+                        && let Ok(merge_base) = git_repo.merge_base(&parent_ref, &branch_ref)
+                    {
+                        tracing::debug!(
+                            lkg_parent = ?merge_base,
+                            "Branch {} has no fast-forward lkg parent; backfilling from merge-base \
+                            with {}",
+                            branch.yellow(),
+                            parent.yellow(),
+                        );
+                        parent_lkgs.insert(branch.clone(), Some(merge_base));
                     }
                 }
-                if git_repo
-                    .is_ancestor(&parent_ref, &branch_ref)
-                    .unwrap_or(false)
-                    && let Ok(new_lkg_parent) = git_repo.sha(&parent_ref)
-                {
-                    tracing::debug!(
-                        lkg_parent = ?new_lkg_parent,
-                        "Branch {} is a descendent of {}",
-                        branch.yellow(),
-                        parent.yellow(),
-                    );
-                    // Save the LKG parent for the branch.
-                    parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
-                } else if !matches!(parent_lkgs.get(&branch), Some(Some(_)))
-                    && let Ok(merge_base) = git_repo.merge_base(&parent_ref, &branch_ref)
-                {
-                    tracing::debug!(
-                        lkg_parent = ?merge_base,
-                        "Branch {} has no fast-forward lkg parent; backfilling from merge-base \
-                        with {}",
-                        branch.yellow(),
-                        parent.yellow(),
-                    );
-                    parent_lkgs.insert(branch.clone(), Some(merge_base));
-                }
             }
-            if let Some(branch) = self.get_tree_branch(repo, &branch) {
-                for child_branch in &branch.branches {
-                    queue.push_back((Some(branch.name.clone()), child_branch.name.clone()));
+            if let Some(branch_node) = self.get_tree_branch(repo, &branch) {
+                for child_branch in &branch_node.branches {
+                    queue.push_back((Some(branch_node.name.clone()), child_branch.name.clone()));
                 }
             }
         }
@@ -812,11 +820,96 @@ impl State {
     pub(crate) fn refresh_lkgs(&mut self, git_repo: &GitRepo, repo: &str) -> Result<()> {
         let _bench = crate::stats::GitBenchmark::start("state:refresh-lkgs");
         tracing::debug!("Refreshing lkgs for all branches...");
-        let parent_lkgs = self.compute_lkg_updates(git_repo, repo)?;
+        let parent_lkgs = self.compute_lkg_updates(git_repo, repo, None)?;
         if self.apply_lkg_updates(repo, parent_lkgs)? {
             self.save_state()?;
         }
         Ok(())
+    }
+
+    /// Refresh `lkg_parent` for only the branches in `scope`. Out-of-scope branches keep their
+    /// existing (possibly stale/missing) values; the consumers all tolerate that via merge-base
+    /// fallbacks, and `refresh_lkg_for_branch` refreshes on demand right before consumption.
+    pub(crate) fn refresh_lkgs_scoped(
+        &mut self,
+        git_repo: &GitRepo,
+        repo: &str,
+        scope: &HashSet<String>,
+    ) -> Result<()> {
+        let _bench = crate::stats::GitBenchmark::start("state:refresh-lkgs");
+        let parent_lkgs = self.compute_lkg_updates(git_repo, repo, Some(scope))?;
+        if self.apply_lkg_updates(repo, parent_lkgs)? {
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    /// Branches to eagerly LKG-refresh: the current branch's ancestor chain to trunk (always),
+    /// plus every branch NOT confidently attributable (via the closed-PR cache) to an author
+    /// outside `display_authors`. Branches with no closed-PR entry stay in the set.
+    ///
+    /// Pure (no git/network) so it can be unit-tested: it walks the in-memory tree and consults
+    /// only the caller-supplied `closed_pr_authors` map.
+    pub(crate) fn eager_lkg_scope(
+        &self,
+        repo: &str,
+        current_branch: &str,
+        display_authors: &[String],
+        closed_pr_authors: &HashMap<String, String>,
+    ) -> HashSet<String> {
+        let mut scope: HashSet<String> = HashSet::default();
+        let Some(tree) = self.get_tree(repo) else {
+            return scope;
+        };
+
+        let mut all_branches = Vec::new();
+        collect_all_branches(tree, &mut all_branches);
+        for branch in all_branches {
+            // Only exclude a branch when the closed-PR cache confidently attributes it to an
+            // author outside `display_authors`. Missing data ⇒ keep (never guess "not mine").
+            let foreign = closed_pr_authors
+                .get(&branch)
+                .is_some_and(|login| !display_authors.iter().any(|a| a == login));
+            if !foreign {
+                scope.insert(branch);
+            }
+        }
+
+        // The current branch's ancestor chain must always be refreshed, even if a foreign
+        // closed-PR author would otherwise exclude one of the ancestors.
+        let mut path: Vec<&Branch> = Vec::new();
+        if get_path(tree, current_branch, &mut path) {
+            for branch in path {
+                scope.insert(branch.name.clone());
+            }
+        }
+
+        scope
+    }
+
+    /// Lazily refresh `lkg_parent` for `branch` and its ancestor chain, right before a subcommand
+    /// consumes it. Cheap (a handful of branches) and covers both `diff` (needs the target) and
+    /// `restack` (needs target + ancestors). Falls back to `{branch}` when the branch isn't in the
+    /// tree yet.
+    pub(crate) fn refresh_lkg_for_branch(
+        &mut self,
+        git_repo: &GitRepo,
+        repo: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let mut scope: HashSet<String> = HashSet::default();
+        if let Some(tree) = self.get_tree(repo) {
+            let mut path: Vec<&Branch> = Vec::new();
+            if get_path(tree, branch, &mut path) {
+                for b in path {
+                    scope.insert(b.name.clone());
+                }
+            }
+        }
+        if scope.is_empty() {
+            scope.insert(branch.to_string());
+        }
+        self.refresh_lkgs_scoped(git_repo, repo, &scope)
     }
 
     pub(crate) fn edit_note(&mut self, repo: &str, branch: &str) -> Result<()> {
@@ -1251,7 +1344,7 @@ mod tests {
                 .collect(),
         };
 
-        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
         assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
     }
 
@@ -1286,7 +1379,7 @@ mod tests {
                 .collect(),
         };
 
-        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
         assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
     }
 
@@ -1318,7 +1411,7 @@ mod tests {
                 .collect(),
         };
 
-        let updates = state.compute_lkg_updates(&git_repo, &repo).unwrap();
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
         assert!(matches!(updates.get("feature"), None | Some(None)));
     }
 
@@ -1367,6 +1460,160 @@ mod tests {
         assert_eq!(
             state.get_tree_branch("repo", "feature").unwrap().lkg_parent,
             Some("def456".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_lkg_updates_respects_scope() {
+        // Tree `main → a → b`, both needing a merge-base backfill.
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let main_sha = git_rev_parse(dir.path(), "main");
+
+        // `a` branches off main at the root, gets a commit, then main diverges so neither `a`
+        // nor `b` is a fast-forward descendant of main's tip (forcing merge-base backfill).
+        git_run(dir.path(), &["checkout", "-b", "a"]);
+        git_run(dir.path(), &["commit", "--allow-empty", "-q", "-m", "a1"]);
+        let a_sha = git_rev_parse(dir.path(), "a");
+        git_run(dir.path(), &["checkout", "-b", "b"]);
+        git_run(dir.path(), &["commit", "--allow-empty", "-q", "-m", "b1"]);
+        git_run(dir.path(), &["checkout", "main"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "main2"],
+        );
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut main_branch = Branch::new("main".to_string(), None);
+        let mut a_branch = Branch::new("a".to_string(), None);
+        a_branch.branches.push(Branch::new("b".to_string(), None));
+        main_branch.branches.push(a_branch);
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        // Scope to just `a`: entry for `a`, none for `b`.
+        let scope_a: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let updates = state
+            .compute_lkg_updates(&git_repo, &repo, Some(&scope_a))
+            .unwrap();
+        assert_eq!(updates.get("a"), Some(&Some(main_sha.clone())));
+        assert!(!updates.contains_key("b"));
+
+        // Scope to just `b`: entry for `b`, none for `a` — proving children of an out-of-scope
+        // branch are still traversed and computed.
+        let scope_b: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let updates = state
+            .compute_lkg_updates(&git_repo, &repo, Some(&scope_b))
+            .unwrap();
+        assert_eq!(updates.get("b"), Some(&Some(a_sha)));
+        assert!(!updates.contains_key("a"));
+    }
+
+    /// Build a `main → mine → theirs → mychild` tree for the pure `eager_lkg_scope` tests.
+    fn author_scope_state(repo: &str) -> State {
+        let mut mine = Branch::new("mine".to_string(), None);
+        let mut theirs = Branch::new("theirs".to_string(), None);
+        theirs
+            .branches
+            .push(Branch::new("mychild".to_string(), None));
+        mine.branches.push(theirs);
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches.push(mine);
+        State {
+            repos: [(repo.to_string(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn eager_lkg_scope_excludes_foreign_closed_pr_authors() {
+        let repo = "repo";
+        let state = author_scope_state(repo);
+        let display_authors = vec!["alice".to_string()];
+        let closed_pr_authors: HashMap<String, String> =
+            [("theirs".to_string(), "bob".to_string())]
+                .into_iter()
+                .collect();
+
+        let scope = state.eager_lkg_scope(repo, "mine", &display_authors, &closed_pr_authors);
+        assert!(scope.contains("main"));
+        assert!(scope.contains("mine"));
+        assert!(scope.contains("mychild")); // no cache entry ⇒ kept
+        assert!(!scope.contains("theirs")); // foreign closed-PR author ⇒ excluded
+    }
+
+    #[test]
+    fn eager_lkg_scope_protects_ancestor_chain() {
+        let repo = "repo";
+        let state = author_scope_state(repo);
+        let display_authors = vec!["alice".to_string()];
+        let closed_pr_authors: HashMap<String, String> =
+            [("theirs".to_string(), "bob".to_string())]
+                .into_iter()
+                .collect();
+
+        // Current branch is `mychild`, so `theirs` is on the ancestor chain — always wins.
+        let scope = state.eager_lkg_scope(repo, "mychild", &display_authors, &closed_pr_authors);
+        assert!(scope.contains("theirs"));
+    }
+
+    #[test]
+    fn refresh_lkgs_scoped_skips_out_of_scope_branch() {
+        // Redirect the XDG state file so save_state() can't clobber the real user state.
+        // Safe under nextest's process-per-test isolation.
+        let state_home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(state_home.path().join(env!("CARGO_PKG_NAME"))).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
+
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let sha_a = git_rev_parse(dir.path(), "main");
+
+        git_run(dir.path(), &["checkout", "-b", "feature"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "feature commit"],
+        );
+        git_run(dir.path(), &["checkout", "main"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "main commit"],
+        );
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch
+            .branches
+            .push(Branch::new("feature".to_string(), None));
+        let mut state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        // Scope excludes `feature` (only `main` in scope) — its lkg_parent stays None.
+        let scope: HashSet<String> = ["main".to_string()].into_iter().collect();
+        state.refresh_lkgs_scoped(&git_repo, &repo, &scope).unwrap();
+        assert_eq!(
+            state.get_tree_branch(&repo, "feature").unwrap().lkg_parent,
+            None
+        );
+
+        // A subsequent full refresh backfills it from the merge-base — recoverable lazily.
+        state.refresh_lkgs(&git_repo, &repo).unwrap();
+        assert_eq!(
+            state.get_tree_branch(&repo, "feature").unwrap().lkg_parent,
+            Some(sha_a)
         );
     }
 }
