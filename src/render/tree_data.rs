@@ -9,6 +9,14 @@ use crate::{
     state::Branch,
 };
 
+/// Memoization of diff-stat results within a single render walk, keyed by
+/// `(base_sha, head_sha)`. Value is the raw `(additions, deletions)` result of
+/// `git_repo.diff_stats`, or `None` when that call failed (also cached so a failing
+/// pair isn't retried per branch). The `reliable` flag is intentionally *not* keyed —
+/// it depends on how the base was chosen (LKG vs merge-base), not on the sha pair — so
+/// it stays computed per-branch outside the cache.
+type DiffStatsCache = HashMap<(String, String), Option<(usize, usize)>>;
+
 /// Status information for a branch's relationship to its parent.
 #[derive(Debug, Clone)]
 pub struct BranchRenderStatus {
@@ -205,6 +213,7 @@ pub fn compute_renderable_tree(
     let mut current_branch_index = None;
     let hidden =
         compute_hidden_branches(tree, current_branch, display_authors, pr_authors, show_all);
+    let mut diff_cache = DiffStatsCache::new();
 
     flatten_tree(
         git_repo,
@@ -218,6 +227,7 @@ pub fn compute_renderable_tree(
         &hidden,
         &mut branches,
         &mut current_branch_index,
+        &mut diff_cache,
     );
 
     RenderableTree {
@@ -255,6 +265,7 @@ fn flatten_tree(
     hidden: &HashSet<String>,
     result: &mut Vec<RenderableBranch>,
     current_branch_index: &mut Option<usize>,
+    cache: &mut DiffStatsCache,
 ) {
     let is_current = branch.name == current_branch;
     let is_hidden = hidden.contains(&branch.name);
@@ -292,7 +303,7 @@ fn flatten_tree(
 
         // Compute diff stats
         let diff_stats = if let Some(ref status) = status {
-            compute_diff_stats(git_repo, branch, status)
+            compute_diff_stats(git_repo, branch, status, cache)
         } else {
             None
         };
@@ -414,14 +425,32 @@ fn flatten_tree(
             hidden,
             result,
             current_branch_index,
+            cache,
         );
     }
+}
+
+/// Return the cached diff-stat result for `(base, head)`, computing and storing it via
+/// `compute` on the first request for that pair.
+fn memoized_diff_stats(
+    cache: &mut DiffStatsCache,
+    base: &str,
+    head: &str,
+    compute: impl FnOnce() -> Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    if let Some(&cached) = cache.get(&(base.to_string(), head.to_string())) {
+        return cached;
+    }
+    let result = compute();
+    cache.insert((base.to_string(), head.to_string()), result);
+    result
 }
 
 fn compute_diff_stats(
     git_repo: &GitRepo,
     branch: &Branch,
     status: &BranchRenderStatus,
+    cache: &mut DiffStatsCache,
 ) -> Option<DiffStats> {
     // Determine base ref and whether it's reliable
     let (base_ref, is_reliable) = if let Some(lkg) = branch.lkg_parent.as_deref() {
@@ -433,14 +462,14 @@ fn compute_diff_stats(
     };
 
     base_ref.and_then(|base| {
-        git_repo
-            .diff_stats(&base, &status.sha)
-            .ok()
-            .map(|(adds, dels)| DiffStats {
-                additions: adds,
-                deletions: dels,
-                reliable: is_reliable,
-            })
+        memoized_diff_stats(cache, &base, &status.sha, || {
+            git_repo.diff_stats(&base, &status.sha).ok()
+        })
+        .map(|(adds, dels)| DiffStats {
+            additions: adds,
+            deletions: dels,
+            reliable: is_reliable,
+        })
     })
 }
 
@@ -693,6 +722,44 @@ mod tests {
         assert_eq!(pr_info.number, 42);
         assert_eq!(pr_info.author, "alice");
         assert!(tree.branches[1].pr_info.is_none());
+    }
+
+    #[test]
+    fn memoized_diff_stats_computes_once_per_key() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let mut cache = DiffStatsCache::new();
+        let mut run = |base, head| {
+            memoized_diff_stats(&mut cache, base, head, || {
+                calls.set(calls.get() + 1);
+                Some((1, 2))
+            })
+        };
+
+        assert_eq!(run("a", "b"), Some((1, 2)));
+        assert_eq!(run("a", "b"), Some((1, 2))); // cache hit
+        assert_eq!(calls.get(), 1);
+
+        assert_eq!(run("a", "c"), Some((1, 2))); // distinct head -> recompute
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn memoized_diff_stats_caches_failure() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let mut cache = DiffStatsCache::new();
+        let r1 = memoized_diff_stats(&mut cache, "a", "b", || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        let r2 = memoized_diff_stats(&mut cache, "a", "b", || {
+            calls.set(calls.get() + 1);
+            None
+        });
+        assert_eq!(r1, None);
+        assert_eq!(r2, None);
+        assert_eq!(calls.get(), 1); // failure cached, not retried
     }
 
     #[test]
