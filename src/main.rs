@@ -21,6 +21,7 @@ mod git2_ops;
 mod github;
 mod llms;
 mod lock;
+mod merge_base_cache;
 mod pr_cache;
 mod render;
 mod state;
@@ -1987,6 +1988,11 @@ fn handle_cache_command(
             let repo_full_name = format!("{}/{}", repo_id.owner, repo_id.repo);
             crate::pr_cache::clear_pr_cache(&repo_full_name)?;
             println!("Cleared PR cache for {}.", repo_full_name);
+
+            // Clear merge-base / is-ancestor cache for this repo (scoped locally, so it works
+            // even for repos with no GitHub remote).
+            git_repo.clear_merge_base_cache()?;
+            println!("Cleared merge-base cache for {}.", repo);
 
             // Clear seen SHAs for current repo
             let count = state.get_seen_shas(repo).map(|s| s.len()).unwrap_or(0);

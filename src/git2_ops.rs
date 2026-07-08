@@ -8,7 +8,7 @@ use std::{path::Path, time::Instant};
 use anyhow::{Context, Result, anyhow};
 use git2::{BranchType, Repository};
 
-use crate::{lock::RepoLock, stats::GitBenchmark};
+use crate::{lock::RepoLock, merge_base_cache::MergeBaseCacheHandle, stats::GitBenchmark};
 
 pub const DEFAULT_REMOTE: &str = "origin";
 
@@ -30,15 +30,64 @@ pub(crate) struct GitBranchStatus {
 /// Wrapper around git2::Repository for fast read-only git operations.
 pub struct GitRepo {
     repo: Repository,
+    /// Persistent cache for `merge_base` / `is_ancestor` results. `None` when the cache could not
+    /// be opened (e.g. another process holds redb's exclusive lock), degrading to uncached.
+    merge_base_cache: Option<MergeBaseCacheHandle>,
+    /// Canonicalized common git dir, used as the cache scope key.
+    repo_scope: String,
 }
 
 impl GitRepo {
-    /// Open a repository at the given path.
+    /// Open a repository at the given path. Opens the merge-base cache best-effort at its default
+    /// XDG path; a cache-open failure degrades this invocation to uncached but never fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let cache = match MergeBaseCacheHandle::open() {
+            Ok(cache) => Some(cache),
+            Err(e) => {
+                tracing::debug!("Failed to open merge-base cache, running uncached: {e:#}");
+                None
+            }
+        };
+        Self::open_inner(path, cache)
+    }
+
+    /// Open a repository with the merge-base cache at an explicit path, keeping tests isolated
+    /// from the real user cache.
+    #[cfg(test)]
+    pub fn open_with_cache_at(path: impl AsRef<Path>, cache_path: &Path) -> Result<Self> {
+        let cache = Some(MergeBaseCacheHandle::open_at(cache_path)?);
+        Self::open_inner(path, cache)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, cache: Option<MergeBaseCacheHandle>) -> Result<Self> {
         let _bench = GitBenchmark::start("git2:open");
         let repo = Repository::open(path.as_ref())
             .with_context(|| format!("Failed to open repository at {:?}", path.as_ref()))?;
-        Ok(Self { repo })
+        let repo_scope = std::fs::canonicalize(repo.commondir())
+            .unwrap_or_else(|_| repo.commondir().to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        Ok(Self {
+            repo,
+            merge_base_cache: cache,
+            repo_scope,
+        })
+    }
+
+    /// The cache scope key (canonicalized common git dir). Test-only accessor for priming the
+    /// cache with the exact key `GitRepo` uses.
+    #[cfg(test)]
+    pub fn repo_scope(&self) -> &str {
+        &self.repo_scope
+    }
+
+    /// Clear the merge-base / is-ancestor cache for this repo's scope. No-op if the cache never
+    /// opened.
+    pub fn clear_merge_base_cache(&self) -> Result<()> {
+        if let Some(cache) = &self.merge_base_cache {
+            cache.clear_scope(&self.repo_scope)?;
+        }
+        Ok(())
     }
 
     /// Acquire a repo-scoped advisory lock (see [`crate::lock::RepoLock`]).
@@ -64,7 +113,6 @@ impl GitRepo {
     /// Check if ancestor_ref is an ancestor of descendant_ref.
     /// Equivalent to `git merge-base --is-ancestor <ancestor> <descendant>`
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-        let _bench = GitBenchmark::start("git2:merge-base");
         let ancestor_obj = self
             .repo
             .revparse_single(ancestor)
@@ -75,17 +123,39 @@ impl GitRepo {
             .with_context(|| format!("Failed to resolve descendant ref: {}", descendant))?;
 
         // A commit is considered an ancestor of itself (matches git behavior)
-        Ok(ancestor_obj.id() == descendant_obj.id()
-            || self
-                .repo
-                .graph_descendant_of(descendant_obj.id(), ancestor_obj.id())
-                .unwrap_or(false))
+        if ancestor_obj.id() == descendant_obj.id() {
+            return Ok(true);
+        }
+
+        let anc_oid = ancestor_obj.id().to_string();
+        let desc_oid = descendant_obj.id().to_string();
+
+        // Cache hit skips the graph walk (and its benchmark span) entirely.
+        if let Some(cache) = &self.merge_base_cache {
+            match cache.get_is_ancestor(&self.repo_scope, &anc_oid, &desc_oid) {
+                Ok(Some(val)) => return Ok(val),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("merge-base cache read failed, computing live: {e:#}"),
+            }
+        }
+
+        let _bench = GitBenchmark::start("git2:is-ancestor");
+        let val = self
+            .repo
+            .graph_descendant_of(descendant_obj.id(), ancestor_obj.id())
+            .unwrap_or(false);
+
+        if let Some(cache) = &self.merge_base_cache
+            && let Err(e) = cache.put_is_ancestor(&self.repo_scope, &anc_oid, &desc_oid, val)
+        {
+            tracing::debug!("merge-base cache write failed: {e:#}");
+        }
+        Ok(val)
     }
 
     /// Find the merge-base (common ancestor) of two refs.
     /// Equivalent to `git merge-base <ref1> <ref2>`
     pub fn merge_base(&self, ref1: &str, ref2: &str) -> Result<String> {
-        let _bench = GitBenchmark::start("git2:merge-base");
         let obj1 = self
             .repo
             .revparse_single(ref1)
@@ -95,11 +165,32 @@ impl GitRepo {
             .revparse_single(ref2)
             .with_context(|| format!("Failed to resolve ref: {}", ref2))?;
 
+        let oid1 = obj1.id().to_string();
+        let oid2 = obj2.id().to_string();
+
+        // Cache hit skips the graph walk (and its benchmark span) entirely.
+        if let Some(cache) = &self.merge_base_cache {
+            match cache.get_merge_base(&self.repo_scope, &oid1, &oid2) {
+                Ok(Some(base)) => return Ok(base),
+                Ok(None) => {}
+                Err(e) => tracing::debug!("merge-base cache read failed, computing live: {e:#}"),
+            }
+        }
+
+        let _bench = GitBenchmark::start("git2:merge-base");
         let oid = self
             .repo
             .merge_base(obj1.id(), obj2.id())
             .with_context(|| format!("Failed to find merge-base between {} and {}", ref1, ref2))?;
-        Ok(oid.to_string())
+        let base = oid.to_string();
+
+        // Only successful results are cached; a real "no merge base" error propagates uncached.
+        if let Some(cache) = &self.merge_base_cache
+            && let Err(e) = cache.put_merge_base(&self.repo_scope, &oid1, &oid2, &base)
+        {
+            tracing::debug!("merge-base cache write failed: {e:#}");
+        }
+        Ok(base)
     }
 
     /// Check if a local branch exists.
@@ -314,5 +405,141 @@ impl GitRepo {
             .url()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Remote has no URL"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, process::Command};
+
+    use super::*;
+    use crate::merge_base_cache::MergeBaseCacheHandle;
+
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn git_rev_parse(dir: &Path, rev: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Two divergent branches: `feature` is NOT an ancestor of `main`, and their only common
+    /// ancestor is the root commit.
+    fn init_divergent_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["commit", "--allow-empty", "-q", "-m", "root"]);
+        git(dir, &["checkout", "-q", "-b", "feature"]);
+        git(
+            dir,
+            &["commit", "--allow-empty", "-q", "-m", "feature commit"],
+        );
+        git(dir, &["checkout", "-q", "main"]);
+        git(dir, &["commit", "--allow-empty", "-q", "-m", "main commit"]);
+    }
+
+    /// Acceptance criterion: `is_ancestor`'s read path genuinely short-circuits to the cache. We
+    /// seed a deliberately *wrong* answer (`true`) for a pair that is not actually ancestor-related
+    /// and prove `is_ancestor` returns the cached value rather than doing a live walk.
+    #[test]
+    fn is_ancestor_short_circuits_to_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        init_divergent_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        let oid_feature = git_rev_parse(dir.path(), "feature");
+        let oid_main = git_rev_parse(dir.path(), "main");
+
+        // Grab the scope key from a throwaway GitRepo, then drop it so its exclusive redb lock is
+        // released before we prime the cache from a second handle.
+        let scope = {
+            let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+            // Sanity: `feature` is genuinely not an ancestor of `main` when computed live.
+            assert!(!git_repo.is_ancestor("feature", "main").unwrap());
+            git_repo.repo_scope().to_string()
+        };
+
+        // Overwrite the (correct, `false`) row the throwaway wrote with a bogus `true`.
+        {
+            let cache = MergeBaseCacheHandle::open_at(&cache_path).unwrap();
+            cache
+                .put_is_ancestor(&scope, &oid_feature, &oid_main, true)
+                .unwrap();
+        }
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        // If this returned the live-walk answer it would be `false`; `true` proves the cache hit.
+        assert!(git_repo.is_ancestor("feature", "main").unwrap());
+    }
+
+    /// Same acceptance check for `merge_base`: seed a bogus base OID and prove it's returned.
+    #[test]
+    fn merge_base_short_circuits_to_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        init_divergent_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        let oid_feature = git_rev_parse(dir.path(), "feature");
+        let oid_main = git_rev_parse(dir.path(), "main");
+        let bogus_base = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let scope = {
+            let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+            git_repo.repo_scope().to_string()
+        };
+
+        {
+            let cache = MergeBaseCacheHandle::open_at(&cache_path).unwrap();
+            cache
+                .put_merge_base(&scope, &oid_feature, &oid_main, bogus_base)
+                .unwrap();
+        }
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert_eq!(git_repo.merge_base("feature", "main").unwrap(), bogus_base);
+    }
+
+    /// Two distinct repos with separate cache files don't cross results: a bogus row primed in
+    /// repo A's cache must not affect repo B.
+    #[test]
+    fn caches_are_scoped_per_repo() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        init_divergent_repo(dir_a.path());
+        init_divergent_repo(dir_b.path());
+        let cache_a = dir_a.path().join("mb_cache.redb");
+        let cache_b = dir_b.path().join("mb_cache.redb");
+
+        let oid_feature_a = git_rev_parse(dir_a.path(), "feature");
+        let oid_main_a = git_rev_parse(dir_a.path(), "main");
+
+        let scope_a = {
+            let git_repo = GitRepo::open_with_cache_at(dir_a.path(), &cache_a).unwrap();
+            git_repo.repo_scope().to_string()
+        };
+        {
+            let cache = MergeBaseCacheHandle::open_at(&cache_a).unwrap();
+            cache
+                .put_is_ancestor(&scope_a, &oid_feature_a, &oid_main_a, true)
+                .unwrap();
+        }
+
+        // Repo B uses its own cache file, so it must compute the real (`false`) answer.
+        let git_repo_b = GitRepo::open_with_cache_at(dir_b.path(), &cache_b).unwrap();
+        assert!(!git_repo_b.is_ancestor("feature", "main").unwrap());
     }
 }

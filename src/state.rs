@@ -1236,7 +1236,8 @@ mod tests {
             &["commit", "--allow-empty", "-q", "-m", "main commit"],
         );
 
-        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
         let repo = repo_key(dir.path());
 
         let mut main_branch = Branch::new("main".to_string(), None);
@@ -1270,7 +1271,8 @@ mod tests {
             &["commit", "--allow-empty", "-q", "-m", "main commit"],
         );
 
-        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
         let repo = repo_key(dir.path());
 
         let mut main_branch = Branch::new("main".to_string(), None);
@@ -1301,7 +1303,8 @@ mod tests {
         );
         git_run(dir.path(), &["checkout", "main"]);
 
-        let git_repo = GitRepo::open(dir.path()).unwrap();
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
         let repo = repo_key(dir.path());
 
         let mut main_branch = Branch::new("main".to_string(), None);
