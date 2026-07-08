@@ -86,8 +86,9 @@ thread_local! {
 /// Record a git command execution
 pub fn record_git_command(args: &[&str], duration: Duration) {
     let command = args.first().copied().unwrap_or("unknown");
+    let command = format!("git:{command}");
     GIT_STATS.with(|stats| {
-        stats.borrow_mut().record(command, duration);
+        stats.borrow_mut().record(&command, duration);
     });
 }
 
@@ -136,10 +137,7 @@ pub fn print_summary() {
     }
 
     eprintln!();
-    eprintln!(
-        "{}",
-        "=== Git Command Performance Summary ===".yellow().bold()
-    );
+    eprintln!("{}", "=== Command Performance Summary ===".yellow().bold());
     eprintln!();
 
     // Sort commands by total time (descending)
@@ -155,7 +153,7 @@ pub fn print_summary() {
     for (cmd, cmd_stats) in commands {
         eprintln!(
             "{:<20} {:>8} {:>12.2?} {:>12.2?} {:>12.2?}",
-            format!("git {}", cmd),
+            cmd,
             cmd_stats.count,
             cmd_stats.total_duration,
             cmd_stats.avg_duration(),

@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{git2_ops::GitRepo, state::write_file_secure};
+use crate::{git2_ops::GitRepo, state::write_file_secure, stats::GitBenchmark};
 
 // ============== Configuration Types ==============
 
@@ -315,6 +315,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, pr_number
         );
 
+        let _bench = GitBenchmark::start("github:get-pr");
         let mut response = ureq::get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
@@ -347,6 +348,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, sha
         );
 
+        let _bench = GitBenchmark::start("github:get-commit-author");
         let mut response = ureq::get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
@@ -373,6 +375,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, repo.owner, branch
         );
 
+        let _bench = GitBenchmark::start("github:find-pr");
         let mut response = ureq::get(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
@@ -399,6 +402,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo
         );
 
+        let _bench = GitBenchmark::start("github:create-pr");
         let mut response = ureq::post(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
@@ -433,6 +437,7 @@ impl GitHubClient {
                 self.config.api_base, repo.owner, repo.repo, state, per_page, page
             );
 
+            let _bench = GitBenchmark::start("github:list-prs");
             let mut response = ureq::get(&url)
                 .header("Authorization", &format!("Bearer {}", self.config.token))
                 .header("Accept", "application/vnd.github.v3+json")
@@ -619,6 +624,7 @@ impl GitHubClient {
                 self.config.api_base, repo.owner, repo.repo, state, per_page, page
             );
 
+            let _bench = GitBenchmark::start("github:list-closed-prs");
             let mut response = ureq::get(&url)
                 .header("Authorization", &format!("Bearer {}", self.config.token))
                 .header("Accept", "application/vnd.github.v3+json")
@@ -679,6 +685,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, pr_number
         );
 
+        let _bench = GitBenchmark::start("github:update-pr");
         let mut response = ureq::patch(&url)
             .header("Authorization", &format!("Bearer {}", self.config.token))
             .header("Accept", "application/vnd.github.v3+json")
