@@ -70,9 +70,8 @@ mod tests {
 
     #[test]
     fn mentions_all_cache_actions() {
-        for action in ["cache clear"] {
-            assert!(LLMS_MD.contains(action), "missing CacheAction {action}");
-        }
+        let action = "cache clear";
+        assert!(LLMS_MD.contains(action), "missing CacheAction {action}");
     }
 
     #[test]
