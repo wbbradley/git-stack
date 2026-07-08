@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
@@ -128,25 +128,26 @@ pub struct State {
 
 impl State {
     pub fn load_state() -> Result<Self> {
-        let config_path = get_xdg_path()?;
-        let mut used_existing_config = true;
-        let data = match fs::read_to_string(&config_path) {
+        let state_path = get_xdg_path()?;
+        let mut used_existing_state = true;
+        let data = match fs::read_to_string(&state_path) {
             Ok(data) => data,
             Err(error) => {
                 tracing::warn!(
                     "Failed to read config file at {}: {}",
-                    config_path.display(),
+                    state_path.display(),
                     error
                 );
                 tracing::warn!("Using default (empty) config");
-                used_existing_config = false;
+                used_existing_state = false;
                 "".to_string()
             }
         };
-        let state: Self = serde_yaml::from_str(&data)?;
-        fs::create_dir_all(config_path.parent().unwrap())
+        let state: Self = serde_yaml::from_str(&data)
+            .with_context(|| format!("parsing state file: {:?}", state_path))?;
+        fs::create_dir_all(state_path.parent().unwrap())
             .inspect_err(|error| tracing::warn!("Failed to create config directory: {}", error))?;
-        if !used_existing_config {
+        if !used_existing_state {
             tracing::info!("No existing config file found, creating a new one.");
             state
                 .save_state()
@@ -156,10 +157,10 @@ impl State {
     }
 
     pub fn save_state(&self) -> Result<()> {
-        let config_path = get_xdg_path()?;
-        tracing::trace!(?self, ?config_path, "Saving state to config file");
+        let state_path = get_xdg_path()?;
+        tracing::trace!(?self, ?state_path, "Saving state to config file");
         Ok(write_file_secure(
-            &config_path,
+            &state_path,
             &serde_yaml::to_string(&self)?,
         )?)
     }
