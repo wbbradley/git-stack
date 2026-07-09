@@ -6,7 +6,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use colored::Colorize;
 use git::{after_text, git_checkout_main, git_fetch, git_trunk, run_git_status};
-use state::{Branch, RestackStep, StackMethod};
+use state::{
+    Branch, PendingRestackOperation, RestackMethod, RestackResume, RestackStep, StackMethod,
+};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt};
 
@@ -328,8 +330,8 @@ fn inner_main() -> Result<()> {
     let current_upstream = git_repo.get_upstream("");
     tracing::debug!(run_version, current_branch, current_upstream);
 
-    // Check for pending squash operation - block other commands except --continue and --abort
-    if state.has_pending_squash(&repo) {
+    // Check for pending restack operation - block other commands except --continue and --abort
+    if state.has_pending_restack(&repo) {
         match &args.command {
             Some(Command::Restack {
                 r#continue: true, ..
@@ -337,7 +339,7 @@ fn inner_main() -> Result<()> {
             Some(Command::Restack { abort: true, .. }) => { /* allowed */ }
             _ => {
                 bail!(
-                    "A squash operation is in progress for this repository.\n\
+                    "A restack operation is in progress for this repository.\n\
                      Run `git stack restack --continue` after resolving conflicts,\n\
                      or `git stack restack --abort` to cancel."
                 );
@@ -365,11 +367,11 @@ fn inner_main() -> Result<()> {
         }) => {
             // Handle --continue first
             if r#continue {
-                return handle_squash_continue(&git_repo, &mut state, &repo);
+                return handle_restack_continue(&git_repo, state, &repo, run_version);
             }
             // Handle --abort
             if abort {
-                return handle_squash_abort(&git_repo, &mut state, &repo);
+                return handle_restack_abort(&git_repo, state, &repo);
             }
             let restack_branch = branch.clone().unwrap_or_else(|| current_branch.clone());
             state.try_auto_mount(&git_repo, &repo, &restack_branch)?;
@@ -1208,25 +1210,89 @@ fn get_concatenated_commit_messages(branch: &str, ancestor: &str) -> Result<Stri
     Ok(cleaned)
 }
 
+/// Print the conflict guidance pointing at `--continue` / `--abort`. `what` labels the git op,
+/// e.g. "`git am`", "Rebase", "Merge", "Squash merge".
+fn print_restack_conflict_help(what: &str) {
+    eprintln!("{what} hit a conflict.");
+    eprintln!("Resolve the conflicts (e.g. `git mergetool`), `git add` the resolved files, then:");
+    eprintln!("  {}", "git stack restack --continue".green().bold());
+    eprintln!();
+    eprintln!("Or to abort and restore the original branch:");
+    eprintln!("  {}", "git stack restack --abort".yellow().bold());
+}
+
+/// Persist a pending-restack record for the conflicting branch, print guidance, and `exit(1)`.
+/// `original_sha` is the branch tip captured *before* the ref moved.
+#[allow(clippy::too_many_arguments)]
+fn record_restack_conflict(
+    state: &mut State,
+    repo: &str,
+    method: RestackMethod,
+    branch_name: &str,
+    parent: &str,
+    original_sha: &str,
+    resume: RestackResume,
+    what: &str,
+) -> ! {
+    state.set_pending_restack(
+        repo,
+        Some(PendingRestackOperation {
+            method,
+            branch_name: branch_name.to_string(),
+            parent: parent.to_string(),
+            original_sha: original_sha.to_string(),
+            tmp_branch_name: None,
+            squash_message: None,
+            resume,
+        }),
+    );
+    if let Err(e) = state.save_state() {
+        eprintln!("Warning: failed to persist restack recovery state: {e}");
+    }
+    print_restack_conflict_help(what);
+    std::process::exit(1);
+}
+
+/// True if the working tree still has unmerged (conflicted) paths.
+fn has_unresolved_conflicts() -> Result<bool> {
+    Ok(run_git(&["status", "--porcelain"])?
+        .output()
+        .map(|s| {
+            s.lines()
+                .any(|l| l.starts_with("UU") || l.starts_with("AA"))
+        })
+        .unwrap_or(false))
+}
+
 /// Complete a squash operation (either after clean merge or after conflict resolution).
 fn complete_squash(
     git_repo: &GitRepo,
     state: &mut State,
     repo: &str,
-    pending: &state::PendingSquashOperation,
+    pending: &PendingRestackOperation,
 ) -> Result<()> {
+    // These are always Some for the squash method.
+    let squash_message = pending
+        .squash_message
+        .as_deref()
+        .ok_or_else(|| anyhow!("pending squash missing commit message"))?;
+    let tmp_branch_name = pending
+        .tmp_branch_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("pending squash missing tmp branch"))?;
+
     // Commit with the concatenated messages
-    run_git(&["commit", "-m", &pending.squash_message])?;
+    run_git(&["commit", "-m", squash_message])?;
 
     // Move the branch pointer: git checkout -B <branch>
     // This points <branch> to current HEAD (the squashed commit) and checks it out
     run_git(&["checkout", "-B", &pending.branch_name])?;
 
     // Clean up temp branch
-    let _ = run_git(&["branch", "-D", &pending.tmp_branch_name]);
+    let _ = run_git(&["branch", "-D", tmp_branch_name]);
 
     // Clear the pending operation
-    state.set_pending_squash(repo, None);
+    state.set_pending_restack(repo, None);
     state.save_state()?;
 
     println!(
@@ -1244,6 +1310,7 @@ fn squash_branch(
     repo: &str,
     branch: &state::Branch,
     parent: &str,
+    resume: RestackResume,
 ) -> Result<bool> {
     let branch_name = &branch.name;
     let tmp_branch = format!("tmp-{}", branch_name);
@@ -1264,15 +1331,19 @@ fn squash_branch(
     // Save original SHA for recovery
     let original_sha = git_repo.sha(branch_name)?;
 
-    // Create pending operation state
-    let pending = state::PendingSquashOperation {
+    // Create pending operation state. Unlike the am/rebase/merge paths (which record only on
+    // conflict), squash persists up front because its `merge --squash` runs on a temp branch and
+    // the pending record carries the temp-branch name + commit message needed to complete it.
+    let pending = PendingRestackOperation {
+        method: RestackMethod::Squash,
         branch_name: branch_name.clone(),
-        parent_branch: parent.to_string(),
-        tmp_branch_name: tmp_branch.clone(),
+        parent: parent.to_string(),
         original_sha,
-        squash_message: squash_message.clone(),
+        tmp_branch_name: Some(tmp_branch.clone()),
+        squash_message: Some(squash_message.clone()),
+        resume,
     };
-    state.set_pending_squash(repo, Some(pending.clone()));
+    state.set_pending_restack(repo, Some(pending.clone()));
     state.save_state()?;
 
     // Execute the squash workflow
@@ -1286,15 +1357,8 @@ fn squash_branch(
     let merge_status = run_git_status(&["merge", "--squash", branch_name], None)?;
 
     if !merge_status.success() {
-        // Conflict! Print instructions and exit
-        eprintln!("{}", "Merge conflict during squash operation.".red().bold());
-        eprintln!();
-        eprintln!("Resolve the conflicts, then run:");
-        eprintln!("  git add <resolved-files>");
-        eprintln!("  {}", "git stack restack --continue".green().bold());
-        eprintln!();
-        eprintln!("Or to abort and restore the original branch:");
-        eprintln!("  {}", "git stack restack --abort".yellow().bold());
+        // Conflict! The pending record is already persisted above; print guidance and exit.
+        print_restack_conflict_help("Squash merge");
         std::process::exit(1);
     }
 
@@ -1304,74 +1368,114 @@ fn squash_branch(
     Ok(true)
 }
 
-/// Handle the --continue flag for resuming a squash operation.
-fn handle_squash_continue(git_repo: &GitRepo, state: &mut State, repo: &str) -> Result<()> {
+/// Handle the `--continue` flag: finish the conflicting branch's in-progress git operation, then
+/// resume restacking the remaining branches in the recorded plan.
+fn handle_restack_continue(
+    git_repo: &GitRepo,
+    mut state: State,
+    repo: &str,
+    run_version: String,
+) -> Result<()> {
     let pending = state
-        .get_pending_squash(repo)
-        .ok_or_else(|| anyhow!("No pending squash operation to continue."))?
+        .get_pending_restack(repo)
+        .ok_or_else(|| anyhow!("No pending restack operation to continue."))?
         .clone();
 
-    // Check if there are unresolved conflicts
-    let status_output = run_git(&["status", "--porcelain"])?;
-    let has_conflicts = status_output
-        .output()
-        .map(|s| {
-            s.lines()
-                .any(|line| line.starts_with("UU") || line.starts_with("AA"))
-        })
-        .unwrap_or(false);
-
-    if has_conflicts {
+    if has_unresolved_conflicts()? {
         bail!(
-            "There are still unresolved conflicts. Resolve them and add the files, \
-             then run --continue again."
+            "There are still unresolved conflicts. Resolve them and `git add` the files, \
+             then run `git stack restack --continue` again."
         );
     }
 
-    // Check if we're on the temp branch
-    let current = git_repo.current_branch()?;
-    if current != pending.tmp_branch_name {
-        bail!(
-            "Expected to be on branch '{}' but currently on '{}'. \
-             Please checkout '{}' and run --continue again.",
-            pending.tmp_branch_name,
-            current,
-            pending.tmp_branch_name
-        );
+    match pending.method {
+        RestackMethod::Squash => {
+            let tmp = pending
+                .tmp_branch_name
+                .as_deref()
+                .ok_or_else(|| anyhow!("pending squash missing tmp branch"))?;
+            let current = git_repo.current_branch()?;
+            if current != tmp {
+                bail!(
+                    "Expected to be on branch '{tmp}' but currently on '{current}'. \
+                     Please checkout '{tmp}' and run --continue again."
+                );
+            }
+            complete_squash(git_repo, &mut state, repo, &pending)?;
+        }
+        RestackMethod::Am => {
+            if !run_git_status(&["am", "--continue"], None)?.success() {
+                // A patch series may conflict more than once; keep the pending record and let
+                // the user resolve and run --continue again.
+                print_restack_conflict_help("`git am`");
+                std::process::exit(1);
+            }
+        }
+        RestackMethod::Rebase => {
+            if !run_git_status(&["rebase", "--continue"], None)?.success() {
+                print_restack_conflict_help("Rebase");
+                std::process::exit(1);
+            }
+        }
+        RestackMethod::Merge => {
+            run_git(&["commit", "--no-edit"])?;
+        }
     }
 
-    // Complete the squash
-    complete_squash(git_repo, state, repo, &pending)?;
-
-    Ok(())
-}
-
-/// Handle the --abort flag for aborting a squash operation.
-fn handle_squash_abort(git_repo: &GitRepo, state: &mut State, repo: &str) -> Result<()> {
-    let pending = state
-        .get_pending_squash(repo)
-        .ok_or_else(|| anyhow!("No pending squash operation to abort."))?
-        .clone();
-
-    // Abort any in-progress merge
-    let _ = run_git_status(&["merge", "--abort"], None);
-
-    // Checkout the original branch at its original SHA
-    run_git(&["checkout", "-f", &pending.original_sha])?;
-    run_git(&["checkout", "-B", &pending.branch_name])?;
-
-    // Clean up temp branch if it exists
-    let _ = run_git(&["branch", "-D", &pending.tmp_branch_name]);
-
-    // Clear pending state
-    state.set_pending_squash(repo, None);
+    // Conflicting branch is done — drop the marker, then resume the rest of the plan.
+    state.set_pending_restack(repo, None);
     state.save_state()?;
 
+    let r = pending.resume;
+    restack(
+        git_repo,
+        state,
+        repo,
+        run_version,
+        Some(r.restack_branch),
+        r.orig_branch,
+        false, // never re-fetch on resume
+        r.push,
+        r.ancestors,
+        r.squash,
+    )
+}
+
+/// Handle the `--abort` flag: tear down git's in-progress op (best-effort) and force-restore the
+/// conflicting branch to its recorded pre-restack SHA.
+fn handle_restack_abort(git_repo: &GitRepo, mut state: State, repo: &str) -> Result<()> {
+    let pending = state
+        .get_pending_restack(repo)
+        .ok_or_else(|| anyhow!("No pending restack operation to abort."))?
+        .clone();
+
+    // Best-effort: tear down git's own in-progress op (ignore failure — it may already be gone,
+    // e.g. the user ran bare `git am --abort`).
+    match pending.method {
+        RestackMethod::Am => {
+            let _ = run_git_status(&["am", "--abort"], None);
+        }
+        RestackMethod::Rebase => {
+            let _ = run_git_status(&["rebase", "--abort"], None);
+        }
+        RestackMethod::Merge | RestackMethod::Squash => {
+            let _ = run_git_status(&["merge", "--abort"], None);
+        }
+    }
+
+    // Force-restore the conflicting branch to its recorded pre-restack SHA.
+    run_git(&["checkout", "-f", &pending.original_sha])?;
+    run_git(&["checkout", "-B", &pending.branch_name])?;
+    if let Some(tmp) = pending.tmp_branch_name.as_deref() {
+        let _ = run_git(&["branch", "-D", tmp]);
+    }
+
+    state.set_pending_restack(repo, None);
+    state.save_state()?;
     println!(
-        "Squash operation aborted. Branch '{}' restored to original state.",
+        "Restack aborted. Branch '{}' restored to original state.",
         pending.branch_name.yellow()
     );
-
     Ok(())
 }
 
@@ -1394,6 +1498,16 @@ fn restack(
     let _lock = git_repo.lock()?;
 
     let restack_branch = restack_branch.unwrap_or(orig_branch.clone());
+
+    // Captured once so a conflict at any exit site can persist enough to resume the remaining
+    // plan via `--continue`.
+    let resume = RestackResume {
+        restack_branch: restack_branch.clone(),
+        orig_branch: orig_branch.clone(),
+        ancestors,
+        push,
+        squash,
+    };
 
     // Track what changes occurred during restack (branch_name, status)
     let mut branch_results: Vec<(String, String)> = Vec::new();
@@ -1465,9 +1579,13 @@ fn restack(
         );
         let source = git_repo.sha(&branch.name)?;
 
-        // Handle squash mode - squash all commits into one on top of parent
+        // Handle squash mode - squash all commits into one on top of parent.
+        // NOTE: unlike the am/rebase/merge paths, squash mode has no `is_ancestor` skip, so a
+        // `--continue` resume re-squashes already-completed branches (same trees, new SHAs, and
+        // a redundant force-push only when `-p` is set). Functionally correct; the
+        // squash + `--ancestors` + conflict + `--continue` scenario is narrow.
         if squash {
-            squash_branch(git_repo, &mut state, repo, &branch, &parent)?;
+            squash_branch(git_repo, &mut state, repo, &branch, &parent, resume.clone())?;
             let status = if push {
                 git_push(git_repo, &branch.name)?;
                 pushed_branches.push(branch.name.clone());
@@ -1531,16 +1649,16 @@ fn restack(
                         let rebased =
                             run_git_status(&["am", "--3way"], Some(&format_patch))?.success();
                         if !rebased {
-                            eprintln!(
-                                "{} did not complete successfully.",
-                                "`git am`".green().bold()
+                            record_restack_conflict(
+                                &mut state,
+                                repo,
+                                RestackMethod::Am,
+                                &branch.name,
+                                &parent,
+                                &source,
+                                resume.clone(),
+                                "`git am`",
                             );
-                            eprintln!("Run `git mergetool` to resolve conflicts.");
-                            eprintln!(
-                                "Once you have finished with {}, re-run `git stack restack`.",
-                                "`git am --continue`".green().bold()
-                            );
-                            std::process::exit(1);
                         }
                         let status = if push {
                             git_push(git_repo, &branch.name)?;
@@ -1559,13 +1677,16 @@ fn restack(
                     let rebased = run_git_status(&["rebase", &parent], None)?.success();
 
                     if !rebased {
-                        eprintln!("{} did not complete automatically.", "Rebase".blue().bold());
-                        eprintln!("Run `git mergetool` to resolve conflicts.");
-                        eprintln!(
-                            "Once you have finished the {}, re-run this script.",
-                            "rebase".blue().bold()
+                        record_restack_conflict(
+                            &mut state,
+                            repo,
+                            RestackMethod::Rebase,
+                            &branch.name,
+                            &parent,
+                            &source,
+                            resume.clone(),
+                            "Rebase",
                         );
-                        std::process::exit(1);
                     }
                     let status = if push {
                         git_push(git_repo, &branch.name)?;
@@ -1580,8 +1701,18 @@ fn restack(
                 StackMethod::Merge => {
                     run_git(&["checkout", &branch.name])
                         .with_context(|| format!("checking out {}", branch.name))?;
-                    run_git(&["merge", &parent])
-                        .with_context(|| format!("merging {parent} into {}", branch.name))?;
+                    if !run_git_status(&["merge", &parent], None)?.success() {
+                        record_restack_conflict(
+                            &mut state,
+                            repo,
+                            RestackMethod::Merge,
+                            &branch.name,
+                            &parent,
+                            &source,
+                            resume.clone(),
+                            "Merge",
+                        );
+                    }
                     branch_results.push((branch.name.clone(), "restacked".to_string()));
                 }
             }

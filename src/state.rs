@@ -46,19 +46,55 @@ pub enum StackMethod {
     Merge,
 }
 
-/// State for an in-progress squash operation that needs to be resumed after conflict resolution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PendingSquashOperation {
-    /// The branch being squashed.
+/// Which restack mechanic was in progress when a conflict interrupted it. Determines the
+/// `--abort`/`--continue` mechanics the handlers run.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestackMethod {
+    /// `format-patch` + `git am` fast path.
+    Am,
+    /// Fallback `git rebase`.
+    Rebase,
+    /// `git merge` (the `Merge` stack method).
+    Merge,
+    /// `git merge --squash` into a temp branch (`-s`/`--squash`).
+    Squash,
+}
+
+/// Enough of the original `restack` invocation to resume the remaining plan after a conflict.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RestackResume {
+    /// The user's target branch for this restack.
+    pub restack_branch: String,
+    /// The branch to return to at the end.
+    pub orig_branch: String,
+    /// Whether the original invocation restacked the whole ancestor chain.
+    pub ancestors: bool,
+    /// Whether the original invocation pushed after each branch.
+    pub push: bool,
+    /// Whether the original invocation was a squash restack.
+    pub squash: bool,
+}
+
+/// A restack operation interrupted by a conflict, awaiting `--continue`/`--abort`.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PendingRestackOperation {
+    /// Which git mechanic was in progress when the conflict hit.
+    pub method: RestackMethod,
+    /// The conflicting branch.
     pub branch_name: String,
-    /// The parent branch we're squashing onto.
-    pub parent_branch: String,
-    /// The temporary branch name used during the squash (e.g., "tmp-<branch>").
-    pub tmp_branch_name: String,
-    /// The original branch SHA before squashing (for recovery).
+    /// The new target parent branch/ref the branch was being restacked onto.
+    pub parent: String,
+    /// The branch tip before the restack moved it (recovery anchor).
     pub original_sha: String,
-    /// The concatenated commit messages to use for the squash commit.
-    pub squash_message: String,
+    /// Squash-only: temp branch used during `merge --squash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmp_branch_name: Option<String>,
+    /// Squash-only: concatenated commit messages for the squash commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_message: Option<String>,
+    /// The original invocation parameters, so `--continue` can resume the remaining plan.
+    pub resume: RestackResume,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,9 +141,9 @@ pub struct RepoState {
     /// branch can be deleted (no unpushed work would be lost).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub seen_remote_shas: HashSet<String>,
-    /// Pending squash operation that needs to be resumed after conflict resolution.
+    /// Pending restack operation that needs to be resumed/aborted after conflict resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_squash: Option<PendingSquashOperation>,
+    pub pending_restack: Option<PendingRestackOperation>,
 }
 
 impl RepoState {
@@ -115,7 +151,7 @@ impl RepoState {
         Self {
             tree,
             seen_remote_shas: HashSet::new(),
-            pending_squash: None,
+            pending_restack: None,
         }
     }
 }
@@ -194,21 +230,23 @@ impl State {
             repo_state.seen_remote_shas.clear();
         }
     }
-    /// Get the pending squash operation for a repo, if any.
-    pub fn get_pending_squash(&self, repo: &str) -> Option<&PendingSquashOperation> {
-        self.repos.get(repo).and_then(|r| r.pending_squash.as_ref())
-    }
-    /// Set or clear the pending squash operation for a repo.
-    pub fn set_pending_squash(&mut self, repo: &str, pending: Option<PendingSquashOperation>) {
-        if let Some(repo_state) = self.repos.get_mut(repo) {
-            repo_state.pending_squash = pending;
-        }
-    }
-    /// Check if there is a pending squash operation for a repo.
-    pub fn has_pending_squash(&self, repo: &str) -> bool {
+    /// Get the pending restack operation for a repo, if any.
+    pub fn get_pending_restack(&self, repo: &str) -> Option<&PendingRestackOperation> {
         self.repos
             .get(repo)
-            .map(|r| r.pending_squash.is_some())
+            .and_then(|r| r.pending_restack.as_ref())
+    }
+    /// Set or clear the pending restack operation for a repo.
+    pub fn set_pending_restack(&mut self, repo: &str, pending: Option<PendingRestackOperation>) {
+        if let Some(repo_state) = self.repos.get_mut(repo) {
+            repo_state.pending_restack = pending;
+        }
+    }
+    /// Check if there is a pending restack operation for a repo.
+    pub fn has_pending_restack(&self, repo: &str) -> bool {
+        self.repos
+            .get(repo)
+            .map(|r| r.pending_restack.is_some())
             .unwrap_or(false)
     }
     /// If there is an existing git-stack branch with the same name, check it out. If there isn't,
@@ -1383,6 +1421,85 @@ mod tests {
         assert_eq!(repo_state.tree.name, "main");
         assert_eq!(repo_state.tree.stack_method, StackMethod::ApplyMerge);
         assert_eq!(repo_state.tree.pr_number, None);
+    }
+
+    fn sample_resume() -> RestackResume {
+        RestackResume {
+            restack_branch: "feature-b".to_string(),
+            orig_branch: "feature-b".to_string(),
+            ancestors: true,
+            push: false,
+            squash: false,
+        }
+    }
+
+    /// Round-trip a non-squash (`Am`/`Rebase`/`Merge`) pending record: no squash-only fields.
+    fn assert_non_squash_round_trip(method: RestackMethod) {
+        let pending = PendingRestackOperation {
+            method,
+            branch_name: "feature-b".to_string(),
+            parent: "feature-a".to_string(),
+            original_sha: "6815deadbeef".to_string(),
+            tmp_branch_name: None,
+            squash_message: None,
+            resume: sample_resume(),
+        };
+        let yaml = serde_yaml::to_string(&pending).unwrap();
+        let back: PendingRestackOperation = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(pending, back);
+        assert_eq!(back.method, method);
+        assert_eq!(back.tmp_branch_name, None);
+        assert_eq!(back.squash_message, None);
+    }
+
+    #[test]
+    fn pending_restack_round_trips_am() {
+        assert_non_squash_round_trip(RestackMethod::Am);
+    }
+
+    #[test]
+    fn pending_restack_round_trips_rebase() {
+        assert_non_squash_round_trip(RestackMethod::Rebase);
+    }
+
+    #[test]
+    fn pending_restack_round_trips_merge() {
+        assert_non_squash_round_trip(RestackMethod::Merge);
+    }
+
+    #[test]
+    fn pending_restack_round_trips_squash() {
+        let pending = PendingRestackOperation {
+            method: RestackMethod::Squash,
+            branch_name: "feature-b".to_string(),
+            parent: "feature-a".to_string(),
+            original_sha: "6815deadbeef".to_string(),
+            tmp_branch_name: Some("tmp-feature-b".to_string()),
+            squash_message: Some("squashed commit message".to_string()),
+            resume: RestackResume {
+                squash: true,
+                ..sample_resume()
+            },
+        };
+        let yaml = serde_yaml::to_string(&pending).unwrap();
+        let back: PendingRestackOperation = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(pending, back);
+        assert_eq!(back.method, RestackMethod::Squash);
+        assert_eq!(back.tmp_branch_name.as_deref(), Some("tmp-feature-b"));
+        assert_eq!(
+            back.squash_message.as_deref(),
+            Some("squashed commit message")
+        );
+    }
+
+    #[test]
+    fn repo_state_without_pending_restack_still_loads() {
+        // An old state file predating the pending_restack field must still parse, with the
+        // field defaulting to None.
+        let yaml = "/tmp/foo:\n  name: main\n  stack_method: apply_merge\n  lkg_parent: null\n  branches: []\n";
+        let state: State = serde_yaml::from_str(yaml).unwrap();
+        let repo_state = state.repos.get("/tmp/foo").unwrap();
+        assert!(repo_state.pending_restack.is_none());
     }
 
     /// Initialize a temp repo with a root commit on `main`, plus a fake `origin` remote-tracking

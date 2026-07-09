@@ -98,8 +98,8 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
   - `-p`/`--push` — push the branch(es) to the remote after a successful restack.
   - `-a`/`--ancestors` — recursively restack every ancestor from trunk up.
   - `-s`/`--squash` — squash all of the branch's commits into one.
-  - `--continue` — resume a squash interrupted by a conflict (after resolving).
-  - `--abort` — cancel an in-progress squash and restore the original state.
+  - `--continue` — resume a restack (any method) interrupted by a conflict (after resolving).
+  - `--abort` — cancel an in-progress restack and restore the original branch state.
 - **`git stack log [branch]`** — no flags. Log of the range parent..branch.
 - **`git stack note [branch]`** — `-e`/`--edit` open the note in `$EDITOR`
   instead of printing it.
@@ -142,8 +142,10 @@ bookkeeping fields:
   `note`, `lkg_parent` (nullable), optional `pr_number`, and `branches` (the
   list of child `Branch`es — this is what makes it a tree).
 - Per repo: `seen_remote_shas` (SHAs observed on the remote, used to prove a
-  local branch can be safely pruned) and, when a squash is mid-flight,
-  `pending_squash`.
+  local branch can be safely pruned) and, when a restack is interrupted by a
+  conflict, `pending_restack` (records the `method` — `am`/`rebase`/`merge`/
+  `squash` — the conflicting branch, its pre-restack SHA, and enough of the
+  original invocation to resume the remaining branches).
 
 Sample `state.yaml`:
 
@@ -177,16 +179,20 @@ branch contains only its own commits, replayed on top of up-to-date parent work.
   which rewrites history; after a successful restack the branch is
   **force-pushed with lease** when `-p` is set. `merge` branches use `git merge`
   and never force-push.
-- **Conflicts.** On a conflict, restack stops and leaves the tree in a
-  conflicted state. Resolve with `git mergetool` (or standard git conflict
-  resolution), then **re-run `git stack restack`**.
+- **Conflicts.** On a conflict (in *any* method — `am`, `rebase`, `merge`, or
+  `squash`), restack stops, records a `pending_restack` in the state file, and
+  leaves the tree in a conflicted state. Resolve with `git mergetool` (or
+  standard git conflict resolution), `git add` the resolved files, then run
+  **`git stack restack --continue`** to finish the conflicting branch and resume
+  the remaining branches, or **`git stack restack --abort`** to restore the
+  conflicting branch to its exact pre-restack SHA. `--abort` recovers even if you
+  already ran a bare `git am --abort` / `git rebase --abort`, because the anchor
+  SHA lives in git-stack's own record, not git's transient state.
 - `-afp` is the common "sync the whole stack and push" combo: fetch (`-f`),
   restack all ancestors from trunk up (`-a`), and push each on success (`-p`).
 - **Squash flow.** `git stack restack -s` squashes the branch's commits into
-  one. If it hits a conflict it records a `pending_squash` in the state file and
-  stops. While a squash is pending, **every other command is blocked** — only
-  `git stack restack --continue` (after you resolve the conflict) or
-  `git stack restack --abort` (restore the pre-squash state) are allowed.
+  one. Like the other methods, a conflict records a `pending_restack` (with
+  `method: squash`) and stops; `--continue` / `--abort` behave as above.
 
 ## 6. Config and authentication
 
@@ -329,9 +335,10 @@ Typical daily loop:
 ## 10. Gotchas
 
 - **Dirty tree blocks restack.** Commit or stash first.
-- **A pending squash blocks everything.** While `pending_squash` is set, only
-  `git stack restack --continue` and `git stack restack --abort` run; every
-  other command errors until the squash is resolved or aborted.
+- **A pending restack blocks everything.** While `pending_restack` is set (after
+  a conflict in any restack method), only `git stack restack --continue` and
+  `git stack restack --abort` run; every other command errors until the restack
+  is resolved or aborted.
 - **Concurrent runs are serialized.** A repo-scoped advisory lock ensures only
   one `git stack` operation touches a repo at a time; a second invocation waits
   for the first.
