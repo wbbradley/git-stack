@@ -121,8 +121,11 @@ Stack state is stored per-repo in `~/.local/state/git-stack/state.yaml`.
 If `git stack` reports issues:
 
 - Ensure your working tree is clean (`git status`)
-- Resolve rebase conflicts with standard git commands (`git mergetool`, then `git rebase --continue`)
-- Rerun `git stack restack` after resolving conflicts
+- On a conflict, restack pauses and records a recovery point. Resolve the conflict
+  (`git mergetool`), `git add` the resolved files, then run `git stack restack --continue`
+  to finish the branch and resume the rest of the stack, or `git stack restack --abort` to
+  restore the conflicting branch to its original state. This works for every stack method,
+  and `--abort` recovers even if you already ran a bare `git am --abort` / `git rebase --abort`.
 
 ## License
 

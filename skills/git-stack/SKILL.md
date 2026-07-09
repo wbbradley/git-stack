@@ -40,11 +40,13 @@ semantics of each step):
 
 - Check `git stack status` (or just `git stack`) first to understand the current
   tree before mutating it.
-- Restack requires a clean working tree, and a conflict pauses it: resolve with
-  `git mergetool`, then re-run `git stack restack`.
-- If any command reports that a squash is in progress, only
-  `git stack restack --continue` (after resolving conflicts) or
-  `git stack restack --abort` will run until it is resolved.
+- Restack requires a clean working tree, and a conflict pauses it (in any method —
+  am, rebase, merge, or squash): resolve with `git mergetool`, `git add` the resolved
+  files, then run `git stack restack --continue` to finish the conflicting branch and
+  resume the rest, or `git stack restack --abort` to restore that branch to its original
+  state. `--abort` recovers even after a bare `git am --abort` / `git rebase --abort`.
+- While a restack is pending, only `git stack restack --continue` / `--abort` run; every
+  other git-stack command is blocked until the restack is resolved or aborted.
 - To remove a branch from the tree, use `git stack delete <branch>` — there is
   no `unmount` command.
 - Prefer `-n`/`--dry-run` (on `sync`, `pr sync`, `cleanup`) to preview

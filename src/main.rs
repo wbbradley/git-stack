@@ -92,10 +92,11 @@ enum Command {
         /// Squash all commits in the branch into a single commit.
         #[arg(long, short = 's', default_value_t = false)]
         squash: bool,
-        /// Continue a previously interrupted squash operation after conflict resolution.
+        /// Continue a restack interrupted by a conflict: finish the conflicting branch, then
+        /// resume restacking the remaining branches.
         #[arg(long, default_value_t = false)]
         r#continue: bool,
-        /// Abort an in-progress squash operation and restore the original branch state.
+        /// Abort an in-progress restack and restore the conflicting branch to its original state.
         #[arg(long, default_value_t = false)]
         abort: bool,
     },
