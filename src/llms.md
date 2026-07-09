@@ -74,7 +74,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 | `git stack checkout <branch_name>` | Create `<branch_name>` as a child of the current branch (or check it out if it exists). |
 | `git stack mount [parent_branch]` | Mount the current branch on `parent_branch` (defaults to trunk); retargets an existing PR's base. |
 | `git stack delete <branch_name>` | Remove a branch from the stack tree (metadata only). |
-| `git stack cleanup` | Remove tree branches that no longer exist locally. |
+| `git stack cleanup` | Remove tree branches missing from git; prune out-of-scope (foreign-author) branches. |
 | `git stack pr create\|view\|sync` | Manage GitHub PRs for the stack (see §7). |
 | `git stack auth login\|status\|logout` | Manage GitHub authentication (see §6). |
 | `git stack cache clear` | Clear the PR cache and seen-SHA set. |
@@ -110,9 +110,14 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
   the new parent.
 - **`git stack delete <branch_name>`** — no flags. Positional branch name.
   Removes it from the tree only; does not delete the git branch or any PR.
-- **`git stack cleanup`** — `-n`/`--dry-run` show what would be removed without
-  removing; `-a`/`--all` clean every repo tree in the state file, dropping
-  invalid repos too.
+- **`git stack cleanup`** — remove branches from the tree that no longer exist
+  locally or on the remote, re-mounting their children onto the grandparent. When
+  `display_authors` is set, it *also* prunes branches confidently attributed to an
+  author outside that list (the same set `status` hides), prompting for
+  confirmation before persisting (and refusing on a non-interactive terminal).
+  `-n`/`--dry-run` previews without changing anything; `-a`/`--all` cleans every
+  repo tree in the state file — missing-branch removal only, no author prune — and
+  drops invalid repos too.
 - **`git stack pr create|view|sync`** — see §7.
 - **`git stack auth login|status|logout`** — see §6.
 - **`git stack cache clear`** — no flags. Empties the PR cache and seen-SHA set.
