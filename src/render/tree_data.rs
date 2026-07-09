@@ -157,7 +157,7 @@ fn mark_ancestor_path(branch: &Branch, target: &str, path: &mut HashSet<String>)
 /// `pr_cache` used elsewhere for rendering PR badges) — otherwise a branch whose PR was already
 /// merged or closed by someone else would look indistinguishable from a branch that never had a
 /// PR, and would wrongly stay visible.
-fn compute_hidden_branches(
+pub(crate) fn compute_hidden_branches(
     tree: &Branch,
     current_branch: &str,
     display_authors: &[String],

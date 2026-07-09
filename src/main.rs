@@ -450,7 +450,28 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
-            state.cleanup_missing_branches(&git_repo, &repo, dry_run, all)
+            let display_authors = github::load_display_authors();
+            // Author-based pruning only runs for a single repo with an active author filter. The
+            // `--all` sweep has no per-repo current-branch/author context, and an empty filter
+            // means "no filtering" — cleanup then behaves exactly as before (missing-only).
+            let pr_authors = if !all
+                && !display_authors.is_empty()
+                && let Some(tree) = state.get_tree(&repo).cloned()
+            {
+                let (authors, _, _) = resolve_pr_authors(&git_repo, &tree, &current_branch, false);
+                authors
+            } else {
+                std::collections::HashMap::new()
+            };
+            state.cleanup_missing_branches(
+                &git_repo,
+                &repo,
+                dry_run,
+                all,
+                &current_branch,
+                &display_authors,
+                &pr_authors,
+            )
         }
         Some(Command::Diff { branch }) => {
             let branch_to_diff = branch.clone().unwrap_or_else(|| current_branch.clone());
@@ -572,6 +593,35 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
 /// fetch (so the caller can print a "showing cached data" disclaimer). Carries `all_authors`
 /// (branch -> author, incl. fork PRs filtered out of `.prs`) so `add_closed_pr_authors` needs no
 /// second open-PR fetch.
+/// Assemble the offline-first branch→author map used for `display_authors` filtering, alongside
+/// the open-PR badge cache and whether any displayed data came from the offline cache fallback.
+/// Runs the same `fetch_pr_cache` → `add_closed_pr_authors` → `add_commit_authors` pipeline for
+/// both callers: `build_renderable_tree` (which also consumes the badge cache) and the `cleanup`
+/// prune path (authors only). Network-capable, so it lives in `main.rs` — `state.rs` stays
+/// network-free.
+fn resolve_pr_authors(
+    git_repo: &GitRepo,
+    tree: &Branch,
+    current_branch: &str,
+    force_full: bool,
+) -> (
+    std::collections::HashMap<String, String>,
+    bool,
+    Option<std::collections::HashMap<String, github::PullRequest>>,
+) {
+    let branch_names = collect_all_branch_names(tree);
+    let pr_result = fetch_pr_cache(git_repo, &branch_names, force_full);
+    let served_from_cache = pr_result.as_ref().is_some_and(|(_, cached)| *cached);
+    let open_authors = pr_result
+        .as_ref()
+        .map(|(r, _)| r.all_authors.clone())
+        .unwrap_or_default();
+    let mut pr_authors = add_closed_pr_authors(git_repo, open_authors);
+    add_commit_authors(git_repo, tree, current_branch, &mut pr_authors);
+    let pr_cache = pr_result.map(|(r, _)| r.prs);
+    (pr_authors, served_from_cache, pr_cache)
+}
+
 fn fetch_pr_cache(
     git_repo: &GitRepo,
     branches: &[String],
@@ -914,14 +964,8 @@ fn build_renderable_tree(
     let (mut renderable, pr_cache, served_from_cache) = if hiding_active {
         // pr_authors depends on the fetch result plus further network calls below, so there's
         // no local work left to overlap the fetch with in this mode.
-        let pr_result = fetch_pr_cache(git_repo, &branch_names, force_full);
-        let served_from_cache = pr_result.as_ref().is_some_and(|(_, cached)| *cached);
-        let open_authors = pr_result
-            .as_ref()
-            .map(|(r, _)| r.all_authors.clone())
-            .unwrap_or_default();
-        let mut pr_authors = add_closed_pr_authors(git_repo, open_authors);
-        add_commit_authors(git_repo, tree, orig_branch, &mut pr_authors);
+        let (pr_authors, served_from_cache, pr_cache) =
+            resolve_pr_authors(git_repo, tree, orig_branch, force_full);
 
         let renderable = render::compute_renderable_tree(
             git_repo,
@@ -932,7 +976,7 @@ fn build_renderable_tree(
             &pr_authors,
             show_all,
         );
-        (renderable, pr_result.map(|(r, _)| r.prs), served_from_cache)
+        (renderable, pr_cache, served_from_cache)
     } else {
         // No author filter active, so hiding/dimming/sort need only an empty pr_authors map —
         // the local git walk has nothing to wait on. Overlap it with the PR fetch.

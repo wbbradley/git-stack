@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     default, fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -390,17 +391,30 @@ impl State {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cleanup_missing_branches(
         &mut self,
         git_repo: &GitRepo,
         repo: &str,
         dry_run: bool,
         all: bool,
+        current_branch: &str,
+        display_authors: &[String],
+        pr_authors: &HashMap<String, String>,
     ) -> Result<()> {
         if all {
+            // The `--all` sweep has no per-repo current-branch/author context, so it does
+            // missing-branch removal only (ignoring the author-prune args).
             self.cleanup_all_trees(dry_run)
         } else {
-            self.cleanup_single_tree(git_repo, repo, dry_run)
+            self.cleanup_single_tree(
+                git_repo,
+                repo,
+                dry_run,
+                current_branch,
+                display_authors,
+                pr_authors,
+            )
         }
     }
 
@@ -451,16 +465,23 @@ impl State {
         Ok(true)
     }
 
-    fn cleanup_single_tree(&mut self, git_repo: &GitRepo, repo: &str, dry_run: bool) -> Result<()> {
+    fn cleanup_single_tree(
+        &mut self,
+        git_repo: &GitRepo,
+        repo: &str,
+        dry_run: bool,
+        current_branch: &str,
+        display_authors: &[String],
+        pr_authors: &HashMap<String, String>,
+    ) -> Result<()> {
         let Some(repo_state) = self.repos.get_mut(repo) else {
             println!("No stack tree found for repo {}", repo.yellow());
             return Ok(());
         };
 
+        // Phase 1: remove branches that no longer exist locally or on the remote.
         let mut removed_branches = Vec::new();
         let mut remounted_branches = Vec::new();
-
-        // Recursively cleanup the tree
         cleanup_tree_recursive(
             git_repo,
             &mut repo_state.tree,
@@ -468,19 +489,42 @@ impl State {
             &mut remounted_branches,
         );
 
-        if removed_branches.is_empty() {
-            println!("No missing branches found. Tree is clean.");
+        // Phase 2: prune branches confidently attributed to an author outside `display_authors` —
+        // exactly the set the render hides via `compute_hidden_branches`, so cleanup and render
+        // stay consistent. Protected branches (current branch, its ancestors, trunk) and branches
+        // with no author data are never selected. Empty when `display_authors` is unset, so this
+        // is a no-op for users who don't filter by author.
+        let to_prune = crate::render::tree_data::compute_hidden_branches(
+            &repo_state.tree,
+            current_branch,
+            display_authors,
+            pr_authors,
+            false,
+        );
+        let (pruned_branches, prune_remounts) = apply_prune(&mut repo_state.tree, &to_prune);
+        remounted_branches.extend(prune_remounts);
+
+        if removed_branches.is_empty() && pruned_branches.is_empty() {
+            println!("No missing or out-of-scope branches found. Tree is clean.");
             return Ok(());
         }
 
-        // Print summary
+        // Print combined preview.
         println!("Cleanup summary for {}:", repo.yellow());
-        println!();
-        println!("Removed branches (no longer exist locally):");
-        for branch_name in &removed_branches {
-            println!("  - {}", branch_name.red());
+        if !removed_branches.is_empty() {
+            println!();
+            println!("Removed (no longer exist):");
+            for branch_name in &removed_branches {
+                println!("  - {}", branch_name.red());
+            }
         }
-
+        if !pruned_branches.is_empty() {
+            println!();
+            println!("Pruned (out of scope — author not in display_authors):");
+            for branch_name in &pruned_branches {
+                println!("  - {}", branch_name.red());
+            }
+        }
         if !remounted_branches.is_empty() {
             println!();
             println!("Re-mounted branches (moved to grandparent):");
@@ -497,12 +541,29 @@ impl State {
         if dry_run {
             println!();
             println!("{}", "Dry run mode: no changes were saved.".bright_blue());
-        } else {
-            self.save_state()?;
-            println!();
-            println!("{}", "Changes saved.".green());
+            return Ok(());
         }
 
+        // The prune phase is destructive in a way the missing-branch removal isn't: those pruned
+        // branches still exist in git, we're only dropping them from git-stack's tree. Confirm
+        // before persisting whenever anything was pruned. Missing-only cleanup keeps today's
+        // no-confirm save.
+        if !pruned_branches.is_empty() {
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "Pruning out-of-scope branches requires confirmation. Use --dry-run to \
+                     preview or run interactively to confirm."
+                );
+            }
+            if !confirm_prune() {
+                println!("\n{}", "Aborted.".yellow());
+                return Ok(());
+            }
+        }
+
+        self.save_state()?;
+        println!();
+        println!("{}", "Changes saved.".green());
         Ok(())
     }
 
@@ -1178,6 +1239,70 @@ fn cleanup_tree_recursive(
     // Add adopted branches
     branch.branches.extend(branches_to_adopt);
 }
+
+/// Splice every branch named in `to_remove` out of the tree, adopting each removed node's kept
+/// children into its parent (mirroring `cleanup_tree_recursive`'s remount behavior, but keyed on
+/// an explicit name set rather than git existence). Bottom-up so a removed branch whose parent is
+/// also removed has its children re-parented onto the surviving grandparent. The root is never
+/// removed even if named. Returns `(removed, remounted)` where `remounted` pairs each adopted
+/// child with its new parent.
+fn apply_prune(
+    tree: &mut Branch,
+    to_remove: &HashSet<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut removed = Vec::new();
+    let mut remounted = Vec::new();
+    prune_recursive(tree, to_remove, &mut removed, &mut remounted);
+    (removed, remounted)
+}
+
+fn prune_recursive(
+    branch: &mut Branch,
+    to_remove: &HashSet<String>,
+    removed: &mut Vec<String>,
+    remounted: &mut Vec<(String, String)>,
+) {
+    // First, recursively process all children (bottom-up).
+    for child in &mut branch.branches {
+        prune_recursive(child, to_remove, removed, remounted);
+    }
+
+    let mut branches_to_adopt: Vec<Branch> = Vec::new();
+    let mut indices_to_remove = Vec::new();
+
+    for (index, child) in branch.branches.iter().enumerate() {
+        if to_remove.contains(&child.name) {
+            removed.push(child.name.clone());
+            for grandchild in &child.branches {
+                branches_to_adopt.push(grandchild.clone());
+                remounted.push((grandchild.name.clone(), branch.name.clone()));
+            }
+            indices_to_remove.push(index);
+        }
+    }
+
+    for &index in indices_to_remove.iter().rev() {
+        branch.branches.remove(index);
+    }
+    branch.branches.extend(branches_to_adopt);
+}
+
+/// Prompt the user to confirm the destructive prune of out-of-scope branches. Modeled on
+/// `sync::confirm_remote_changes`.
+fn confirm_prune() -> bool {
+    use std::io::{self, Write};
+
+    print!("Prune out-of-scope branches from the git-stack tree? [y/N] ");
+    io::stdout().flush().unwrap();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 fn find_stack_with_branch<'a>(
     stacks: &'a mut [Vec<String>],
     current_branch: &str,
@@ -1547,6 +1672,94 @@ mod tests {
         assert!(scope.contains("mine"));
         assert!(scope.contains("mychild")); // no cache entry ⇒ kept
         assert!(!scope.contains("theirs")); // foreign closed-PR author ⇒ excluded
+    }
+
+    #[test]
+    fn apply_prune_removes_foreign_and_adopts_children() {
+        // Tree: main → mine → theirs → mychild. Pruning `theirs` should remove it and re-parent
+        // its child `mychild` onto `mine`.
+        let repo = "repo";
+        let mut state = author_scope_state(repo);
+        let tree = &mut state.repos.get_mut(repo).unwrap().tree;
+
+        let to_remove: HashSet<String> = ["theirs".to_string()].into_iter().collect();
+        let (removed, remounted) = apply_prune(tree, &to_remove);
+
+        assert_eq!(removed, vec!["theirs".to_string()]);
+        assert_eq!(remounted, vec![("mychild".to_string(), "mine".to_string())]);
+        assert!(!is_branch_mentioned_in_tree("theirs", tree));
+
+        // `mychild` is now a direct child of `mine`.
+        let mine = find_branch_by_name(tree, "mine").unwrap();
+        assert!(mine.branches.iter().any(|b| b.name == "mychild"));
+    }
+
+    #[test]
+    fn cleanup_prune_set_excludes_protected() {
+        // Current branch is `mychild`, so its ancestor `theirs` is protected even though it's
+        // authored by `bob` (outside display_authors) — the prune set must be empty.
+        let repo = "repo";
+        let state = author_scope_state(repo);
+        let tree = state.get_tree(repo).unwrap();
+        let display_authors = vec!["alice".to_string()];
+        let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
+            .into_iter()
+            .collect();
+
+        let to_prune = crate::render::tree_data::compute_hidden_branches(
+            tree,
+            "mychild",
+            &display_authors,
+            &pr_authors,
+            false,
+        );
+        assert!(to_prune.is_empty());
+    }
+
+    #[test]
+    fn cleanup_prune_set_selects_foreign() {
+        // Current branch is `mine`, so `theirs` is off the ancestor chain and its foreign author
+        // makes it prunable.
+        let repo = "repo";
+        let state = author_scope_state(repo);
+        let tree = state.get_tree(repo).unwrap();
+        let display_authors = vec!["alice".to_string()];
+        let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
+            .into_iter()
+            .collect();
+
+        let to_prune = crate::render::tree_data::compute_hidden_branches(
+            tree,
+            "mine",
+            &display_authors,
+            &pr_authors,
+            false,
+        );
+        assert_eq!(
+            to_prune,
+            ["theirs".to_string()].into_iter().collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn cleanup_prune_empty_display_authors() {
+        // No author filter configured ⇒ nothing is ever pruned (no behavior change from before).
+        let repo = "repo";
+        let state = author_scope_state(repo);
+        let tree = state.get_tree(repo).unwrap();
+        let display_authors: Vec<String> = Vec::new();
+        let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
+            .into_iter()
+            .collect();
+
+        let to_prune = crate::render::tree_data::compute_hidden_branches(
+            tree,
+            "mine",
+            &display_authors,
+            &pr_authors,
+            false,
+        );
+        assert!(to_prune.is_empty());
     }
 
     #[test]
