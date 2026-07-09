@@ -207,6 +207,70 @@ impl GitRepo {
         self.repo.revparse_single(ref_name).is_ok()
     }
 
+    /// The set of commit OIDs (lowercase hex) reachable from any of `tips` but not from `exclude`.
+    ///
+    /// This is the inverted, bounded form of the per-SHA `is_ancestor` probing that `sync`'s
+    /// seen-SHA pass used to do. Asking "is this PR-head SHA reachable from a tracked branch and
+    /// not yet merged into trunk?" for tens of thousands of SHAs one at a time means a graph walk
+    /// (or a refresh-on-miss ODB lookup, for SHAs never fetched locally) per SHA. Instead we walk
+    /// once from the stack's own tips, hiding the trunk boundary, and return the commits in
+    /// between; membership is then an O(1) set lookup per SHA. Cost scales with the stack size,
+    /// not with the repo's closed-PR count.
+    ///
+    /// `exclude` (typically `origin/<trunk>`) must resolve — it bounds the walk to commits not in
+    /// trunk. If it does not resolve (unexpected after a fetch), the walk would be unbounded, so we
+    /// log and return an empty set rather than traverse the repo's entire history.
+    pub fn commits_reachable_excluding(
+        &self,
+        tips: &[String],
+        exclude: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let _bench = GitBenchmark::start("git2:revwalk-reachable");
+
+        let Some(exclude_commit) = self
+            .repo
+            .revparse_single(exclude)
+            .ok()
+            .and_then(|obj| obj.peel_to_commit().ok())
+        else {
+            tracing::warn!(
+                "commits_reachable_excluding: exclude ref {exclude} did not resolve; \
+                 skipping seen-SHA reachability this run"
+            );
+            return Ok(std::collections::HashSet::new());
+        };
+
+        let mut walk = self.repo.revwalk().context("creating revwalk")?;
+        walk.hide(exclude_commit.id())
+            .context("hiding exclude boundary in revwalk")?;
+
+        let mut pushed = false;
+        for tip in tips {
+            if let Ok(oid) = git2::Oid::from_str(tip)
+                && walk.push(oid).is_ok()
+            {
+                pushed = true;
+            }
+        }
+        if !pushed {
+            return Ok(std::collections::HashSet::new());
+        }
+
+        let mut set = std::collections::HashSet::new();
+        for oid in walk {
+            match oid {
+                Ok(oid) => {
+                    set.insert(oid.to_string());
+                }
+                Err(e) => {
+                    tracing::debug!("revwalk error while collecting reachable commits: {e}");
+                    break;
+                }
+            }
+        }
+        Ok(set)
+    }
+
     /// Resolve a branch name to a ref that exists.
     /// Tries the branch name first, then falls back to origin/{branch}.
     /// Returns None if neither exists.
@@ -511,6 +575,50 @@ mod tests {
 
         let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
         assert_eq!(git_repo.merge_base("feature", "main").unwrap(), bogus_base);
+    }
+
+    /// `commits_reachable_excluding` is the bounded revwalk that replaced `sync`'s per-SHA
+    /// is_ancestor loop. It must return exactly the commits reachable from the given tips but not
+    /// from the exclude boundary — the same set the old "reachable from a tracked branch and not
+    /// merged to trunk" condition selected.
+    #[test]
+    fn commits_reachable_excluding_matches_is_ancestor_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        init_divergent_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+
+        let oid_feature = git_rev_parse(dir.path(), "feature");
+        let oid_main = git_rev_parse(dir.path(), "main");
+        let oid_root = git_rev_parse(dir.path(), "feature~1");
+
+        // Walk from `feature`, hiding `main`: `feature`'s own commit is reachable and not in main;
+        // the shared root commit is hidden by `main`.
+        let set = git_repo
+            .commits_reachable_excluding(std::slice::from_ref(&oid_feature), "main")
+            .unwrap();
+        assert!(set.contains(&oid_feature));
+        assert!(!set.contains(&oid_root));
+        assert!(!set.contains(&oid_main));
+
+        // A well-formed-but-absent tip contributes nothing (mirrors an unfetched PR head SHA);
+        // with no resolvable tips the set is empty.
+        let empty = git_repo
+            .commits_reachable_excluding(
+                &["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
+                "main",
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // An exclude ref that does not resolve yields an empty set rather than an unbounded walk.
+        let unresolved = git_repo
+            .commits_reachable_excluding(
+                std::slice::from_ref(&oid_feature),
+                "origin/does-not-exist",
+            )
+            .unwrap();
+        assert!(unresolved.is_empty());
     }
 
     /// Two distinct repos with separate cache files don't cross results: a bogus row primed in

@@ -246,30 +246,23 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
         .unwrap_or_default();
 
     let mut skipped_existing = 0;
-    let mut skipped_merged = 0;
-    let mut skipped_unreachable = 0;
     let mut added = 0;
     let total = seen_shas.len();
 
-    // Count how many SHAs need checking (not already in existing set)
-    let needs_checking = seen_shas
-        .iter()
-        .filter(|sha| !existing_shas.contains(*sha))
-        .count();
-
-    // Show progress bar if there are SHAs to check and stderr is a TTY
-    let progress = if needs_checking > 0 && std::io::stderr().is_terminal() {
-        let pb = ProgressBar::new(needs_checking as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.cyan} Filtering PR SHAs [{bar:30.cyan/dim}] {pos}/{len}")
-                .expect("valid template")
-                .progress_chars("=> "),
-        );
-        Some(pb)
-    } else {
-        None
-    };
+    // A PR-head SHA belongs in the seen set exactly when it is reachable from one of our tracked
+    // branch tips but is not already merged into trunk. The old implementation computed that per
+    // SHA with is_ancestor, walking the commit graph (or triggering a refresh-on-miss ODB lookup
+    // for the many SHAs never fetched into this clone) tens of thousands of times on every sync —
+    // dominating sync time on a large repo. Invert it: one bounded revwalk over just the stack's
+    // own commits (push tracked tips, hide origin/trunk) yields precisely that set, after which
+    // membership is an O(1) lookup per SHA. Cost now scales with the stack size, not the repo's
+    // closed-PR count. SHAs absent from this clone simply never appear in the walk.
+    let reachable = git_repo
+        .commits_reachable_excluding(&tracked_shas, &origin_trunk)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to compute reachable seen SHAs, adding none this run: {e:#}");
+            HashSet::new()
+        });
 
     for sha in seen_shas {
         // Skip if already tracked (no work needed)
@@ -277,38 +270,17 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
             skipped_existing += 1;
             continue;
         }
-
-        if let Some(pb) = &progress {
-            pb.inc(1);
-        }
-
-        // Skip if already merged to trunk
-        if git_repo.is_ancestor(&sha, &origin_trunk).unwrap_or(false) {
-            skipped_merged += 1;
-            continue;
-        }
-        // Only add if reachable from a tracked branch
-        let reachable = tracked_shas
-            .iter()
-            .any(|branch_sha| git_repo.is_ancestor(&sha, branch_sha).unwrap_or(false));
-        if reachable {
+        if reachable.contains(&sha) {
             state.add_seen_sha(repo, sha);
             added += 1;
-        } else {
-            skipped_unreachable += 1;
         }
-    }
-
-    if let Some(pb) = progress {
-        pb.finish_and_clear();
     }
 
     tracing::debug!(
-        "seen_shas: total={}, skipped_existing={}, skipped_merged={}, skipped_unreachable={}, added={}",
+        "seen_shas: total={}, skipped_existing={}, reachable_commits={}, added={}",
         total,
         skipped_existing,
-        skipped_merged,
-        skipped_unreachable,
+        reachable.len(),
         added
     );
 
