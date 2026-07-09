@@ -1634,16 +1634,32 @@ fn restack(
                     if let Some(lkg_parent) = branch.lkg_parent.as_deref()
                         && git_repo.is_ancestor(lkg_parent, &source)?
                     {
-                        tracing::info!("LKG parent: {}", lkg_parent);
-                        let patch_rev = format!("{}..{}", &lkg_parent, &branch.name);
-                        tracing::info!("Creating patch {}", &patch_rev);
-                        // The branch is still on top of the LKG parent. Let's create a format-patch of the
-                        // difference, and apply it on top of the new parent.
-                        let format_patch =
-                            run_git(&["format-patch", "--stdout", &patch_rev])?.output();
+                        // `lkg_parent` now only gates fast-path vs. rebase fallback (via the
+                        // guard above); the replay base comes from `parent` directly.
+                        if let Ok(mb) = git_repo.merge_base(&parent, &source) {
+                            tracing::info!(
+                                "Restacking '{}' onto '{}' (merge-base {})",
+                                branch.name,
+                                parent,
+                                mb
+                            );
+                        }
+                        // Build the patch series exactly as `git rebase`'s `am` backend does
+                        // (symmetric-difference range with `--cherry-pick --right-only`), so
+                        // commits already upstream — including ones pulled in by a `Merge branch
+                        // 'main'` commit — are dropped rather than replayed. Compute before the
+                        // checkout below moves the branch ref.
+                        let format_patch = git_repo.restack_patch_series(&parent, &branch.name)?;
                         run_git(&["checkout", "-B", &branch.name, &parent])?;
                         let Some(format_patch) = format_patch else {
-                            tracing::debug!("No diff between LKG and branch?!");
+                            // No branch-only work remains; the `checkout -B` above already moved
+                            // the branch onto the new parent. Report it so the summary isn't silent.
+                            tracing::debug!(
+                                "Branch '{}' has no unique commits over '{}'; fast-forwarded, nothing to replay.",
+                                branch.name,
+                                parent
+                            );
+                            branch_results.push((branch.name.clone(), "restacked".to_string()));
                             continue;
                         };
                         println!("Applying patch...");

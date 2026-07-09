@@ -396,6 +396,44 @@ impl GitRepo {
             .to_string())
     }
 
+    /// Build the patch series to replay `branch` onto `parent`, exactly as
+    /// `git rebase`'s `am` backend does: the symmetric-difference range
+    /// `parent...branch` with `--cherry-pick --right-only`, so commits already
+    /// reachable from `parent` — and commits whose change is already present
+    /// upstream by patch-id (e.g. pulled in by a `Merge branch 'main'` commit, or
+    /// belonging to a parent that was itself just rebased) — are dropped instead of
+    /// replayed. `format-patch` already skips merge commits. Returns `None` when the
+    /// series is empty (no branch-only work remains). Fixes the stale-base bug where
+    /// a cached LKG parent behind the merge-base replayed already-merged commits
+    /// (see restack-problem.md).
+    pub fn restack_patch_series(&self, parent: &str, branch: &str) -> Result<Option<String>> {
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| anyhow!("Repository has no working directory"))?;
+        let range = format!("{parent}...{branch}");
+        let out = std::process::Command::new("git")
+            .args([
+                "format-patch",
+                "--stdout",
+                "--cherry-pick",
+                "--right-only",
+                &range,
+            ])
+            .current_dir(workdir)
+            .output()
+            .with_context(|| format!("git format-patch {range}"))?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git format-patch {range} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let patch = String::from_utf8_lossy(&out.stdout);
+        let patch = patch.trim();
+        Ok((!patch.is_empty()).then(|| patch.to_string()))
+    }
+
     /// Get current branch name.
     /// Equivalent to `git rev-parse --abbrev-ref HEAD`
     pub fn current_branch(&self) -> Result<String> {
@@ -498,6 +536,143 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Init a repo with `main` checked out and a committer identity configured.
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "Test"]);
+    }
+
+    /// Write `content` to `file` and commit it with message `msg`.
+    fn commit_file(dir: &Path, file: &str, content: &str, msg: &str) {
+        std::fs::write(dir.join(file), content).unwrap();
+        git(dir, &["add", file]);
+        git(dir, &["commit", "-q", "-m", msg]);
+    }
+
+    /// Extract the `Subject:` lines from a `format-patch` series (one per patch).
+    fn patch_subjects(patch: &str) -> Vec<String> {
+        patch
+            .lines()
+            .filter(|l| l.starts_with("Subject:"))
+            .map(|l| l.trim_start_matches("Subject:").trim().to_string())
+            .collect()
+    }
+
+    /// The `restack-problem.md` minimal repro: a feature branch that merged `main` into
+    /// itself pulls an already-upstream commit (`U2`) into its history. The old
+    /// `lkg..branch` range replayed it; the fixed symmetric-difference range must drop it
+    /// and replay only the branch's own commits (`F1`, `F2`).
+    #[test]
+    fn restack_patch_series_drops_already_upstream_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // main: U1, U2
+        commit_file(dir.path(), "base.txt", "u1", "U1");
+        commit_file(dir.path(), "u2.txt", "u2", "U2");
+
+        // feature forks at U1, commits F1, then merges main (pulling U2 in), then commits F2.
+        git(dir.path(), &["checkout", "-q", "-b", "feature", "main~1"]);
+        commit_file(dir.path(), "f1.txt", "f1", "F1");
+        git(dir.path(), &["merge", "-q", "--no-edit", "main"]);
+        commit_file(dir.path(), "f2.txt", "f2", "F2");
+
+        // main advances to U3.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "u3.txt", "u3", "U3");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        let patch = git_repo
+            .restack_patch_series("main", "feature")
+            .unwrap()
+            .expect("branch has unique work to replay");
+        let subjects = patch_subjects(&patch);
+
+        assert!(
+            subjects.iter().any(|s| s.contains("F1")),
+            "expected F1 in {subjects:?}"
+        );
+        assert!(
+            subjects.iter().any(|s| s.contains("F2")),
+            "expected F2 in {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("U2")),
+            "already-upstream U2 must be dropped, got {subjects:?}"
+        );
+    }
+
+    /// Nested stack: the parent branch `B` was itself rebased onto a new `main`, so its
+    /// commit has a new SHA but an unchanged patch-id. Replaying `A` onto `B` must drop the
+    /// parent's patch-equivalent commit and replay only `A`'s own commit.
+    #[test]
+    fn restack_patch_series_drops_patch_equivalent_parent_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // main: U1
+        commit_file(dir.path(), "base.txt", "u1", "U1");
+
+        // B forks off main with one commit; A forks off B with one commit.
+        git(dir.path(), &["checkout", "-q", "-b", "B"]);
+        commit_file(dir.path(), "b.txt", "b1", "B1");
+        git(dir.path(), &["checkout", "-q", "-b", "A"]);
+        commit_file(dir.path(), "a.txt", "a1", "A1");
+
+        // main advances, and B is rebased onto it: B1 gets a new SHA but the same change.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "u2.txt", "u2", "U2");
+        git(dir.path(), &["checkout", "-q", "B"]);
+        git(dir.path(), &["rebase", "-q", "main"]);
+
+        // A still points at the old B1; replay A onto the rebased B.
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        let patch = git_repo
+            .restack_patch_series("B", "A")
+            .unwrap()
+            .expect("A has unique work to replay");
+        let subjects = patch_subjects(&patch);
+
+        assert_eq!(
+            subjects.len(),
+            1,
+            "only A's own commit should replay, got {subjects:?}"
+        );
+        assert!(subjects[0].contains("A1"), "expected A1, got {subjects:?}");
+    }
+
+    /// A branch whose sole commit was already cherry-picked onto the parent is fully merged
+    /// by patch-id: the series is empty and the helper returns `None`.
+    #[test]
+    fn restack_patch_series_empty_when_fully_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // main: U1
+        commit_file(dir.path(), "base.txt", "u1", "U1");
+
+        // feature adds one commit.
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        commit_file(dir.path(), "x.txt", "content", "F1");
+
+        // The same change lands on main via cherry-pick (new SHA, same patch-id).
+        git(dir.path(), &["checkout", "-q", "main"]);
+        git(dir.path(), &["cherry-pick", "feature"]);
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert!(
+            git_repo
+                .restack_patch_series("main", "feature")
+                .unwrap()
+                .is_none(),
+            "fully patch-equivalent branch should yield an empty series"
+        );
     }
 
     /// Two divergent branches: `feature` is NOT an ancestor of `main`, and their only common
