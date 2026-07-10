@@ -110,6 +110,9 @@ what `status` shows:
 - `git stack cleanup` **prunes** out-of-scope branches from the stack tree (it prompts for
   confirmation before saving, and refuses to prune on a non-interactive terminal).
 - `git stack sync` skips **injecting** remote-only PR branches authored by others.
+- `git stack sync` also **discovers** the filtered authors' open PRs and auto-mounts them, so
+  running it from a trunk-only tree reconstructs and mounts your stacks (skipped under `--push`
+  and when `authors_filter: []` is set).
 
 Override the default with an `authors_filter` key in `~/.config/git-stack/github.yaml`:
 

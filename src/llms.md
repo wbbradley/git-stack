@@ -297,6 +297,13 @@ It fetches with `--tags -f --prune` and never discards unpushed work.
 - **Auto-prune.** Sync automatically removes local branches that have been
   **merged** or that merely **duplicate the remote** branch, using
   `seen_remote_shas` to confirm no unpushed work would be lost.
+- **Author-based discovery.** On every pull-direction sync, git-stack enumerates
+  the open PRs authored by the effective `authors_filter` (one GitHub GraphQL
+  query; see §6) and folds them into the pull pipeline, so running `sync` from a
+  trunk-only tree reconstructs and mounts your stacks (PR base chains bridge
+  intermediate branches). Skipped under `--push` and when `authors_filter: []`
+  ("everyone") is set; best-effort — a discovery failure falls back to the
+  stack-scoped fetch and never aborts the sync.
 
 ## 9. Worked walkthrough
 

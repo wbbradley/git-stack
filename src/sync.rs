@@ -234,10 +234,33 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
         &current_branch,
         !options.push_only,
     );
-    let scope: HashSet<String> = scope_vec.iter().cloned().collect();
+    let mut scope: HashSet<String> = scope_vec.iter().cloned().collect();
+
+    // Author-based open-PR discovery: seed scope with the user's own open PRs so sync mounts
+    // them even from a trunk-only tree. Additive; skipped under --push and empty filter.
+    // Best-effort — a failure never aborts sync.
+    let discovered_prs: Vec<PullRequest> = if !options.push_only && !authors_filter.is_empty() {
+        match client.list_open_prs_by_authors(&repo_id, &authors_filter) {
+            Ok(prs) => prs,
+            Err(e) => {
+                tracing::warn!(
+                    "Author-based PR discovery failed; continuing with stack scope: {e}"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     println!("Reading remote state...");
-    let (remote_state, seen_shas) = read_remote_state(&client, &repo_id, &scope_vec)?;
+    let (mut remote_state, mut seen_shas) = read_remote_state(&client, &repo_id, &scope_vec)?;
+    merge_discovered_prs(
+        &discovered_prs,
+        &mut scope,
+        &mut remote_state,
+        &mut seen_shas,
+    );
 
     // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
@@ -651,6 +674,35 @@ fn compute_scope_branches(
 }
 
 // ============== Stage 2: Model Functions ==============
+
+/// Fold author-discovered open PRs into the pull-direction inputs: seed `scope` with each PR's
+/// head branch (so the inject gate's `scope.contains` check passes), upsert `remote.prs`/
+/// `remote.authors` (so the author gate passes by construction), and record head SHAs in
+/// `seen_shas`. Pure over its inputs — no client — so it is unit-testable. Existing entries win
+/// (`or_insert_with`) so a stack-scoped REST fetch is never clobbered by discovery.
+fn merge_discovered_prs(
+    discovered: &[PullRequest],
+    scope: &mut HashSet<String>,
+    remote: &mut RemoteState,
+    seen_shas: &mut HashSet<String>,
+) {
+    for pr in discovered {
+        let branch = pr.head.ref_name.clone();
+        if branch.is_empty() {
+            continue;
+        }
+        scope.insert(branch.clone());
+        seen_shas.insert(pr.head.sha.clone());
+        remote
+            .authors
+            .entry(branch.clone())
+            .or_insert_with(|| pr.user.login.clone());
+        remote
+            .prs
+            .entry(branch)
+            .or_insert_with(|| RemotePr::from(pr));
+    }
+}
 
 /// Remote-only PR branches eligible to be pulled into the tree, after stack-scoping and
 /// `authors_filter` gating. Returns (branch, pr_base, pr_number). Pure and testable — no
@@ -1845,5 +1897,79 @@ mod tests {
             resolve_repoint("orphan", &branches, &trunk, &unmount_set),
             trunk
         );
+    }
+
+    /// Build a `PullRequest` shaped like one returned from author-based GraphQL discovery: open,
+    /// non-fork (head/base repos match), with a synthetic head SHA derived from the branch name.
+    fn discovered_pr(head: &str, base: &str, number: u64, author: &str) -> PullRequest {
+        use crate::github::{PrBranchRef, PrRepoRef, PrUser};
+        let repo = || {
+            Some(PrRepoRef {
+                full_name: "acme/app".to_string(),
+            })
+        };
+        PullRequest {
+            number,
+            state: PrState::Open,
+            title: format!("PR #{number}"),
+            html_url: format!("https://example.test/pr/{number}"),
+            base: PrBranchRef {
+                ref_name: base.to_string(),
+                sha: String::new(),
+                repo: repo(),
+            },
+            head: PrBranchRef {
+                ref_name: head.to_string(),
+                sha: format!("sha-{head}"),
+                repo: repo(),
+            },
+            user: PrUser {
+                login: author.to_string(),
+            },
+            draft: false,
+            merged: false,
+            merged_at: None,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_discovered_prs_seeds_scope_and_enables_injection() {
+        // Trunk-only tree, empty remote scope — the on-trunk case the feature targets.
+        let local = local_state("main", &[("main", None)]);
+        let mut remote = remote_state(&[]);
+        let mut scope = scope_of(&["main"]);
+        let mut seen_shas: HashSet<String> = HashSet::new();
+
+        let discovered = vec![discovered_pr("mine", "main", 42, "wbbradley")];
+        merge_discovered_prs(&discovered, &mut scope, &mut remote, &mut seen_shas);
+
+        // The head branch is folded into scope, remote.prs, remote.authors, and seen_shas.
+        assert!(scope.contains("mine"));
+        assert_eq!(remote.prs.get("mine").unwrap().number, 42);
+        assert_eq!(remote.authors.get("mine").unwrap(), "wbbradley");
+        assert!(seen_shas.contains("sha-mine"));
+
+        // The author gate now passes by construction ⇒ the PR is injected as a mount tuple.
+        let injected =
+            remote_only_branches_to_inject(&local, &remote, &scope, &["wbbradley".into()]);
+        assert_eq!(injected, vec![("mine".to_string(), "main".to_string(), 42)]);
+    }
+
+    #[test]
+    fn merge_discovered_prs_non_matching_author_not_injected() {
+        // A discovered PR by someone outside the effective filter is seeded into scope but still
+        // dropped by the existing author gate — discovery never bypasses `authors_filter`.
+        let local = local_state("main", &[("main", None)]);
+        let mut remote = remote_state(&[]);
+        let mut scope = scope_of(&["main"]);
+        let mut seen_shas: HashSet<String> = HashSet::new();
+
+        let discovered = vec![discovered_pr("theirs", "main", 7, "bob")];
+        merge_discovered_prs(&discovered, &mut scope, &mut remote, &mut seen_shas);
+
+        let injected =
+            remote_only_branches_to_inject(&local, &remote, &scope, &["wbbradley".into()]);
+        assert!(injected.is_empty());
     }
 }

@@ -7,6 +7,12 @@ All notable changes to this project are documented in this file.
 ### Added
 - `git stack edit --config` opens the GitHub config file (`~/.config/git-stack/github.yaml`) in
   `$EDITOR`; `git stack edit` still opens the state file.
+- `git stack sync` now discovers and auto-mounts **your own open PRs** even from a trunk-only
+  working tree. On every pull-direction sync it enumerates the open PRs authored by the effective
+  `authors_filter` (via a single GitHub GraphQL query) and folds them into the pull pipeline, so
+  running `sync` on `main` with an empty tree reconstructs and mounts your stacks instead of
+  reporting "Everything is in sync!". Skipped under `--push` and when `authors_filter: []`
+  ("everyone") is set; best-effort, so a discovery failure never aborts the sync.
 
 ### Changed
 - Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as an

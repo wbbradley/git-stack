@@ -236,6 +236,75 @@ pub struct ScopedOpenPrs {
     // Errored branches are omitted from both — the caller falls back to cache for them.
 }
 
+// ============== GraphQL Types ==============
+//
+// GraphQL responds with HTTP 200 even for query-level failures, carrying them in a top-level
+// `errors` array alongside an optional `data`. These wrappers let the transport surface those as
+// `GitHubError`s. The `Search*` types below model exactly the `search` connection shape that
+// `list_open_prs_by_authors` requests (rename-cased; `Option` fields tolerate empty non-PR nodes).
+
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse<T> {
+    data: Option<T>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchData {
+    search: SearchConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchConnection {
+    page_info: PageInfo,
+    #[serde(default)]
+    nodes: Vec<SearchNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+/// One `search` node. All fields are `Option` so an empty `{}` node (a non-`PullRequest` result
+/// the `... on PullRequest` fragment doesn't populate) deserializes cleanly and is skipped.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchNode {
+    number: Option<u64>,
+    title: Option<String>,
+    url: Option<String>,
+    is_draft: Option<bool>,
+    is_cross_repository: Option<bool>,
+    updated_at: Option<String>,
+    base_ref_name: Option<String>,
+    head_ref_name: Option<String>,
+    head_ref_oid: Option<String>,
+    head_repository: Option<SearchRepo>,
+    base_repository: Option<SearchRepo>,
+    author: Option<SearchAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRepo {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchAuthor {
+    login: String,
+}
+
 // ============== Error Types ==============
 
 #[derive(Debug)]
@@ -780,6 +849,168 @@ impl GitHubClient {
 
         self.patch_json(&url, &request, "github:update-pr")
     }
+
+    /// The GraphQL endpoint for this host. github.com's REST base is `https://api.github.com`
+    /// (GraphQL at `…/graphql`); GHE's REST base is `https://{host}/api/v3` (GraphQL at
+    /// `https://{host}/api/graphql`).
+    fn graphql_url(&self) -> String {
+        match self.config.api_base.strip_suffix("/api/v3") {
+            Some(base) => format!("{base}/api/graphql"),
+            None => format!("{}/graphql", self.config.api_base),
+        }
+    }
+
+    /// POST a GraphQL `{query, variables}` and deserialize `data` into `T`. GraphQL returns HTTP
+    /// 200 even for query-level failures, carrying them in a top-level `errors` array, so this
+    /// maps a non-empty `errors` (or a missing `data`) to a `GitHubError::Api { status: 200 }`.
+    fn graphql<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, GitHubError> {
+        let _bench = GitBenchmark::start("github:graphql");
+        let url = self.graphql_url();
+        let body = serde_json::json!({ "query": query, "variables": variables });
+        let response = self
+            .auth_headers(self.agent.post(&url))
+            .send_json(&body)
+            .map_err(transport_error)?;
+        let parsed: GraphQlResponse<T> = read_checked(response)?;
+        if !parsed.errors.is_empty() {
+            let message = parsed
+                .errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(GitHubError::Api {
+                status: 200,
+                message,
+            });
+        }
+        parsed.data.ok_or_else(|| GitHubError::Api {
+            status: 200,
+            message: "GraphQL response contained no data".to_string(),
+        })
+    }
+
+    /// Enumerate the open PRs authored by any of `authors` in `repo`, via a single paginated
+    /// GraphQL search. Returns PRs *with* their base/head refs and author, so the caller needs no
+    /// per-branch REST hydration. Fork PRs (`isCrossRepository`) are dropped — their head branch
+    /// isn't on `origin` and can't be mounted. Empty `authors` short-circuits to `Ok(vec![])`
+    /// (no HTTP), since there's no cheap way to enumerate "everyone".
+    pub fn list_open_prs_by_authors(
+        &self,
+        repo: &RepoIdentifier,
+        authors: &[String],
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        if authors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        const QUERY: &str = r"
+            query($q: String!, $cursor: String) {
+              search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  ... on PullRequest {
+                    number
+                    title
+                    url
+                    isDraft
+                    isCrossRepository
+                    updatedAt
+                    baseRefName
+                    headRefName
+                    headRefOid
+                    headRepository { nameWithOwner }
+                    baseRepository { nameWithOwner }
+                    author { login }
+                  }
+                }
+              }
+            }
+        ";
+
+        let search_query = build_author_search_query(repo, authors);
+        let mut all_prs: Vec<PullRequest> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let variables = serde_json::json!({ "q": search_query, "cursor": cursor });
+            let data: SearchData = self.graphql(QUERY, variables)?;
+            all_prs.extend(pull_requests_from_search_nodes(&data.search.nodes));
+
+            if !data.search.page_info.has_next_page {
+                break;
+            }
+            match data.search.page_info.end_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(all_prs)
+    }
+}
+
+/// Build the GitHub search string for author-scoped open-PR discovery: the repo, `is:pr is:open`,
+/// and one `author:` qualifier per login (multiple `author:` qualifiers OR together in search).
+fn build_author_search_query(repo: &RepoIdentifier, authors: &[String]) -> String {
+    let mut query = format!("repo:{}/{} is:pr is:open", repo.owner, repo.repo);
+    for login in authors {
+        query.push_str(&format!(" author:{login}"));
+    }
+    query
+}
+
+/// Map GraphQL `search` nodes into `PullRequest`s, dropping fork PRs (`isCrossRepository`) and any
+/// node missing the core PR fields (e.g. an empty non-PR result). All results come from an
+/// `is:open` search, so `state` is hardcoded to `PrState::Open`; the base SHA is unused downstream
+/// (`RemotePr` carries only `base.ref_name`), so it's left empty.
+fn pull_requests_from_search_nodes(nodes: &[SearchNode]) -> Vec<PullRequest> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            if node.is_cross_repository == Some(true) {
+                return None;
+            }
+            let number = node.number?;
+            let head_ref_name = node.head_ref_name.clone()?;
+            let base_ref_name = node.base_ref_name.clone()?;
+            Some(PullRequest {
+                number,
+                state: PrState::Open,
+                title: node.title.clone().unwrap_or_default(),
+                html_url: node.url.clone().unwrap_or_default(),
+                base: PrBranchRef {
+                    ref_name: base_ref_name,
+                    sha: String::new(),
+                    repo: node.base_repository.as_ref().map(|r| PrRepoRef {
+                        full_name: r.name_with_owner.clone(),
+                    }),
+                },
+                head: PrBranchRef {
+                    ref_name: head_ref_name,
+                    sha: node.head_ref_oid.clone().unwrap_or_default(),
+                    repo: node.head_repository.as_ref().map(|r| PrRepoRef {
+                        full_name: r.name_with_owner.clone(),
+                    }),
+                },
+                user: PrUser {
+                    login: node
+                        .author
+                        .as_ref()
+                        .map(|a| a.login.clone())
+                        .unwrap_or_default(),
+                },
+                draft: node.is_draft.unwrap_or(false),
+                merged: false,
+                merged_at: None,
+                updated_at: node.updated_at.clone().unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// A genuine transport failure (DNS/connect/TLS/timeout); status codes never land here now
@@ -2064,5 +2295,129 @@ mod tests {
             api_error_message("  plain text error  ", 500),
             "plain text error"
         );
+    }
+
+    fn test_repo() -> RepoIdentifier {
+        RepoIdentifier {
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            host: "github.com".to_string(),
+        }
+    }
+
+    fn client_with_api_base(api_base: &str) -> GitHubClient {
+        GitHubClient::new(GitHubConfig {
+            token: "t".to_string(),
+            api_base: api_base.to_string(),
+        })
+    }
+
+    #[test]
+    fn build_author_search_query_has_repo_and_per_author_qualifier() {
+        let q = build_author_search_query(&test_repo(), &["alice".to_string(), "bob".to_string()]);
+        assert!(q.contains("repo:acme/app is:pr is:open"), "q was: {q}");
+        assert!(q.contains("author:alice"), "q was: {q}");
+        assert!(q.contains("author:bob"), "q was: {q}");
+    }
+
+    #[test]
+    fn graphql_url_github_com_appends_graphql() {
+        let client = client_with_api_base("https://api.github.com");
+        assert_eq!(client.graphql_url(), "https://api.github.com/graphql");
+    }
+
+    #[test]
+    fn graphql_url_ghe_replaces_api_v3() {
+        let client = client_with_api_base("https://ghe.host/api/v3");
+        assert_eq!(client.graphql_url(), "https://ghe.host/api/graphql");
+    }
+
+    #[test]
+    fn list_open_prs_by_authors_empty_short_circuits_without_http() {
+        // Empty authors returns Ok(vec![]) before any network call.
+        let client = client_with_api_base("https://api.github.com");
+        let prs = client.list_open_prs_by_authors(&test_repo(), &[]).unwrap();
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn search_nodes_map_to_pull_requests() {
+        let json = r#"{
+            "search": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [
+                    {
+                        "number": 4626,
+                        "title": "ctrl-d handling",
+                        "url": "https://github.com/acme/app/pull/4626",
+                        "isDraft": true,
+                        "isCrossRepository": false,
+                        "updatedAt": "2026-07-01T00:00:00Z",
+                        "baseRefName": "main",
+                        "headRefName": "wbbradley/code/ctrl-d",
+                        "headRefOid": "deadbeef",
+                        "headRepository": { "nameWithOwner": "acme/app" },
+                        "baseRepository": { "nameWithOwner": "acme/app" },
+                        "author": { "login": "wbbradley" }
+                    }
+                ]
+            }
+        }"#;
+        let data: SearchData = serde_json::from_str(json).unwrap();
+        let prs = pull_requests_from_search_nodes(&data.search.nodes);
+        assert_eq!(prs.len(), 1);
+        let pr = &prs[0];
+        assert_eq!(pr.number, 4626);
+        assert_eq!(pr.head.ref_name, "wbbradley/code/ctrl-d");
+        assert_eq!(pr.base.ref_name, "main");
+        assert_eq!(pr.head.sha, "deadbeef");
+        assert_eq!(pr.user.login, "wbbradley");
+        assert!(pr.draft);
+        assert_eq!(pr.state, PrState::Open);
+        // Non-fork head/base repos map through so downstream fork detection stays consistent.
+        assert!(!pr.is_from_fork());
+    }
+
+    #[test]
+    fn search_nodes_drop_cross_repository_forks() {
+        let json = r#"{
+            "search": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [
+                    {
+                        "number": 1,
+                        "title": "fork pr",
+                        "url": "https://github.com/acme/app/pull/1",
+                        "isDraft": false,
+                        "isCrossRepository": true,
+                        "updatedAt": "2026-07-01T00:00:00Z",
+                        "baseRefName": "main",
+                        "headRefName": "feature",
+                        "headRefOid": "abc",
+                        "headRepository": { "nameWithOwner": "someone/app" },
+                        "baseRepository": { "nameWithOwner": "acme/app" },
+                        "author": { "login": "someone" }
+                    }
+                ]
+            }
+        }"#;
+        let data: SearchData = serde_json::from_str(json).unwrap();
+        let prs = pull_requests_from_search_nodes(&data.search.nodes);
+        assert!(prs.is_empty());
+    }
+
+    #[test]
+    fn search_nodes_skip_empty_non_pr_nodes() {
+        // GitHub's ISSUE search can include an empty `{}` node the PullRequest fragment doesn't
+        // populate; it must deserialize cleanly and be skipped rather than panic.
+        let json = r#"{
+            "search": {
+                "pageInfo": { "hasNextPage": false, "endCursor": null },
+                "nodes": [ {} ]
+            }
+        }"#;
+        let data: SearchData = serde_json::from_str(json).unwrap();
+        let prs = pull_requests_from_search_nodes(&data.search.nodes);
+        assert!(prs.is_empty());
     }
 }
