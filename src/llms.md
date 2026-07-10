@@ -231,7 +231,12 @@ PR columns in `status`) need a token. Config lives at
   are cleared. (This does not touch env vars, git config, or `gh`.)
 
 Graceful degradation: with **no** resolvable token, read-only commands still
-work — `git stack status` renders the tree, just without PR numbers/state.
+render the tree (just without PR numbers/state) — *provided* the effective author
+filter doesn't need your login. That holds when the repo has no GitHub remote, or
+when `authors_filter: []` / `--show-all` is in effect. With the **default** filter
+in a GitHub repo and no cached login, resolving "your own login" fails, so
+`status`/`interactive`/`cleanup`/`sync` **error with actionable guidance** instead
+(see the `authors_filter` note just below).
 
 `authors_filter` (list of GitHub logins; the old key `display_authors` still works
 as a deprecated alias) in `github.yaml` is a **three-state** knob controlling which

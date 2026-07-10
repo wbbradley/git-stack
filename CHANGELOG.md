@@ -2,7 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-07-10
+
+### Breaking Changes
+- **`status`/`interactive` now filter the tree to your own GitHub login by default.** Previously,
+  with no author filter configured, every branch was shown. Now branches whose PR was authored by
+  someone else are hidden out of the box (the current branch, its ancestor chain to trunk, and
+  branches with no resolvable author stay visible). The same effective filter also makes
+  `cleanup` **prune** out-of-scope branches by default (it previously never pruned by author) and
+  scopes `sync`'s remote-only injection. To restore the old "show everyone" behavior, set
+  `authors_filter: []` in `~/.config/git-stack/github.yaml`, or pass `--show-all` per invocation.
+- **In a GitHub repo with no resolvable token and no cached login, author-aware commands now error
+  instead of degrading silently.** Deriving the default "you" filter requires knowing your login;
+  when it can't be fetched or found in cache, `status`/`interactive`/`cleanup`/`sync` now exit with
+  actionable guidance rather than rendering without PR data. Fix by configuring a token
+  (`git stack auth login`, or `GITHUB_TOKEN`/`GH_TOKEN`), or by setting `authors_filter: []` /
+  passing `--show-all`. Repos with no GitHub remote are unaffected.
 
 ### Added
 - `git stack edit --config` opens the GitHub config file (`~/.config/git-stack/github.yaml`) in
@@ -15,28 +30,29 @@ All notable changes to this project are documented in this file.
   ("everyone") is set; best-effort, so a discovery failure never aborts the sync.
 
 ### Changed
-- Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as an
-  alias and is migrated to `authors_filter` on the next auth write. Author matching against the
-  filter is now case-insensitive.
-- `authors_filter` now defaults to filtering the tree to **your own GitHub login** when the key is
-  left unset — `status`/`interactive` hide teammates' unrelated branches out of the box (the same
-  effective filter also drives `cleanup` pruning and `sync` injection). It is a three-state knob:
-  absent → filter to you; `authors_filter: []` → show everyone; `authors_filter: [a, b]` → those
-  authors. `--show-all` still shows everything for one invocation. Your login is fetched once via
-  `GET /user` and cached host-keyed, refreshed on `auth login` and `sync`. If it's unset, uncached,
-  and can't be fetched (offline and token-less), the command now prints an actionable error instead
-  of guessing.
+- Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as a
+  deprecated alias and is migrated to `authors_filter` on the next auth write. Author matching
+  against the filter is now case-insensitive. It is a three-state knob: absent → filter to you (see
+  Breaking Changes); `authors_filter: []` → show everyone; `authors_filter: [a, b]` → exactly those
+  authors. Your login is fetched once via `GET /user` and cached host-keyed in the redb state store,
+  refreshed on `auth login` and `sync`.
+- GitHub API errors now surface GitHub's own explanatory `message` body instead of a bare status
+  string — the client no longer treats a non-2xx response as an opaque transport error.
 
 ### Fixed
 - When a GitHub organization forbids classic personal access tokens, `sync` (and other PR
   operations) now print actionable guidance — create a fine-grained PAT scoped to the org, or use
   `git stack auth login` — instead of a bare "GitHub API error (403)". git-stack now reads the
   explanatory 403 body from GitHub (previously discarded by ureq's default status-as-error).
+- Corrected stale on-screen guidance: when a branch's remote is gone (likely merged), git-stack now
+  advises `git stack delete <branch>` instead of the nonexistent `git stack unmount <branch>`.
 
 ### Internal
-- Test suite no longer emits spurious `nextest` LEAK warnings. The temp repos used in tests now
-  disable git's background auto-maintenance (`maintenance.auto`/`gc.auto`), which previously spawned
-  a detached `git maintenance` process that outlived the test and kept its output pipe open.
+- Test suite no longer emits spurious `nextest` LEAK warnings, via two changes: the temp repos used
+  in tests disable git's background auto-maintenance (`maintenance.auto`/`gc.auto`), which
+  previously spawned a detached `git maintenance` process that outlived the test and kept its output
+  pipe open; and `.config/nextest.toml` widens `leak-timeout` to `2s` to absorb late handle
+  releases.
 
 ## [0.3.1] - 2026-07-09
 
