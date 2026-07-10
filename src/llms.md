@@ -112,12 +112,13 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
   Removes it from the tree only; does not delete the git branch or any PR.
 - **`git stack cleanup`** — remove branches from the tree that no longer exist
   locally or on the remote, re-mounting their children onto the grandparent. When
-  `authors_filter` is set, it *also* prunes branches confidently attributed to an
-  author outside that list (the same set `status` hides), prompting for
-  confirmation before persisting (and refusing on a non-interactive terminal).
+  author filtering is active — which is the **default** (see §6), unless
+  `authors_filter: []` is set — it *also* prunes branches confidently attributed to
+  an author outside the effective filter (the same set `status` hides), prompting
+  for confirmation before persisting (and refusing on a non-interactive terminal).
   `-n`/`--dry-run` previews without changing anything; `-a`/`--all` cleans every
-  repo tree in the state file — missing-branch removal only, no author prune — and
-  drops invalid repos too.
+  repo tree in the state file — missing-branch removal only, no author prune (so it
+  never needs identity resolution) — and drops invalid repos too.
 - **`git stack pr create|view|sync`** — see §7.
 - **`git stack auth login|status|logout`** — see §6.
 - **`git stack cache clear`** — no flags. Empties the PR cache and seen-SHA set.
@@ -130,8 +131,8 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 
 Global flags (valid on any subcommand): `-v`/`--verbose`, `--benchmark` (print
 git-command timing stats), `--json` (emit those stats as JSON, implies
-`--benchmark`), `--show-all` (bypasses `authors_filter`-based hiding for this
-invocation).
+`--benchmark`), `--show-all` (bypasses author-filter hiding for this invocation,
+including the default filter-to-your-own-login behavior described in §6).
 
 ## 4. State file
 
@@ -233,12 +234,25 @@ Graceful degradation: with **no** resolvable token, read-only commands still
 work — `git stack status` renders the tree, just without PR numbers/state.
 
 `authors_filter` (list of GitHub logins; the old key `display_authors` still works
-as a deprecated alias) in `github.yaml` — when non-empty,
-`status`/`interactive` hide branches whose PR author isn't listed (case-insensitively), except the
-current branch and its ancestor chain to trunk, and any branch whose author
+as a deprecated alias) in `github.yaml` is a **three-state** knob controlling which
+branches `status`/`interactive` show (matching is case-insensitive):
+
+- **key absent (the default)** → filter to *your own* GitHub login, i.e. behaves as
+  `authors_filter: [<you>]`. This is derived, not written to disk: git-stack looks
+  up your login via `GET /user` and caches it host-keyed in the redb state store
+  (`~/.local/state/git-stack/pr_cache.redb`), refreshing on `auth login` and `sync`.
+  If the filter is unset **and** no login is cached **and** one can't be fetched now
+  (offline + token-less), the command **errors with actionable guidance** rather than
+  guessing — it never silently shows or hides everything.
+- **`authors_filter: []`** → show everyone (filtering off; never needs your login).
+- **`authors_filter: [a, b]`** → filter to exactly those authors.
+
+When filtering is active, branches whose PR author isn't listed are hidden, except
+the current branch and its ancestor chain to trunk, and any branch whose author
 can't be determined at all. A hidden branch's visible descendants reparent to
 the nearest visible ancestor for display purposes only. `--show-all` disables
-this for one invocation.
+this for one invocation. The same effective filter also drives `cleanup` pruning
+and `sync` remote-only-branch injection (see §5, §8).
 
 Author resolution for hiding isn't limited to open PRs: it also checks
 closed/merged PRs (via the same on-disk watermark cache `sync` uses), and, for

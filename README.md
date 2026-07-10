@@ -97,6 +97,44 @@ git-stack resolves a token from the first source that provides one, in order:
    login`, git-stack borrows `gh`'s token automatically (via `gh auth token`). Use `gh auth logout`
    to sign out of `gh`.
 
+## Filtering by author
+
+By default, `git stack status` and the interactive TUI filter the tree to **your own GitHub
+login** — branches whose PR was authored by someone else are hidden, so a shared repo shows just
+your stacks. The current branch, its ancestor chain up to trunk, the trunk itself, and any branch
+whose author can't be determined (e.g. local work with no PR yet) always stay visible.
+
+The same effective filter also governs two non-display behaviors, so they stay consistent with
+what `status` shows:
+
+- `git stack cleanup` **prunes** out-of-scope branches from the stack tree (it prompts for
+  confirmation before saving, and refuses to prune on a non-interactive terminal).
+- `git stack sync` skips **injecting** remote-only PR branches authored by others.
+
+Override the default with an `authors_filter` key in `~/.config/git-stack/github.yaml`:
+
+```yaml
+# Filter to specific authors (yourself and a collaborator):
+authors_filter: [octocat, hubber]
+
+# Show everyone's branches (filtering off):
+authors_filter: []
+```
+
+- **Key absent** (the default) → filter to your own login.
+- **`authors_filter: []`** → show everyone.
+- **`authors_filter: [a, b]`** → show exactly those authors (plus the always-visible protected
+  branches above).
+
+To show everything for a single invocation without editing config, pass `--show-all`.
+
+Deriving the default requires knowing your GitHub login. git-stack looks it up once via `GET /user`
+and caches it (keyed by host) in its local state, refreshing it on `git stack auth login` and
+`git stack sync`. If the filter is unset **and** there's no cached login **and** git-stack can't
+fetch one right now (offline and token-less), `status` prints an actionable error rather than
+guessing — set a token (`git stack auth login`, or `GITHUB_TOKEN`/`GH_TOKEN`), set `authors_filter`
+explicitly, or use `authors_filter: []` / `--show-all` to show everyone.
+
 ## Workflow Example
 
 ```bash

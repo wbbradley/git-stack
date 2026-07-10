@@ -16,6 +16,10 @@ const WATERMARKS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("wate
 const CLOSED_PRS_TABLE: TableDefinition<(&str, &str), &[u8]> =
     TableDefinition::new("closed_prs_v1");
 const OPEN_PRS_TABLE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("open_prs_v1");
+/// Host-keyed cache of the authenticated user's GitHub login (`host` → `login`). Host-keyed (not
+/// repo-keyed) because github.com and GHE logins can differ. Deliberately left untouched by
+/// `clear_repo` — identity is cross-repo, not PR data.
+const IDENTITIES_TABLE: TableDefinition<&str, &str> = TableDefinition::new("identities_v1");
 
 pub struct PrCacheHandle {
     db: redb::Database,
@@ -52,6 +56,39 @@ impl PrCacheHandle {
             .get(repo)
             .context("reading watermark")?
             .map(|guard| guard.value().to_string()))
+    }
+
+    /// The cached GitHub login for `host`, if one has ever been written.
+    pub fn identity(&self, host: &str) -> Result<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .context("opening PR cache read transaction")?;
+        let table = match read_txn.open_table(IDENTITIES_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(anyhow::Error::from(e).context("opening identities table")),
+        };
+        Ok(table
+            .get(host)
+            .context("reading identity")?
+            .map(|guard| guard.value().to_string()))
+    }
+
+    /// Cache the authenticated user's `login` for `host` (upsert).
+    pub fn put_identity(&self, host: &str, login: &str) -> Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("opening PR cache write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(IDENTITIES_TABLE)
+                .context("opening identities table")?;
+            table.insert(host, login).context("updating identity")?;
+        }
+        write_txn.commit().context("committing identity write")?;
+        Ok(())
     }
 
     /// All cached closed PRs for `repo`, keyed by head branch name.
@@ -707,6 +744,58 @@ mod tests {
                 .number,
             2
         );
+    }
+
+    #[test]
+    fn identity_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        assert_eq!(handle.identity("github.com").unwrap(), None);
+
+        handle.put_identity("github.com", "octocat").unwrap();
+        assert_eq!(
+            handle.identity("github.com").unwrap(),
+            Some("octocat".to_string())
+        );
+
+        // Upsert overwrites.
+        handle.put_identity("github.com", "hubber").unwrap();
+        assert_eq!(
+            handle.identity("github.com").unwrap(),
+            Some("hubber".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_is_host_keyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        // github.com and a GHE host have distinct logins.
+        handle.put_identity("github.com", "octocat").unwrap();
+        handle
+            .put_identity("ghe.example.com", "enterprise-me")
+            .unwrap();
+
+        assert_eq!(
+            handle.identity("github.com").unwrap(),
+            Some("octocat".to_string())
+        );
+        assert_eq!(
+            handle.identity("ghe.example.com").unwrap(),
+            Some("enterprise-me".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_miss_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = open_test_handle(&dir);
+
+        handle.put_identity("github.com", "octocat").unwrap();
+        // A host we never wrote misses even though the table exists.
+        assert_eq!(handle.identity("ghe.example.com").unwrap(), None);
     }
 
     #[cfg(unix)]

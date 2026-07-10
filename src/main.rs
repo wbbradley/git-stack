@@ -453,7 +453,14 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
-            let authors_filter = github::load_authors_filter();
+            // `--all` ignores author filtering (it has no per-repo current-branch/author context),
+            // so it must not require identity resolution — pass an empty filter. Single-repo
+            // cleanup resolves the effective filter (unset → your own login).
+            let authors_filter = if all {
+                Vec::new()
+            } else {
+                effective_authors_filter(&git_repo)?
+            };
             // Author-based pruning only runs for a single repo with an active author filter. The
             // `--all` sweep has no per-repo current-branch/author context, and an empty filter
             // means "no filtering" — cleanup then behaves exactly as before (missing-only).
@@ -753,13 +760,31 @@ fn eager_refresh_lkgs(
     repo: &str,
     current_branch: &str,
 ) -> Result<()> {
-    let authors_filter = github::load_authors_filter();
-    if authors_filter.is_empty() {
-        return state.refresh_lkgs(git_repo, repo);
+    // Network-free by design: resolve the filter from cache only. A cold cache (or no GitHub
+    // remote) yields `None`, which falls through to a full refresh — the historical behavior for
+    // an unset filter.
+    let authors_filter = github::get_repo_identifier(git_repo)
+        .ok()
+        .and_then(|repo_id| github::resolve_effective_authors_filter_cached(&repo_id));
+    match authors_filter {
+        Some(filter) if !filter.is_empty() => {
+            let closed_pr_authors = load_closed_pr_authors(git_repo).unwrap_or_default();
+            let scope = state.eager_lkg_scope(repo, current_branch, &filter, &closed_pr_authors);
+            state.refresh_lkgs_scoped(git_repo, repo, &scope)
+        }
+        _ => state.refresh_lkgs(git_repo, repo),
     }
-    let closed_pr_authors = load_closed_pr_authors(git_repo).unwrap_or_default();
-    let scope = state.eager_lkg_scope(repo, current_branch, &authors_filter, &closed_pr_authors);
-    state.refresh_lkgs_scoped(git_repo, repo, &scope)
+}
+
+/// Resolve the effective author filter for this repo's GitHub host, defaulting an unset filter to
+/// `[<your login>]` (see `github::resolve_effective_authors_filter`). A repo with no origin/GitHub
+/// remote has no identity concept and no PRs to filter, so it yields an empty filter (no hiding)
+/// rather than erroring.
+fn effective_authors_filter(git_repo: &GitRepo) -> Result<Vec<String>> {
+    match github::get_repo_identifier(git_repo) {
+        Ok(repo_id) => github::resolve_effective_authors_filter(&repo_id, None),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 /// Read branch -> login from the local redb closed-PR cache. Pure-local, no network.
@@ -1039,13 +1064,15 @@ fn status(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Load authors_filter for filtering (hides branches whose PR author isn't listed)
-    let authors_filter = github::load_authors_filter();
-
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
         return Ok(());
     };
+
+    // Resolve the effective author filter (unset → your own login; hides branches whose PR author
+    // isn't listed). Done after the "no stack" guard so a brand-new user in a stackless repo sees
+    // that message rather than an identity-resolution error.
+    let authors_filter = effective_authors_filter(git_repo)?;
 
     let (renderable, served_from_cache) = build_renderable_tree(
         git_repo,
@@ -1096,13 +1123,15 @@ fn interactive(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Load authors_filter for filtering (hides branches whose PR author isn't listed)
-    let authors_filter = github::load_authors_filter();
-
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
         return Ok(());
     };
+
+    // Resolve the effective author filter (unset → your own login; hides branches whose PR author
+    // isn't listed). Done after the "no stack" guard so a brand-new user in a stackless repo sees
+    // that message rather than an identity-resolution error.
+    let authors_filter = effective_authors_filter(git_repo)?;
 
     let (renderable, served_from_cache) = build_renderable_tree(
         git_repo,
@@ -2365,6 +2394,11 @@ fn handle_auth_command(git_repo: &GitRepo, action: AuthAction) -> Result<()> {
             println!(
                 "Tip: if you already run `gh auth login`, git-stack will borrow gh's token automatically — no separate setup needed."
             );
+            // Warm the identity cache so the next `status` filters to your login without a network
+            // round-trip. Best-effort — the login already succeeded, so ignore any failure.
+            if let Ok(repo_id) = get_repo_identifier(git_repo) {
+                let _ = github::refresh_self_login(&repo_id);
+            }
             Ok(())
         }
         AuthAction::Status => {

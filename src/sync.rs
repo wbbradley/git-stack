@@ -224,7 +224,9 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     // Scope the open-PR fetch + target injection to the user's stack (local tree, plus a
     // reconstructed base chain on a fresh clone). Gate remote-only injection by authors_filter.
     let current_branch = git_repo.current_branch().unwrap_or_default();
-    let authors_filter = client.config().authors_filter.clone();
+    // sync is always online with a live client, so refresh the identity cache here (an unset
+    // filter resolves to your own login; explicit config passes through).
+    let authors_filter = crate::github::resolve_effective_authors_filter(&repo_id, Some(&client))?;
     let scope_vec = compute_scope_branches(
         &client,
         &repo_id,

@@ -8,6 +8,14 @@ All notable changes to this project are documented in this file.
 - Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as an
   alias and is migrated to `authors_filter` on the next auth write. Author matching against the
   filter is now case-insensitive.
+- `authors_filter` now defaults to filtering the tree to **your own GitHub login** when the key is
+  left unset — `status`/`interactive` hide teammates' unrelated branches out of the box (the same
+  effective filter also drives `cleanup` pruning and `sync` injection). It is a three-state knob:
+  absent → filter to you; `authors_filter: []` → show everyone; `authors_filter: [a, b]` → those
+  authors. `--show-all` still shows everything for one invocation. Your login is fetched once via
+  `GET /user` and cached host-keyed, refreshed on `auth login` and `sync`. If it's unset, uncached,
+  and can't be fetched (offline and token-less), the command now prints an actionable error instead
+  of guessing.
 
 ### Internal
 - Test suite no longer emits spurious `nextest` LEAK warnings. The temp repos used in tests now

@@ -612,7 +612,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_authors_filter_hides_nothing() {
+    fn explicit_empty_filter_hides_nothing() {
+        // The 3-state resolution (`None → [me]`, `Some([]) → []`, `Some([a,b]) → [a,b]`) happens
+        // above this layer, so a `&[]` filter reaching here specifically means the explicit "show
+        // everyone" case — which must hide nothing.
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
 

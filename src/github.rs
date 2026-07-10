@@ -22,11 +22,6 @@ use crate::{git2_ops::GitRepo, state::write_file_secure, stats::GitBenchmark};
 pub struct GitHubConfig {
     pub token: String,
     pub api_base: String,
-    /// GitHub usernames whose PRs should be displayed prominently in status.
-    /// When non-empty, branches whose PR author isn't listed are hidden from
-    /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
-    /// branches with no PR yet. `--show-all` bypasses this for one invocation.
-    pub authors_filter: Vec<String>,
 }
 
 /// Repository identification (owner/repo extracted from remote URL)
@@ -301,17 +296,13 @@ impl GitHubClient {
 
     /// Load config from environment/git config/config file
     pub fn from_env(repo_id: &RepoIdentifier) -> Result<Self, GitHubError> {
-        let (token, authors_filter) = find_github_config(&repo_id.host)?;
+        let token = find_github_config(&repo_id.host)?;
         let api_base = if repo_id.host == "github.com" {
             "https://api.github.com".to_string()
         } else {
             format!("https://{}/api/v3", repo_id.host)
         };
-        Ok(Self::new(GitHubConfig {
-            token,
-            api_base,
-            authors_filter,
-        }))
+        Ok(Self::new(GitHubConfig { token, api_base }))
     }
 
     /// Get a reference to the client's config
@@ -381,6 +372,29 @@ impl GitHubClient {
             .map_err(|e| GitHubError::Network(e.to_string()))?;
 
         Ok(parsed.author.map(|u| u.login))
+    }
+
+    /// Resolve the login of the authenticated user via `GET {api_base}/user`. Used to derive the
+    /// default author filter (`[<your login>]`) when it's left unconfigured.
+    pub fn whoami(&self) -> Result<String, GitHubError> {
+        let url = format!("{}/user", self.config.api_base);
+
+        let _bench = GitBenchmark::start("github:whoami");
+        let mut response = self
+            .agent
+            .get(&url)
+            .header("Authorization", &format!("Bearer {}", self.config.token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .header("User-Agent", "git-stack")
+            .call()
+            .map_err(|e| self.handle_ureq_error(e))?;
+
+        let user: PrUser = response
+            .body_mut()
+            .read_json()
+            .map_err(|e| GitHubError::Network(e.to_string()))?;
+
+        Ok(user.login)
     }
 
     /// Find open PR for a branch (returns None if no PR exists)
@@ -920,12 +934,140 @@ fn load_github_config_file() -> Option<GitHubConfigFile> {
     serde_yaml::from_str(&contents).ok()
 }
 
-/// Load authors_filter from the GitHub config file.
-/// Returns an empty vec if the config file doesn't exist or has no authors_filter.
-pub fn load_authors_filter() -> Vec<String> {
-    load_github_config_file()
-        .map(|c| c.authors_filter)
-        .unwrap_or_default()
+/// The on-disk state of `authors_filter`, distinguishing "unset" from "explicitly empty".
+///
+/// - `Default` — no `authors_filter` key at all → resolve to `[<your login>]`.
+/// - `Explicit(vec![])` — `authors_filter: []` → show everyone (filtering off).
+/// - `Explicit([a, b])` — filter to exactly those authors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfiguredAuthorsFilter {
+    Default,
+    Explicit(Vec<String>),
+}
+
+/// Read the three-state `authors_filter` from the GitHub config file. An absent config file or an
+/// absent key both mean `Default`.
+pub fn configured_authors_filter() -> ConfiguredAuthorsFilter {
+    match load_github_config_file().and_then(|c| c.authors_filter) {
+        Some(list) => ConfiguredAuthorsFilter::Explicit(list),
+        None => ConfiguredAuthorsFilter::Default,
+    }
+}
+
+/// Pure resolution core for the three-state author filter, with all identity inputs injected so
+/// the "can't resolve → error" path is unit-testable with no live API.
+///
+/// - `Explicit(v)` → `v` (works offline; identity is irrelevant).
+/// - `Default` → `[login]`, preferring a freshly-`fetched_login` over a `cached_login`, and
+///   erroring (never guessing) when neither is available.
+fn resolve_effective_authors_filter_core(
+    configured: ConfiguredAuthorsFilter,
+    cached_login: Option<String>,
+    fetched_login: Option<String>,
+) -> Result<Vec<String>> {
+    match configured {
+        ConfiguredAuthorsFilter::Explicit(list) => Ok(list),
+        ConfiguredAuthorsFilter::Default => match fetched_login.or(cached_login) {
+            Some(login) => Ok(vec![login]),
+            None => bail!(
+                "Could not determine your GitHub login to filter the stack to your own branches.\n\
+                 Fix this in any of these ways:\n\
+                 \x20 - run `git stack auth login` (or set GITHUB_TOKEN / GH_TOKEN) so git-stack \
+                 can look up your login;\n\
+                 \x20 - set `authors_filter: [<your-login>]` (or a specific list) in \
+                 ~/.config/git-stack/github.yaml;\n\
+                 \x20 - set `authors_filter: []` (or pass `--show-all`) to show everyone's branches."
+            ),
+        },
+    }
+}
+
+/// Resolve the three-state author filter to a concrete list (the central entry point).
+///
+/// `Explicit` config short-circuits with no identity work (offline-safe). For `Default`:
+/// - with `live_client = Some` (always-online callers like `sync`): live `whoami` refresh, writing
+///   through to the host-keyed cache, falling back to the cache on failure;
+/// - with `live_client = None` (the `status`/`interactive` hot path): cache-first, building a
+///   client on demand only on a cache miss (cold-cache path).
+///
+/// Errors — never guesses — when a `Default` filter can't be resolved to a login by any means.
+pub fn resolve_effective_authors_filter(
+    repo_id: &RepoIdentifier,
+    live_client: Option<&GitHubClient>,
+) -> Result<Vec<String>> {
+    let configured = configured_authors_filter();
+    // Explicit config never needs identity resolution.
+    if let ConfiguredAuthorsFilter::Explicit(list) = configured {
+        return Ok(list);
+    }
+
+    let cache = crate::pr_cache::PrCacheHandle::open().ok();
+    let cached_login = cache
+        .as_ref()
+        .and_then(|c| c.identity(&repo_id.host).ok().flatten());
+
+    // Fetch a live login only when it's worth it: refresh on the always-online callers, and on the
+    // hot path only when the cache missed (cold cache). A warm cache with no live client fetches
+    // nothing.
+    let fetch_and_cache = |client: &GitHubClient| -> Option<String> {
+        match client.whoami() {
+            Ok(login) => {
+                if let Some(cache) = &cache {
+                    let _ = cache.put_identity(&repo_id.host, &login);
+                }
+                Some(login)
+            }
+            Err(e) => {
+                tracing::debug!("whoami lookup failed for {}: {e}", repo_id.host);
+                None
+            }
+        }
+    };
+
+    let fetched_login = if let Some(client) = live_client {
+        fetch_and_cache(client)
+    } else if cached_login.is_none() {
+        match GitHubClient::from_env(repo_id) {
+            Ok(client) => fetch_and_cache(&client),
+            Err(e) => {
+                tracing::debug!("could not build client for whoami on {}: {e}", repo_id.host);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    resolve_effective_authors_filter_core(
+        ConfiguredAuthorsFilter::Default,
+        cached_login,
+        fetched_login,
+    )
+}
+
+/// Cache-only resolution of the effective author filter: never touches the network and never
+/// errors. Returns `None` for a `Default` filter with no cached login, letting the caller fall
+/// back to its own network-free default behavior. Used by the `eager_refresh_lkgs` hot path.
+pub fn resolve_effective_authors_filter_cached(repo_id: &RepoIdentifier) -> Option<Vec<String>> {
+    match configured_authors_filter() {
+        ConfiguredAuthorsFilter::Explicit(list) => Some(list),
+        ConfiguredAuthorsFilter::Default => {
+            let cache = crate::pr_cache::PrCacheHandle::open().ok()?;
+            let login = cache.identity(&repo_id.host).ok().flatten()?;
+            Some(vec![login])
+        }
+    }
+}
+
+/// Best-effort force-live `whoami` + host-keyed cache write, ignoring all errors. Used by
+/// `auth login` to warm the identity cache after a successful login. Returns the login on success.
+pub fn refresh_self_login(repo_id: &RepoIdentifier) -> Option<String> {
+    let client = GitHubClient::from_env(repo_id).ok()?;
+    let login = client.whoami().ok()?;
+    if let Ok(cache) = crate::pr_cache::PrCacheHandle::open() {
+        let _ = cache.put_identity(&repo_id.host, &login);
+    }
+    Some(login)
 }
 
 /// Case-insensitive membership test for the author filter. GitHub logins are
@@ -1065,11 +1207,10 @@ pub fn find_auth_source(host: &str) -> Option<AuthSource> {
     resolve_github_auth(host).map(|(_, src)| src)
 }
 
-/// Find GitHub token and config from various sources
-fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> {
-    let authors_filter = load_authors_filter();
+/// Find a GitHub token from various sources.
+fn find_github_config(host: &str) -> Result<String, GitHubError> {
     match resolve_github_auth(host) {
-        Some((token, _)) => Ok((token, authors_filter)),
+        Some((token, _)) => Ok(token),
         None => Err(GitHubError::NoToken),
     }
 }
@@ -1079,12 +1220,22 @@ fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> 
 struct GitHubConfigFile {
     default_token: Option<String>,
     hosts: Option<std::collections::HashMap<String, String>>,
-    /// GitHub usernames whose PRs should be displayed prominently in status.
-    /// When non-empty, branches whose PR author isn't listed are hidden from
-    /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
-    /// branches with no PR yet. `--show-all` bypasses this for one invocation.
-    #[serde(default, alias = "display_authors")]
-    authors_filter: Vec<String>,
+    /// GitHub usernames whose PRs should be displayed prominently in status. Three states:
+    /// **absent** (`None`) → default to filtering to your own login; **`[]`** → show everyone
+    /// (filtering off); **`[a, b]`** → filter to exactly those authors. When filtering is active,
+    /// branches whose PR author isn't listed are hidden from `status`/`interactive`, except the
+    /// current branch, its ancestor chain to trunk, and branches with no PR yet. `--show-all`
+    /// bypasses this for one invocation.
+    ///
+    /// `skip_serializing_if` is critical: the write-back paths round-trip this config, and `None`
+    /// must NOT be re-materialized as `[]` (that would flip "unset → [me]" into "explicit [] →
+    /// everyone").
+    #[serde(
+        default,
+        alias = "display_authors",
+        skip_serializing_if = "Option::is_none"
+    )]
+    authors_filter: Option<Vec<String>>,
     /// OAuth device-flow token (distinct from `default_token`, which holds a PAT).
     #[serde(skip_serializing_if = "Option::is_none")]
     oauth_token: Option<String>,
@@ -1446,18 +1597,124 @@ mod tests {
     #[test]
     fn authors_filter_alias_deserializes() {
         let config: GitHubConfigFile = serde_yaml::from_str("display_authors:\n- x\n").unwrap();
-        assert_eq!(config.authors_filter, vec!["x".to_string()]);
+        assert_eq!(config.authors_filter, Some(vec!["x".to_string()]));
     }
 
     #[test]
     fn authors_filter_serializes_with_new_key() {
         let config = GitHubConfigFile {
-            authors_filter: vec!["x".to_string()],
+            authors_filter: Some(vec!["x".to_string()]),
             ..Default::default()
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("authors_filter"));
         assert!(!yaml.contains("display_authors"));
+    }
+
+    #[test]
+    fn authors_filter_absent_deserializes_to_none() {
+        // No `authors_filter` key at all → `None` (the "unset → [me]" default).
+        let config: GitHubConfigFile = serde_yaml::from_str("default_token: tok\n").unwrap();
+        assert_eq!(config.authors_filter, None);
+    }
+
+    #[test]
+    fn authors_filter_explicit_empty_deserializes_to_some_empty() {
+        // `authors_filter: []` → `Some(vec![])` (the explicit "show everyone" state), distinct
+        // from an absent key.
+        let config: GitHubConfigFile = serde_yaml::from_str("authors_filter: []\n").unwrap();
+        assert_eq!(config.authors_filter, Some(vec![]));
+    }
+
+    #[test]
+    fn authors_filter_explicit_list_deserializes_to_some_list() {
+        let config: GitHubConfigFile = serde_yaml::from_str("authors_filter:\n- a\n- b\n").unwrap();
+        assert_eq!(
+            config.authors_filter,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn none_authors_filter_is_not_serialized() {
+        // Guards the write-back path: `None` must NOT round-trip to `authors_filter: []`, which
+        // would flip "unset → [me]" into "explicit [] → everyone".
+        let config = GitHubConfigFile {
+            default_token: Some("tok".to_string()),
+            authors_filter: None,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("authors_filter"),
+            "None authors_filter must not emit a key, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn resolve_core_explicit_empty_shows_everyone() {
+        let out = resolve_effective_authors_filter_core(
+            ConfiguredAuthorsFilter::Explicit(vec![]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolve_core_explicit_list_passes_through() {
+        let out = resolve_effective_authors_filter_core(
+            ConfiguredAuthorsFilter::Explicit(vec!["a".to_string(), "b".to_string()]),
+            Some("me".to_string()),
+            Some("me".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn resolve_core_default_uses_fetched_login() {
+        let out = resolve_effective_authors_filter_core(
+            ConfiguredAuthorsFilter::Default,
+            None,
+            Some("me".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["me".to_string()]);
+    }
+
+    #[test]
+    fn resolve_core_default_uses_cached_login() {
+        let out = resolve_effective_authors_filter_core(
+            ConfiguredAuthorsFilter::Default,
+            Some("me".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, vec!["me".to_string()]);
+    }
+
+    #[test]
+    fn resolve_core_default_fetched_wins_over_cached() {
+        let out = resolve_effective_authors_filter_core(
+            ConfiguredAuthorsFilter::Default,
+            Some("stale".to_string()),
+            Some("fresh".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["fresh".to_string()]);
+    }
+
+    #[test]
+    fn resolve_core_default_neither_errors() {
+        // The acceptance-criteria error path: unset filter + no cached login + can't fetch.
+        let err =
+            resolve_effective_authors_filter_core(ConfiguredAuthorsFilter::Default, None, None)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auth login"), "message was: {msg}");
+        assert!(msg.contains("authors_filter"), "message was: {msg}");
     }
 
     #[test]
