@@ -254,6 +254,8 @@ pub enum GitHubError {
     Network(String),
     /// API error with message
     Api { status: u16, message: String },
+    /// Org forbids classic PATs; carries the org name when parseable from the 403 body.
+    ClassicPatForbidden { org: Option<String> },
 }
 
 impl std::fmt::Display for GitHubError {
@@ -272,6 +274,28 @@ impl std::fmt::Display for GitHubError {
             Self::Api { status, message } => {
                 write!(f, "GitHub API error ({}): {}", status, message)
             }
+            Self::ClassicPatForbidden { org } => {
+                let org_label = org.as_deref().unwrap_or("this organization");
+                write!(
+                    f,
+                    "The GitHub organization '{org_label}' does not allow classic personal access tokens.\n\
+                     git-stack authenticated fine, but the org blocks classic-PAT access to its repos.\n\
+                     \n\
+                     Use one of these org-accepted options:\n\
+                     \n\
+                     1. Create a fine-grained personal access token:\n\
+                     \x20  - Visit https://github.com/settings/personal-access-tokens/new\n\
+                     \x20  - Set the resource owner to '{org_label}'\n\
+                     \x20  - Grant repository permissions: Pull requests (Read and write),\n\
+                     \x20    Contents (Read and write), Metadata (Read-only)\n\
+                     \x20  - An organization admin may need to approve the token before it works\n\
+                     \x20  - Save it as `default_token` in ~/.config/git-stack/github.yaml,\n\
+                     \x20    or export it as GITHUB_TOKEN / GH_TOKEN\n\
+                     \n\
+                     2. Or authenticate with browser OAuth: run `git stack auth login`\n\
+                     \x20  (an org admin may still need to approve git-stack's OAuth app)."
+                )
+            }
         }
     }
 }
@@ -288,10 +312,13 @@ pub struct GitHubClient {
 
 impl GitHubClient {
     pub fn new(config: GitHubConfig) -> Self {
-        Self {
-            config,
-            agent: ureq::agent(), // default config: connection pooling + keep-alive
-        }
+        let agent = ureq::Agent::config_builder()
+            // Return non-2xx as Ok(response) so we can read GitHub's explanatory body
+            // (e.g. the classic-PAT-forbidden 403 message) instead of a body-less StatusCode error.
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
+        Self { config, agent }
     }
 
     /// Load config from environment/git config/config file
@@ -310,6 +337,57 @@ impl GitHubClient {
         &self.config
     }
 
+    /// Apply the auth/Accept/User-Agent headers common to every GitHub REST call.
+    fn auth_headers<B>(&self, rb: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        rb.header("Authorization", &format!("Bearer {}", self.config.token))
+            .header("Accept", "application/vnd.github.v3+json")
+            .header("User-Agent", "git-stack")
+    }
+
+    /// Issue a GET and deserialize the JSON response (classifying non-2xx into a `GitHubError`).
+    fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        bench: &'static str,
+    ) -> Result<T, GitHubError> {
+        let _bench = GitBenchmark::start(bench);
+        let response = self
+            .auth_headers(self.agent.get(url))
+            .call()
+            .map_err(transport_error)?;
+        read_checked(response)
+    }
+
+    /// Issue a POST with a JSON body and deserialize the JSON response.
+    fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &impl Serialize,
+        bench: &'static str,
+    ) -> Result<T, GitHubError> {
+        let _bench = GitBenchmark::start(bench);
+        let response = self
+            .auth_headers(self.agent.post(url))
+            .send_json(body)
+            .map_err(transport_error)?;
+        read_checked(response)
+    }
+
+    /// Issue a PATCH with a JSON body and deserialize the JSON response.
+    fn patch_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &impl Serialize,
+        bench: &'static str,
+    ) -> Result<T, GitHubError> {
+        let _bench = GitBenchmark::start(bench);
+        let response = self
+            .auth_headers(self.agent.patch(url))
+            .send_json(body)
+            .map_err(transport_error)?;
+        read_checked(response)
+    }
+
     /// Get PR by number
     pub fn get_pr(
         &self,
@@ -321,20 +399,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, pr_number
         );
 
-        let _bench = GitBenchmark::start("github:get-pr");
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .call()
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))
+        self.get_json(&url, "github:get-pr")
     }
 
     /// Resolve the GitHub login GitHub associates with a commit (via a verified email on the
@@ -356,21 +421,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, sha
         );
 
-        let _bench = GitBenchmark::start("github:get-commit-author");
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .call()
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        let parsed: CommitResponse = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))?;
-
+        let parsed: CommitResponse = self.get_json(&url, "github:get-commit-author")?;
         Ok(parsed.author.map(|u| u.login))
     }
 
@@ -379,22 +430,7 @@ impl GitHubClient {
     pub fn whoami(&self) -> Result<String, GitHubError> {
         let url = format!("{}/user", self.config.api_base);
 
-        let _bench = GitBenchmark::start("github:whoami");
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .call()
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        let user: PrUser = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))?;
-
-        Ok(user.login)
+        Ok(self.get_json::<PrUser>(&url, "github:whoami")?.login)
     }
 
     /// Find open PR for a branch (returns None if no PR exists)
@@ -408,21 +444,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, repo.owner, branch
         );
 
-        let _bench = GitBenchmark::start("github:find-pr");
-        let mut response = self
-            .agent
-            .get(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .call()
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        let prs: Vec<PullRequest> = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))?;
-
+        let prs: Vec<PullRequest> = self.get_json(&url, "github:find-pr")?;
         Ok(prs.into_iter().next())
     }
 
@@ -437,20 +459,7 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo
         );
 
-        let _bench = GitBenchmark::start("github:create-pr");
-        let mut response = self
-            .agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .send_json(&request)
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))
+        self.post_json(&url, &request, "github:create-pr")
     }
 
     /// List PRs for a repository with a given state filter
@@ -474,20 +483,7 @@ impl GitHubClient {
                 self.config.api_base, repo.owner, repo.repo, state, per_page, page
             );
 
-            let _bench = GitBenchmark::start("github:list-prs");
-            let mut response = self
-                .agent
-                .get(&url)
-                .header("Authorization", &format!("Bearer {}", self.config.token))
-                .header("Accept", "application/vnd.github.v3+json")
-                .header("User-Agent", "git-stack")
-                .call()
-                .map_err(|e| self.handle_ureq_error(e))?;
-
-            let prs: Vec<PullRequest> = response
-                .body_mut()
-                .read_json()
-                .map_err(|e| GitHubError::Network(e.to_string()))?;
+            let prs: Vec<PullRequest> = self.get_json(&url, "github:list-prs")?;
 
             let count = prs.len();
             all_prs.extend(prs);
@@ -732,20 +728,7 @@ impl GitHubClient {
                 self.config.api_base, repo.owner, repo.repo, state, per_page, page
             );
 
-            let _bench = GitBenchmark::start("github:list-closed-prs");
-            let mut response = self
-                .agent
-                .get(&url)
-                .header("Authorization", &format!("Bearer {}", self.config.token))
-                .header("Accept", "application/vnd.github.v3+json")
-                .header("User-Agent", "git-stack")
-                .call()
-                .map_err(|e| self.handle_ureq_error(e))?;
-
-            let prs: Vec<PullRequest> = response
-                .body_mut()
-                .read_json()
-                .map_err(|e| GitHubError::Network(e.to_string()))?;
+            let prs: Vec<PullRequest> = self.get_json(&url, "github:list-closed-prs")?;
 
             let count = prs.len();
 
@@ -795,46 +778,83 @@ impl GitHubClient {
             self.config.api_base, repo.owner, repo.repo, pr_number
         );
 
-        let _bench = GitBenchmark::start("github:update-pr");
-        let mut response = self
-            .agent
-            .patch(&url)
-            .header("Authorization", &format!("Bearer {}", self.config.token))
-            .header("Accept", "application/vnd.github.v3+json")
-            .header("User-Agent", "git-stack")
-            .send_json(&request)
-            .map_err(|e| self.handle_ureq_error(e))?;
-
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|e| GitHubError::Network(e.to_string()))
+        self.patch_json(&url, &request, "github:update-pr")
     }
+}
 
-    fn handle_ureq_error(&self, error: ureq::Error) -> GitHubError {
-        // In ureq 3.x, errors are structured differently
-        let msg = error.to_string();
-        if msg.contains("401") {
-            GitHubError::Unauthorized
-        } else if msg.contains("403") {
-            GitHubError::Api {
-                status: 403,
-                message: msg,
+/// A genuine transport failure (DNS/connect/TLS/timeout); status codes never land here now
+/// because the agent has `http_status_as_error(false)`.
+fn transport_error(error: ureq::Error) -> GitHubError {
+    GitHubError::Network(error.to_string())
+}
+
+/// Status-check + JSON-deserialize. Non-2xx reads the body and classifies the error.
+fn read_checked<T: serde::de::DeserializeOwned>(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<T, GitHubError> {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(classify_status_error(status, &body));
+    }
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|e| GitHubError::Network(e.to_string()))
+}
+
+const CLASSIC_PAT_MARKER: &str = "forbids access via a personal access token (classic)";
+
+/// Map an HTTP error status + body to a `GitHubError`. Preserves prior behavior (401 →
+/// Unauthorized; others → Api) and adds classic-PAT detection on 403.
+fn classify_status_error(status: u16, body: &str) -> GitHubError {
+    match status {
+        401 => GitHubError::Unauthorized,
+        403 if body.to_ascii_lowercase().contains(CLASSIC_PAT_MARKER) => {
+            GitHubError::ClassicPatForbidden {
+                org: parse_forbidden_org(body),
             }
-        } else if msg.contains("422") {
-            GitHubError::Api {
-                status: 422,
-                message: msg,
-            }
-        } else if msg.contains("404") {
-            GitHubError::Api {
-                status: 404,
-                message: msg,
-            }
-        } else {
-            GitHubError::Network(msg)
         }
+        _ => GitHubError::Api {
+            status,
+            message: api_error_message(body, status),
+        },
     }
+}
+
+/// Extract GitHub's `message` field from a JSON error body; fall back to the raw body, then to a
+/// bare "HTTP <status>".
+fn api_error_message(body: &str, status: u16) -> String {
+    #[derive(Deserialize)]
+    struct ApiErrorBody {
+        message: Option<String>,
+    }
+    serde_json::from_str::<ApiErrorBody>(body)
+        .ok()
+        .and_then(|b| b.message)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| {
+            let t = body.trim();
+            if t.is_empty() {
+                format!("HTTP {status}")
+            } else {
+                t.to_string()
+            }
+        })
+}
+
+/// Pull the org login out of the classic-PAT-forbidden message. GitHub phrases it
+/// "<org> forbids access via a personal access token (classic)"; the org is the whitespace/quote-
+/// delimited token immediately before the marker. Returns None if it doesn't look like a login.
+fn parse_forbidden_org(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase(); // ASCII marker → byte indices align with `body`
+    let pos = lower.find(CLASSIC_PAT_MARKER)?;
+    let org = body[..pos]
+        .trim_end()
+        .rsplit(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .find(|s| !s.is_empty())?;
+    (!org.is_empty() && org.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .then(|| org.to_string())
 }
 
 // ============== Helper Functions ==============
@@ -1945,6 +1965,95 @@ mod tests {
                 token: "gho_abc123".to_string(),
                 scope: "repo".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn classify_403_classic_pat_detected() {
+        let body = r#"{"message":"langchain-ai forbids access via a personal access token (classic). Please use a GitHub App, OAuth App, or a personal access token with fine-grained permissions.","documentation_url":"https://docs.github.com/"}"#;
+        let err = classify_status_error(403, body);
+        match &err {
+            GitHubError::ClassicPatForbidden { org } => {
+                assert_eq!(org.as_deref(), Some("langchain-ai"));
+            }
+            other => panic!("expected ClassicPatForbidden, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert!(display.contains("fine-grained"), "display: {display}");
+        assert!(display.contains("langchain-ai"), "display: {display}");
+    }
+
+    #[test]
+    fn classify_403_case_insensitive() {
+        let body =
+            r#"{"message":"Acme-Corp FORBIDS ACCESS VIA A PERSONAL ACCESS TOKEN (CLASSIC)."}"#;
+        match classify_status_error(403, body) {
+            GitHubError::ClassicPatForbidden { org } => {
+                assert_eq!(org.as_deref(), Some("Acme-Corp"));
+            }
+            other => panic!("expected ClassicPatForbidden, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_403_generic_permission_denied() {
+        let body = r#"{"message":"Resource not accessible by integration"}"#;
+        match classify_status_error(403, body) {
+            GitHubError::Api { status, message } => {
+                assert_eq!(status, 403);
+                assert_eq!(message, "Resource not accessible by integration");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_401_is_unauthorized() {
+        assert!(matches!(
+            classify_status_error(401, r#"{"message":"Bad credentials"}"#),
+            GitHubError::Unauthorized
+        ));
+    }
+
+    #[test]
+    fn classify_404_and_422_are_api() {
+        match classify_status_error(404, r#"{"message":"Not Found"}"#) {
+            GitHubError::Api { status, message } => {
+                assert_eq!(status, 404);
+                assert_eq!(message, "Not Found");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+        match classify_status_error(422, r#"{"message":"Validation Failed"}"#) {
+            GitHubError::Api { status, message } => {
+                assert_eq!(status, 422);
+                assert_eq!(message, "Validation Failed");
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_forbidden_org_missing_returns_none() {
+        // Marker present but the preceding token isn't a plausible login.
+        let body = "Something odd @@@ forbids access via a personal access token (classic).";
+        match classify_status_error(403, body) {
+            GitHubError::ClassicPatForbidden { org } => assert_eq!(org, None),
+            other => panic!("expected ClassicPatForbidden, got {other:?}"),
+        }
+        // Display falls back to a generic label when the org is unknown.
+        let display = GitHubError::ClassicPatForbidden { org: None }.to_string();
+        assert!(display.contains("this organization"), "display: {display}");
+    }
+
+    #[test]
+    fn api_error_message_falls_back() {
+        // Empty body → bare "HTTP <status>".
+        assert_eq!(api_error_message("", 500), "HTTP 500");
+        // Non-JSON body → raw (trimmed) text.
+        assert_eq!(
+            api_error_message("  plain text error  ", 500),
+            "plain text error"
         );
     }
 }

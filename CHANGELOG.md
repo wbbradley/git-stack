@@ -17,6 +17,12 @@ All notable changes to this project are documented in this file.
   and can't be fetched (offline and token-less), the command now prints an actionable error instead
   of guessing.
 
+### Fixed
+- When a GitHub organization forbids classic personal access tokens, `sync` (and other PR
+  operations) now print actionable guidance — create a fine-grained PAT scoped to the org, or use
+  `git stack auth login` — instead of a bare "GitHub API error (403)". git-stack now reads the
+  explanatory 403 body from GitHub (previously discarded by ureq's default status-as-error).
+
 ### Internal
 - Test suite no longer emits spurious `nextest` LEAK warnings. The temp repos used in tests now
   disable git's background auto-maintenance (`maintenance.auto`/`gc.auto`), which previously spawned
