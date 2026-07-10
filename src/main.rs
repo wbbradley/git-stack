@@ -553,7 +553,7 @@ fn diff(git_repo: &GitRepo, mut state: State, repo: &str, branch: &str) -> Resul
         ),
     ])?;
     if !status.success() {
-        bail!("git format-patch failed");
+        bail!("git diff failed");
     }
     Ok(())
 }
@@ -576,7 +576,7 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
         &format!("{}..{}", &parent_branch.name, branch),
     ])?;
     if !status.success() {
-        bail!("git format-patch failed");
+        bail!("git log failed");
     }
     Ok(())
 }
