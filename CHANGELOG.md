@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-07-09
+
+### Changed
+- `sync` is dramatically faster on large repositories. Instead of inspecting every closed-PR head
+  SHA individually, it now does a single bounded history walk scoped to your stack's tracked
+  branches, so its cost scales with the size of your stack rather than the repository's total
+  closed-PR count.
+- During `restack`, a branch that has no unique commits over its new parent is now reported as
+  `restacked` in the summary instead of being silently skipped.
+
+### Fixed
+- `restack` no longer replays commits that are already upstream. Restacking a branch that had
+  merged trunk into itself — or a branch stacked on a parent that was itself just rebased — could
+  replay commits already present upstream, manufacturing spurious merge conflicts and duplicate
+  commits. Restack now builds its patch series the same way `git rebase` does, dropping commits
+  reachable from the new parent and commits whose change is already upstream by patch-id.
+- `git stack diff` and `git stack log` now report accurate error messages on failure ("git diff
+  failed" / "git log failed") instead of the incorrect "git format-patch failed".
+
+### Removed
+- The "Filtering PR SHAs" progress bar shown during `sync` was removed. It was cosmetic — the
+  filtering step is now effectively instantaneous.
+
 ## [0.3.0] - 2026-07-09
 
 ### Breaking Changes
