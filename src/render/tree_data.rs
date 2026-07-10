@@ -79,7 +79,7 @@ pub struct RenderableBranch {
     pub depth: usize,
     /// Whether this is the currently checked-out branch.
     pub is_current: bool,
-    /// Whether this branch should be rendered dimmed (filtered by display_authors).
+    /// Whether this branch should be rendered dimmed (filtered by authors_filter).
     pub is_dimmed: bool,
     /// Whether this branch only exists on remote (not locally).
     pub is_remote_only: bool,
@@ -108,24 +108,24 @@ pub struct RenderableTree {
     pub current_branch_index: Option<usize>,
 }
 
-/// Check if a branch subtree contains the target branch or a display_author PR.
-/// Returns (has_target_branch, has_display_author_pr).
+/// Check if a branch subtree contains the target branch or a PR by a filtered author.
+/// Returns (has_target_branch, has_filtered_author_pr).
 fn subtree_contains(
     branch: &Branch,
     target_branch: &str,
-    display_authors: &[String],
+    authors_filter: &[String],
     pr_authors: &HashMap<String, String>,
 ) -> (bool, bool) {
     let is_target = branch.name == target_branch;
     let has_author = pr_authors
         .get(&branch.name)
-        .map(|author| display_authors.contains(author))
+        .map(|author| crate::github::author_in_filter(authors_filter, author))
         .unwrap_or(false);
 
     let (child_has_target, child_has_author) = branch
         .branches
         .iter()
-        .map(|b| subtree_contains(b, target_branch, display_authors, pr_authors))
+        .map(|b| subtree_contains(b, target_branch, authors_filter, pr_authors))
         .fold((false, false), |(t1, a1), (t2, a2)| (t1 || t2, a1 || a2));
 
     (
@@ -149,7 +149,7 @@ fn mark_ancestor_path(branch: &Branch, target: &str, path: &mut HashSet<String>)
 }
 
 /// Compute the set of branch names to hide entirely from rendering because their PR author
-/// isn't in `display_authors`. A branch is protected from hiding if it is `current_branch`, one
+/// isn't in `authors_filter`. A branch is protected from hiding if it is `current_branch`, one
 /// of its ancestors, or the tree root — regardless of author. Branches with no PR (no entry in
 /// `pr_authors`) are never hidden.
 ///
@@ -160,17 +160,17 @@ fn mark_ancestor_path(branch: &Branch, target: &str, path: &mut HashSet<String>)
 pub(crate) fn compute_hidden_branches(
     tree: &Branch,
     current_branch: &str,
-    display_authors: &[String],
+    authors_filter: &[String],
     pr_authors: &HashMap<String, String>,
     show_all: bool,
 ) -> HashSet<String> {
     let mut hidden = HashSet::new();
-    if show_all || display_authors.is_empty() {
+    if show_all || authors_filter.is_empty() {
         return hidden;
     }
 
     let protected = compute_protected_branches(tree, current_branch);
-    mark_hidden(tree, display_authors, pr_authors, &protected, &mut hidden);
+    mark_hidden(tree, authors_filter, pr_authors, &protected, &mut hidden);
     hidden
 }
 
@@ -186,19 +186,20 @@ pub fn compute_protected_branches(tree: &Branch, current_branch: &str) -> HashSe
 
 fn mark_hidden(
     branch: &Branch,
-    display_authors: &[String],
+    authors_filter: &[String],
     pr_authors: &HashMap<String, String>,
     protected: &HashSet<String>,
     hidden: &mut HashSet<String>,
 ) {
     if !protected.contains(&branch.name) {
         let pr_author = pr_authors.get(&branch.name).map(|s| s.as_str());
-        if pr_author.is_some_and(|author| !display_authors.contains(&author.to_string())) {
+        if pr_author.is_some_and(|author| !crate::github::author_in_filter(authors_filter, author))
+        {
             hidden.insert(branch.name.clone());
         }
     }
     for child in &branch.branches {
-        mark_hidden(child, display_authors, pr_authors, protected, hidden);
+        mark_hidden(child, authors_filter, pr_authors, protected, hidden);
     }
 }
 
@@ -212,14 +213,14 @@ pub fn compute_renderable_tree(
     tree: &Branch,
     current_branch: &str,
     verbose: bool,
-    display_authors: &[String],
+    authors_filter: &[String],
     pr_authors: &HashMap<String, String>,
     show_all: bool,
 ) -> RenderableTree {
     let mut branches = Vec::new();
     let mut current_branch_index = None;
     let hidden =
-        compute_hidden_branches(tree, current_branch, display_authors, pr_authors, show_all);
+        compute_hidden_branches(tree, current_branch, authors_filter, pr_authors, show_all);
     let mut diff_cache = DiffStatsCache::new();
 
     flatten_tree(
@@ -229,7 +230,7 @@ pub fn compute_renderable_tree(
         0,
         current_branch,
         verbose,
-        display_authors,
+        authors_filter,
         pr_authors,
         &hidden,
         &mut branches,
@@ -267,7 +268,7 @@ fn flatten_tree(
     depth: usize,
     current_branch: &str,
     verbose: bool,
-    display_authors: &[String],
+    authors_filter: &[String],
     pr_authors: &HashMap<String, String>,
     hidden: &HashSet<String>,
     result: &mut Vec<RenderableBranch>,
@@ -284,12 +285,12 @@ fn flatten_tree(
             *current_branch_index = Some(index);
         }
 
-        // Check if this branch should be dimmed (filtered by display_authors)
+        // Check if this branch should be dimmed (filtered by authors_filter)
         let pr_author = pr_authors.get(&branch.name).map(|s| s.as_str());
-        let is_dimmed = if display_authors.is_empty() {
+        let is_dimmed = if authors_filter.is_empty() {
             false
         } else {
-            pr_author.is_some_and(|author| !display_authors.contains(&author.to_string()))
+            pr_author.is_some_and(|author| !crate::github::author_in_filter(authors_filter, author))
         };
 
         // Check if branch is remote-only (not local)
@@ -374,7 +375,7 @@ fn flatten_tree(
         });
     }
 
-    // Sort children: current subtree first, display_authors second, alphabetical third
+    // Sort children: current subtree first, authors_filter second, alphabetical third
     let mut children: Vec<&Branch> = branch.branches.iter().collect();
 
     // Pre-compute subtree properties for sorting
@@ -383,7 +384,7 @@ fn flatten_tree(
         .map(|b| {
             (
                 b.name.as_str(),
-                subtree_contains(b, current_branch, display_authors, pr_authors),
+                subtree_contains(b, current_branch, authors_filter, pr_authors),
             )
         })
         .collect();
@@ -404,7 +405,7 @@ fn flatten_tree(
             (false, true) => return std::cmp::Ordering::Greater,
             _ => {}
         }
-        // Priority 2: subtree contains display_author PR
+        // Priority 2: subtree contains a filtered-author PR
         match (a_has_author, b_has_author) {
             (true, false) => return std::cmp::Ordering::Less,
             (false, true) => return std::cmp::Ordering::Greater,
@@ -427,7 +428,7 @@ fn flatten_tree(
             child_depth,
             current_branch,
             verbose,
-            display_authors,
+            authors_filter,
             pr_authors,
             hidden,
             result,
@@ -565,9 +566,9 @@ mod tests {
     fn hides_branches_with_unlisted_pr_author() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &authors_filter, &pr_authors, false);
 
         let expected: HashSet<String> =
             ["carol-1", "eve-1"].iter().map(|s| s.to_string()).collect();
@@ -578,9 +579,9 @@ mod tests {
     fn protects_current_branch_and_its_ancestors() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &authors_filter, &pr_authors, false);
 
         assert!(!hidden.contains("bob-1"));
         assert!(!hidden.contains("alice-1"));
@@ -590,9 +591,9 @@ mod tests {
     fn never_hides_branches_without_a_pr() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &authors_filter, &pr_authors, false);
 
         assert!(!hidden.contains("main"));
         assert!(!hidden.contains("dave-1"));
@@ -602,16 +603,16 @@ mod tests {
     fn hidden_branch_does_not_hide_its_own_listed_author_child() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &authors_filter, &pr_authors, false);
 
         assert!(hidden.contains("carol-1"));
         assert!(!hidden.contains("carol-1-child"));
     }
 
     #[test]
-    fn empty_display_authors_hides_nothing() {
+    fn empty_authors_filter_hides_nothing() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
 
@@ -624,9 +625,9 @@ mod tests {
     fn show_all_disables_hiding() {
         let tree = fixture_tree();
         let pr_authors = fixture_pr_authors();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "bob-1", &display_authors, &pr_authors, true);
+        let hidden = compute_hidden_branches(&tree, "bob-1", &authors_filter, &pr_authors, true);
 
         assert!(hidden.is_empty());
     }
@@ -636,16 +637,11 @@ mod tests {
         let mut pr_authors = HashMap::new();
         pr_authors.insert("main".to_string(), "mallory".to_string());
         let tree = branch("main", vec![]);
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
         // "does-not-exist" simulates stale current_branch state that matches nothing in the tree.
-        let hidden = compute_hidden_branches(
-            &tree,
-            "does-not-exist",
-            &display_authors,
-            &pr_authors,
-            false,
-        );
+        let hidden =
+            compute_hidden_branches(&tree, "does-not-exist", &authors_filter, &pr_authors, false);
 
         assert!(!hidden.contains(&tree.name));
     }
@@ -660,18 +656,33 @@ mod tests {
         let tree = branch("main", vec![branch("mallory-1", vec![])]);
         let mut pr_authors = HashMap::new();
         pr_authors.insert("mallory-1".to_string(), "mallory".to_string());
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "main", &authors_filter, &pr_authors, false);
 
         assert!(hidden.contains("mallory-1"));
+    }
+
+    #[test]
+    fn case_insensitive_author_match() {
+        // A config entry differing only in case from the PR author's login must still match:
+        // GitHub logins are case-insensitive, so `mallory` in the filter matches a `Mallory` login
+        // and the branch is not hidden.
+        let tree = branch("main", vec![branch("mallory-1", vec![])]);
+        let mut pr_authors = HashMap::new();
+        pr_authors.insert("mallory-1".to_string(), "Mallory".to_string());
+        let authors_filter = vec!["mallory".to_string()];
+
+        let hidden = compute_hidden_branches(&tree, "main", &authors_filter, &pr_authors, false);
+
+        assert!(!hidden.contains("mallory-1"));
     }
 
     #[test]
     fn descendant_missing_from_scoped_fetch_stays_visible() {
         // The scoped/offline case: a descendant branch that the stack-scoped open-PR fetch
         // returned nothing for (and had no cached entry) has no `pr_authors` entry, so it must
-        // never be hidden even with `display_authors` active — "missing data" ⇒ stays visible.
+        // never be hidden even with `authors_filter` active — "missing data" ⇒ stays visible.
         let tree = branch(
             "main",
             vec![branch("alice-1", vec![branch("scoped-miss", vec![])])],
@@ -679,9 +690,9 @@ mod tests {
         let mut pr_authors = HashMap::new();
         pr_authors.insert("alice-1".to_string(), "alice".to_string());
         // `scoped-miss` deliberately has no entry.
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
 
-        let hidden = compute_hidden_branches(&tree, "main", &display_authors, &pr_authors, false);
+        let hidden = compute_hidden_branches(&tree, "main", &authors_filter, &pr_authors, false);
 
         assert!(!hidden.contains("scoped-miss"));
     }

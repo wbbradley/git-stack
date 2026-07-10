@@ -112,7 +112,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
   Removes it from the tree only; does not delete the git branch or any PR.
 - **`git stack cleanup`** — remove branches from the tree that no longer exist
   locally or on the remote, re-mounting their children onto the grandparent. When
-  `display_authors` is set, it *also* prunes branches confidently attributed to an
+  `authors_filter` is set, it *also* prunes branches confidently attributed to an
   author outside that list (the same set `status` hides), prompting for
   confirmation before persisting (and refusing on a non-interactive terminal).
   `-n`/`--dry-run` previews without changing anything; `-a`/`--all` cleans every
@@ -130,7 +130,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 
 Global flags (valid on any subcommand): `-v`/`--verbose`, `--benchmark` (print
 git-command timing stats), `--json` (emit those stats as JSON, implies
-`--benchmark`), `--show-all` (bypasses `display_authors`-based hiding for this
+`--benchmark`), `--show-all` (bypasses `authors_filter`-based hiding for this
 invocation).
 
 ## 4. State file
@@ -232,8 +232,9 @@ PR columns in `status`) need a token. Config lives at
 Graceful degradation: with **no** resolvable token, read-only commands still
 work — `git stack status` renders the tree, just without PR numbers/state.
 
-`display_authors` (list of GitHub logins) in `github.yaml` — when non-empty,
-`status`/`interactive` hide branches whose PR author isn't listed, except the
+`authors_filter` (list of GitHub logins; the old key `display_authors` still works
+as a deprecated alias) in `github.yaml` — when non-empty,
+`status`/`interactive` hide branches whose PR author isn't listed (case-insensitively), except the
 current branch and its ancestor chain to trunk, and any branch whose author
 can't be determined at all. A hidden branch's visible descendants reparent to
 the nearest visible ancestor for display purposes only. `--show-all` disables

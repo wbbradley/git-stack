@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as an
+  alias and is migrated to `authors_filter` on the next auth write. Author matching against the
+  filter is now case-insensitive.
+
 ## [0.3.1] - 2026-07-09
 
 ### Changed

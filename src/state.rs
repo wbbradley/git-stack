@@ -437,7 +437,7 @@ impl State {
         dry_run: bool,
         all: bool,
         current_branch: &str,
-        display_authors: &[String],
+        authors_filter: &[String],
         pr_authors: &HashMap<String, String>,
     ) -> Result<()> {
         if all {
@@ -450,7 +450,7 @@ impl State {
                 repo,
                 dry_run,
                 current_branch,
-                display_authors,
+                authors_filter,
                 pr_authors,
             )
         }
@@ -509,7 +509,7 @@ impl State {
         repo: &str,
         dry_run: bool,
         current_branch: &str,
-        display_authors: &[String],
+        authors_filter: &[String],
         pr_authors: &HashMap<String, String>,
     ) -> Result<()> {
         let Some(repo_state) = self.repos.get_mut(repo) else {
@@ -527,15 +527,15 @@ impl State {
             &mut remounted_branches,
         );
 
-        // Phase 2: prune branches confidently attributed to an author outside `display_authors` —
+        // Phase 2: prune branches confidently attributed to an author outside `authors_filter` —
         // exactly the set the render hides via `compute_hidden_branches`, so cleanup and render
         // stay consistent. Protected branches (current branch, its ancestors, trunk) and branches
-        // with no author data are never selected. Empty when `display_authors` is unset, so this
+        // with no author data are never selected. Empty when `authors_filter` is unset, so this
         // is a no-op for users who don't filter by author.
         let to_prune = crate::render::tree_data::compute_hidden_branches(
             &repo_state.tree,
             current_branch,
-            display_authors,
+            authors_filter,
             pr_authors,
             false,
         );
@@ -558,7 +558,7 @@ impl State {
         }
         if !pruned_branches.is_empty() {
             println!();
-            println!("Pruned (out of scope — author not in display_authors):");
+            println!("Pruned (out of scope — author not in authors_filter):");
             for branch_name in &pruned_branches {
                 println!("  - {}", branch_name.red());
             }
@@ -945,7 +945,7 @@ impl State {
 
     /// Branches to eagerly LKG-refresh: the current branch's ancestor chain to trunk (always),
     /// plus every branch NOT confidently attributable (via the closed-PR cache) to an author
-    /// outside `display_authors`. Branches with no closed-PR entry stay in the set.
+    /// outside `authors_filter`. Branches with no closed-PR entry stay in the set.
     ///
     /// Pure (no git/network) so it can be unit-tested: it walks the in-memory tree and consults
     /// only the caller-supplied `closed_pr_authors` map.
@@ -953,7 +953,7 @@ impl State {
         &self,
         repo: &str,
         current_branch: &str,
-        display_authors: &[String],
+        authors_filter: &[String],
         closed_pr_authors: &HashMap<String, String>,
     ) -> HashSet<String> {
         let mut scope: HashSet<String> = HashSet::default();
@@ -965,10 +965,10 @@ impl State {
         collect_all_branches(tree, &mut all_branches);
         for branch in all_branches {
             // Only exclude a branch when the closed-PR cache confidently attributes it to an
-            // author outside `display_authors`. Missing data ⇒ keep (never guess "not mine").
+            // author outside `authors_filter`. Missing data ⇒ keep (never guess "not mine").
             let foreign = closed_pr_authors
                 .get(&branch)
-                .is_some_and(|login| !display_authors.iter().any(|a| a == login));
+                .is_some_and(|login| !crate::github::author_in_filter(authors_filter, login));
             if !foreign {
                 scope.insert(branch);
             }
@@ -1778,13 +1778,13 @@ mod tests {
     fn eager_lkg_scope_excludes_foreign_closed_pr_authors() {
         let repo = "repo";
         let state = author_scope_state(repo);
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
         let closed_pr_authors: HashMap<String, String> =
             [("theirs".to_string(), "bob".to_string())]
                 .into_iter()
                 .collect();
 
-        let scope = state.eager_lkg_scope(repo, "mine", &display_authors, &closed_pr_authors);
+        let scope = state.eager_lkg_scope(repo, "mine", &authors_filter, &closed_pr_authors);
         assert!(scope.contains("main"));
         assert!(scope.contains("mine"));
         assert!(scope.contains("mychild")); // no cache entry ⇒ kept
@@ -1814,11 +1814,11 @@ mod tests {
     #[test]
     fn cleanup_prune_set_excludes_protected() {
         // Current branch is `mychild`, so its ancestor `theirs` is protected even though it's
-        // authored by `bob` (outside display_authors) — the prune set must be empty.
+        // authored by `bob` (outside authors_filter) — the prune set must be empty.
         let repo = "repo";
         let state = author_scope_state(repo);
         let tree = state.get_tree(repo).unwrap();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
         let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
             .into_iter()
             .collect();
@@ -1826,7 +1826,7 @@ mod tests {
         let to_prune = crate::render::tree_data::compute_hidden_branches(
             tree,
             "mychild",
-            &display_authors,
+            &authors_filter,
             &pr_authors,
             false,
         );
@@ -1840,7 +1840,7 @@ mod tests {
         let repo = "repo";
         let state = author_scope_state(repo);
         let tree = state.get_tree(repo).unwrap();
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
         let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
             .into_iter()
             .collect();
@@ -1848,7 +1848,7 @@ mod tests {
         let to_prune = crate::render::tree_data::compute_hidden_branches(
             tree,
             "mine",
-            &display_authors,
+            &authors_filter,
             &pr_authors,
             false,
         );
@@ -1859,12 +1859,12 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_prune_empty_display_authors() {
+    fn cleanup_prune_empty_authors_filter() {
         // No author filter configured ⇒ nothing is ever pruned (no behavior change from before).
         let repo = "repo";
         let state = author_scope_state(repo);
         let tree = state.get_tree(repo).unwrap();
-        let display_authors: Vec<String> = Vec::new();
+        let authors_filter: Vec<String> = Vec::new();
         let pr_authors: HashMap<String, String> = [("theirs".to_string(), "bob".to_string())]
             .into_iter()
             .collect();
@@ -1872,7 +1872,7 @@ mod tests {
         let to_prune = crate::render::tree_data::compute_hidden_branches(
             tree,
             "mine",
-            &display_authors,
+            &authors_filter,
             &pr_authors,
             false,
         );
@@ -1883,14 +1883,14 @@ mod tests {
     fn eager_lkg_scope_protects_ancestor_chain() {
         let repo = "repo";
         let state = author_scope_state(repo);
-        let display_authors = vec!["alice".to_string()];
+        let authors_filter = vec!["alice".to_string()];
         let closed_pr_authors: HashMap<String, String> =
             [("theirs".to_string(), "bob".to_string())]
                 .into_iter()
                 .collect();
 
         // Current branch is `mychild`, so `theirs` is on the ancestor chain — always wins.
-        let scope = state.eager_lkg_scope(repo, "mychild", &display_authors, &closed_pr_authors);
+        let scope = state.eager_lkg_scope(repo, "mychild", &authors_filter, &closed_pr_authors);
         assert!(scope.contains("theirs"));
     }
 

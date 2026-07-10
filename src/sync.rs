@@ -56,7 +56,7 @@ pub struct RemoteState {
     pub prs: HashMap<String, RemotePr>,
     /// Map of head branch name -> PR info (closed/merged PRs)
     pub closed_prs: HashMap<String, RemotePr>,
-    /// Map of head branch name -> open PR author login (for `display_authors` gating)
+    /// Map of head branch name -> open PR author login (for `authors_filter` gating)
     pub authors: HashMap<String, String>,
 }
 
@@ -222,9 +222,9 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
     let local_state = read_local_state(git_repo, state, repo)?;
 
     // Scope the open-PR fetch + target injection to the user's stack (local tree, plus a
-    // reconstructed base chain on a fresh clone). Gate remote-only injection by display_authors.
+    // reconstructed base chain on a fresh clone). Gate remote-only injection by authors_filter.
     let current_branch = git_repo.current_branch().unwrap_or_default();
-    let display_authors = client.config().display_authors.clone();
+    let authors_filter = client.config().authors_filter.clone();
     let scope_vec = compute_scope_branches(
         &client,
         &repo_id,
@@ -294,7 +294,7 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
         &local_state,
         &remote_state,
         &scope,
-        &display_authors,
+        &authors_filter,
     );
 
     // Stage 3: Compute diffs
@@ -651,17 +651,17 @@ fn compute_scope_branches(
 // ============== Stage 2: Model Functions ==============
 
 /// Remote-only PR branches eligible to be pulled into the tree, after stack-scoping and
-/// `display_authors` gating. Returns (branch, pr_base, pr_number). Pure and testable — no
+/// `authors_filter` gating. Returns (branch, pr_base, pr_number). Pure and testable — no
 /// `git_repo`. Rules for each remote open PR branch not already in `local.branches`:
 /// - skip if not in `scope` (stack-scoping; defensive even though the fetch is scoped);
-/// - skip if `display_authors` is non-empty and the branch's author is missing or not listed
+/// - skip if `authors_filter` is non-empty and the branch's author is missing or not listed
 ///   ("can't tell / not mine ⇒ don't track");
 /// - otherwise include with the PR's base / number.
 fn remote_only_branches_to_inject(
     local: &LocalState,
     remote: &RemoteState,
     scope: &HashSet<String>,
-    display_authors: &[String],
+    authors_filter: &[String],
 ) -> Vec<(String, String, u64)> {
     let mut result: Vec<(String, String, u64)> = Vec::new();
 
@@ -672,11 +672,11 @@ fn remote_only_branches_to_inject(
         if !scope.contains(branch) {
             continue;
         }
-        if !display_authors.is_empty() {
+        if !authors_filter.is_empty() {
             let author_listed = remote
                 .authors
                 .get(branch)
-                .is_some_and(|author| display_authors.contains(author));
+                .is_some_and(|author| crate::github::author_in_filter(authors_filter, author));
             if !author_listed {
                 continue;
             }
@@ -695,7 +695,7 @@ fn build_target_state(
     local: &LocalState,
     remote: &RemoteState,
     scope: &HashSet<String>,
-    display_authors: &[String],
+    authors_filter: &[String],
 ) -> TargetState {
     let mut branches = HashMap::new();
 
@@ -745,7 +745,7 @@ fn build_target_state(
     // Because tracked branches are always in `local.branches`, this only ever injects
     // reconstructed-chain branches — never an arbitrary `main`-based PR.
     for (branch_name, pr_base, pr_number) in
-        remote_only_branches_to_inject(local, remote, scope, display_authors)
+        remote_only_branches_to_inject(local, remote, scope, authors_filter)
     {
         let remote_ref = format!("{}/{}", DEFAULT_REMOTE, branch_name);
         let pushed_to_remote = git_repo.ref_exists(&remote_ref);
@@ -1713,12 +1713,12 @@ mod tests {
     }
 
     #[test]
-    fn inject_gated_by_display_authors() {
+    fn inject_gated_by_authors_filter() {
         let local = local_state("main", &[("main", None)]);
         let remote = remote_state(&[("feature", "main", 7, "bob")]);
         let scope = scope_of(&["main", "feature"]);
 
-        // Author "bob" is not in display_authors ⇒ not injected.
+        // Author "bob" is not in authors_filter ⇒ not injected.
         let injected = remote_only_branches_to_inject(&local, &remote, &scope, &["alice".into()]);
         assert!(injected.is_empty());
 
@@ -1729,8 +1729,15 @@ mod tests {
             vec![("feature".to_string(), "main".to_string(), 7)]
         );
 
-        // Empty display_authors ⇒ injected regardless of author.
+        // Empty authors_filter ⇒ injected regardless of author.
         let injected = remote_only_branches_to_inject(&local, &remote, &scope, &[]);
+        assert_eq!(
+            injected,
+            vec![("feature".to_string(), "main".to_string(), 7)]
+        );
+
+        // Matching is case-insensitive: `BOB` in the filter matches the `bob` author.
+        let injected = remote_only_branches_to_inject(&local, &remote, &scope, &["BOB".into()]);
         assert_eq!(
             injected,
             vec![("feature".to_string(), "main".to_string(), 7)]
@@ -1738,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn inject_skips_branch_with_missing_author_when_display_authors_active() {
+    fn inject_skips_branch_with_missing_author_when_authors_filter_active() {
         let local = local_state("main", &[("main", None)]);
         // Remote PR present but no author entry recorded ⇒ "can't tell" ⇒ not injected.
         let mut remote = remote_state(&[("feature", "main", 7, "bob")]);

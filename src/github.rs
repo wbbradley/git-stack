@@ -26,8 +26,7 @@ pub struct GitHubConfig {
     /// When non-empty, branches whose PR author isn't listed are hidden from
     /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
     /// branches with no PR yet. `--show-all` bypasses this for one invocation.
-    /// No longer used for filtering during sync.
-    pub display_authors: Vec<String>,
+    pub authors_filter: Vec<String>,
 }
 
 /// Repository identification (owner/repo extracted from remote URL)
@@ -302,7 +301,7 @@ impl GitHubClient {
 
     /// Load config from environment/git config/config file
     pub fn from_env(repo_id: &RepoIdentifier) -> Result<Self, GitHubError> {
-        let (token, display_authors) = find_github_config(&repo_id.host)?;
+        let (token, authors_filter) = find_github_config(&repo_id.host)?;
         let api_base = if repo_id.host == "github.com" {
             "https://api.github.com".to_string()
         } else {
@@ -311,7 +310,7 @@ impl GitHubClient {
         Ok(Self::new(GitHubConfig {
             token,
             api_base,
-            display_authors,
+            authors_filter,
         }))
     }
 
@@ -921,12 +920,20 @@ fn load_github_config_file() -> Option<GitHubConfigFile> {
     serde_yaml::from_str(&contents).ok()
 }
 
-/// Load display_authors from the GitHub config file.
-/// Returns an empty vec if the config file doesn't exist or has no display_authors.
-pub fn load_display_authors() -> Vec<String> {
+/// Load authors_filter from the GitHub config file.
+/// Returns an empty vec if the config file doesn't exist or has no authors_filter.
+pub fn load_authors_filter() -> Vec<String> {
     load_github_config_file()
-        .map(|c| c.display_authors)
+        .map(|c| c.authors_filter)
         .unwrap_or_default()
+}
+
+/// Case-insensitive membership test for the author filter. GitHub logins are
+/// case-insensitive, so a config entry `WBBradley` matches a `wbbradley` login.
+pub(crate) fn author_in_filter(authors_filter: &[String], author: &str) -> bool {
+    authors_filter
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(author))
 }
 
 /// Where the active GitHub token was resolved from. PATs win over OAuth.
@@ -1060,9 +1067,9 @@ pub fn find_auth_source(host: &str) -> Option<AuthSource> {
 
 /// Find GitHub token and config from various sources
 fn find_github_config(host: &str) -> Result<(String, Vec<String>), GitHubError> {
-    let display_authors = load_display_authors();
+    let authors_filter = load_authors_filter();
     match resolve_github_auth(host) {
-        Some((token, _)) => Ok((token, display_authors)),
+        Some((token, _)) => Ok((token, authors_filter)),
         None => Err(GitHubError::NoToken),
     }
 }
@@ -1076,8 +1083,8 @@ struct GitHubConfigFile {
     /// When non-empty, branches whose PR author isn't listed are hidden from
     /// `status`/`interactive`, except the current branch, its ancestor chain to trunk, and
     /// branches with no PR yet. `--show-all` bypasses this for one invocation.
-    #[serde(default)]
-    display_authors: Vec<String>,
+    #[serde(default, alias = "display_authors")]
+    authors_filter: Vec<String>,
     /// OAuth device-flow token (distinct from `default_token`, which holds a PAT).
     #[serde(skip_serializing_if = "Option::is_none")]
     oauth_token: Option<String>,
@@ -1101,7 +1108,7 @@ pub fn save_github_token(token: &str) -> Result<()> {
         .place_config_file("github.yaml")
         .context("Failed to create config directory")?;
 
-    // Load existing config to preserve other settings (like display_authors)
+    // Load existing config to preserve other settings (like authors_filter)
     let mut config = load_github_config_file().unwrap_or_default();
     config.default_token = Some(token.to_string());
 
@@ -1121,7 +1128,7 @@ pub fn save_github_oauth_token(token: &str, scope: &str) -> Result<()> {
         .place_config_file("github.yaml")
         .context("Failed to create config directory")?;
 
-    // Load existing config to preserve other settings (PAT, display_authors).
+    // Load existing config to preserve other settings (PAT, authors_filter).
     let mut config = load_github_config_file().unwrap_or_default();
     config.oauth_token = Some(token.to_string());
     config.oauth_scope = Some(scope.to_string());
@@ -1136,7 +1143,7 @@ pub fn save_github_oauth_token(token: &str, scope: &str) -> Result<()> {
 /// Clear stored tokens from the config file.
 ///
 /// Clears OAuth and/or PAT (`default_token`) per the flags; when neither flag
-/// is set, both are cleared. `display_authors` and other settings are preserved.
+/// is set, both are cleared. `authors_filter` and other settings are preserved.
 pub fn clear_github_tokens(oauth: bool, pat: bool) -> Result<()> {
     let config_path = get_github_config_path()?;
     let Some(mut config) = load_github_config_file() else {
@@ -1435,6 +1442,29 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
+
+    #[test]
+    fn authors_filter_alias_deserializes() {
+        let config: GitHubConfigFile = serde_yaml::from_str("display_authors:\n- x\n").unwrap();
+        assert_eq!(config.authors_filter, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn authors_filter_serializes_with_new_key() {
+        let config = GitHubConfigFile {
+            authors_filter: vec!["x".to_string()],
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("authors_filter"));
+        assert!(!yaml.contains("display_authors"));
+    }
+
+    #[test]
+    fn author_in_filter_is_case_insensitive() {
+        assert!(author_in_filter(&["WBBradley".to_string()], "wbbradley"));
+        assert!(!author_in_filter(&["alice".to_string()], "bob"));
+    }
 
     #[test]
     fn gh_fallback_reached_when_all_empty() {

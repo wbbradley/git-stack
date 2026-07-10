@@ -49,7 +49,7 @@ struct Args {
     #[arg(
         long,
         global = true,
-        help = "Show all branches, bypassing display_authors-based hiding"
+        help = "Show all branches, bypassing authors_filter-based hiding"
     )]
     show_all: bool,
 
@@ -453,12 +453,12 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
-            let display_authors = github::load_display_authors();
+            let authors_filter = github::load_authors_filter();
             // Author-based pruning only runs for a single repo with an active author filter. The
             // `--all` sweep has no per-repo current-branch/author context, and an empty filter
             // means "no filtering" — cleanup then behaves exactly as before (missing-only).
             let pr_authors = if !all
-                && !display_authors.is_empty()
+                && !authors_filter.is_empty()
                 && let Some(tree) = state.get_tree(&repo).cloned()
             {
                 let (authors, _, _) = resolve_pr_authors(&git_repo, &tree, &current_branch, false);
@@ -472,7 +472,7 @@ fn inner_main() -> Result<()> {
                 dry_run,
                 all,
                 &current_branch,
-                &display_authors,
+                &authors_filter,
                 &pr_authors,
             )
         }
@@ -581,7 +581,7 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open-PR fetch feeding the render's PR badges + `display_authors` hiding (never deletion).
+/// Open-PR fetch feeding the render's PR badges + `authors_filter` hiding (never deletion).
 ///
 /// Behavior is deterministic per command — no TTL, no staleness clock:
 /// - default (`force_full == false`): a **stack-scoped** parallel fetch (`find_pr_for_branch`
@@ -596,7 +596,7 @@ fn show_log(state: State, repo: &str, branch: &str) -> Result<()> {
 /// fetch (so the caller can print a "showing cached data" disclaimer). Carries `all_authors`
 /// (branch -> author, incl. fork PRs filtered out of `.prs`) so `add_closed_pr_authors` needs no
 /// second open-PR fetch.
-/// Assemble the offline-first branch→author map used for `display_authors` filtering, alongside
+/// Assemble the offline-first branch→author map used for `authors_filter` filtering, alongside
 /// the open-PR badge cache and whether any displayed data came from the offline cache fallback.
 /// Runs the same `fetch_pr_cache` → `add_closed_pr_authors` → `add_commit_authors` pipeline for
 /// both callers: `build_renderable_tree` (which also consumes the badge cache) and the `cleanup`
@@ -737,15 +737,15 @@ fn collect_all_branch_names(tree: &Branch) -> Vec<String> {
 }
 
 /// Extend an open-PR author lookup (from `fetch_pr_cache`'s `all_authors`) with authors of
-/// closed/merged PRs, for display_authors-based hiding. Open-only author data can't tell
+/// closed/merged PRs, for authors_filter-based hiding. Open-only author data can't tell
 /// whether a branch with no open PR was never turned into one (must stay visible) from one
 /// whose PR was merged or closed by someone else (should be hidden) — this fills that gap.
 /// Closed PRs are fetched through the same on-disk watermark cache `git stack sync` uses, so
-/// only the very first call after enabling `display_authors` pays the full historical fetch
+/// only the very first call after enabling `authors_filter` pays the full historical fetch
 /// cost; subsequent calls only page until the watermark. Returns `authors` unchanged on any
 /// error (graceful degradation — hides nothing beyond what the input already allows).
-/// Eager LKG refresh, scoped by display_authors + the local closed-PR cache when configured.
-/// Falls back to a full refresh when display_authors is unset (common case) — no cache read,
+/// Eager LKG refresh, scoped by authors_filter + the local closed-PR cache when configured.
+/// Falls back to a full refresh when authors_filter is unset (common case) — no cache read,
 /// no behavior change. Never makes a network call.
 fn eager_refresh_lkgs(
     git_repo: &GitRepo,
@@ -753,12 +753,12 @@ fn eager_refresh_lkgs(
     repo: &str,
     current_branch: &str,
 ) -> Result<()> {
-    let display_authors = github::load_display_authors();
-    if display_authors.is_empty() {
+    let authors_filter = github::load_authors_filter();
+    if authors_filter.is_empty() {
         return state.refresh_lkgs(git_repo, repo);
     }
     let closed_pr_authors = load_closed_pr_authors(git_repo).unwrap_or_default();
-    let scope = state.eager_lkg_scope(repo, current_branch, &display_authors, &closed_pr_authors);
+    let scope = state.eager_lkg_scope(repo, current_branch, &authors_filter, &closed_pr_authors);
     state.refresh_lkgs_scoped(git_repo, repo, &scope)
 }
 
@@ -945,7 +945,7 @@ fn collect_branches_without_author(
 
 /// Builds the renderable tree shared by `status()`/`interactive()`: fetches PR data from GitHub
 /// and computes local git status/diff/sort, overlapping the two when hiding/dimming don't
-/// require the fetch to finish first (i.e. whenever display_authors filtering isn't active).
+/// require the fetch to finish first (i.e. whenever authors_filter filtering isn't active).
 ///
 /// The default fetch is stack-scoped (see `fetch_pr_cache`); `force_full` (from `gs --fetch`)
 /// switches it to the authoritative whole-repo fetch. Returns the tree plus `served_from_cache`:
@@ -958,10 +958,10 @@ fn build_renderable_tree(
     orig_branch: &str,
     verbose: bool,
     show_all: bool,
-    display_authors: &[String],
+    authors_filter: &[String],
     force_full: bool,
 ) -> (render::RenderableTree, bool) {
-    let hiding_active = !show_all && !display_authors.is_empty();
+    let hiding_active = !show_all && !authors_filter.is_empty();
     let branch_names = collect_all_branch_names(tree);
 
     let (mut renderable, pr_cache, served_from_cache) = if hiding_active {
@@ -975,7 +975,7 @@ fn build_renderable_tree(
             tree,
             orig_branch,
             verbose,
-            display_authors,
+            authors_filter,
             &pr_authors,
             show_all,
         );
@@ -1002,7 +1002,7 @@ fn build_renderable_tree(
                 tree,
                 orig_branch,
                 verbose,
-                display_authors,
+                authors_filter,
                 &pr_authors,
                 show_all,
             );
@@ -1039,8 +1039,8 @@ fn status(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Load display_authors for filtering (hides branches whose PR author isn't listed)
-    let display_authors = github::load_display_authors();
+    // Load authors_filter for filtering (hides branches whose PR author isn't listed)
+    let authors_filter = github::load_authors_filter();
 
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
@@ -1054,7 +1054,7 @@ fn status(
         orig_branch,
         verbose,
         show_all,
-        &display_authors,
+        &authors_filter,
         fetch,
     );
 
@@ -1096,8 +1096,8 @@ fn interactive(
     // Auto-cleanup any missing branches before displaying the tree
     state.auto_cleanup_missing_branches(git_repo, repo)?;
 
-    // Load display_authors for filtering (hides branches whose PR author isn't listed)
-    let display_authors = github::load_display_authors();
+    // Load authors_filter for filtering (hides branches whose PR author isn't listed)
+    let authors_filter = github::load_authors_filter();
 
     let Some(tree) = state.get_tree(repo) else {
         println!("No stack configured for this repository.");
@@ -1111,7 +1111,7 @@ fn interactive(
         orig_branch,
         verbose,
         show_all,
-        &display_authors,
+        &authors_filter,
         false,
     );
 
