@@ -1272,6 +1272,15 @@ fn get_github_config_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("Failed to determine config file path"))
 }
 
+/// Path to the GitHub config file, creating its parent directory if needed so an editor can
+/// save a not-yet-existing file.
+pub fn ensure_github_config_path() -> Result<PathBuf> {
+    let base_dirs = xdg::BaseDirectories::with_prefix("git-stack");
+    base_dirs
+        .place_config_file("github.yaml")
+        .context("Failed to determine config file path")
+}
+
 /// Save GitHub token to config file
 pub fn save_github_token(token: &str) -> Result<()> {
     let base_dirs = xdg::BaseDirectories::with_prefix("git-stack");

@@ -66,7 +66,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 | `git stack interactive` | Launch the interactive TUI for navigating/checking out branches. |
 | `git stack up` | Check out the parent branch (move up the stack). |
 | `git stack down` | Check out the child branch (only when there is exactly one child). |
-| `git stack edit` | Open the state file in `$EDITOR` for manual editing. |
+| `git stack edit` | Open the state file (or github.yaml with --config) in $EDITOR for manual editing. |
 | `git stack restack` | Rebase the current (or `-b`) branch onto its parent. |
 | `git stack log` | Show the commit log between a branch and its parent. |
 | `git stack note` | Show or edit the free-form note attached to a branch. |
@@ -91,7 +91,7 @@ itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
 - **`git stack up`** — no flags. Checks out the parent of the current branch.
 - **`git stack down`** — no flags. Checks out the sole child; errors if a branch
   has zero or multiple children (ambiguous).
-- **`git stack edit`** — no flags. Opens `state.yaml` in `$EDITOR`.
+- **`git stack edit`** — `--config` opens `~/.config/git-stack/github.yaml`; otherwise opens `state.yaml`.
 - **`git stack restack`** — see §5 for semantics.
   - `-b`/`--branch <name>` — restack this branch instead of the current one.
   - `-f`/`--fetch` — fetch from the remote first.

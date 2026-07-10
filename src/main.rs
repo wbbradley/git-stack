@@ -73,8 +73,13 @@ enum Command {
     Up,
     /// Move down the stack to a child branch (only if there's exactly one child).
     Down,
-    /// Open the git-stack state file in an editor for manual editing.
-    Edit,
+    /// Open the git-stack state file in an editor for manual editing. With `--config`, open the
+    /// GitHub config file (github.yaml) instead.
+    Edit {
+        /// Open the GitHub config file (github.yaml) instead of the state file.
+        #[arg(long, default_value_t = false)]
+        config: bool,
+    },
     /// Restack your active branch onto its parent branch.
     Restack {
         /// The name of the branch to restack.
@@ -356,7 +361,13 @@ fn inner_main() -> Result<()> {
             current_upstream,
             branch_name,
         ),
-        Some(Command::Edit) => state.edit_config(),
+        Some(Command::Edit { config }) => {
+            if config {
+                state.edit_github_config()
+            } else {
+                state.edit_state()
+            }
+        }
         Some(Command::Restack {
             branch,
             fetch,
@@ -2511,6 +2522,25 @@ mod tests {
             lkg_parent: None,
             pr_number: None,
             branches,
+        }
+    }
+
+    #[test]
+    fn edit_parses_without_config_flag() {
+        let args = Args::try_parse_from(["git-stack", "edit"]).expect("edit should parse");
+        match args.command {
+            Some(Command::Edit { config }) => assert!(!config),
+            _ => panic!("expected Command::Edit"),
+        }
+    }
+
+    #[test]
+    fn edit_parses_with_config_flag() {
+        let args =
+            Args::try_parse_from(["git-stack", "edit", "--config"]).expect("edit --config parses");
+        match args.command {
+            Some(Command::Edit { config }) => assert!(config),
+            _ => panic!("expected Command::Edit"),
         }
     }
 

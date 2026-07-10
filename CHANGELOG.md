@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `git stack edit --config` opens the GitHub config file (`~/.config/git-stack/github.yaml`) in
+  `$EDITOR`; `git stack edit` still opens the state file.
+
 ### Changed
 - Renamed the `display_authors` config key to `authors_filter`. The old name keeps working as an
   alias and is migrated to `authors_filter` on the next auth write. Author matching against the

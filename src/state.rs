@@ -1015,18 +1015,13 @@ impl State {
         let Some(branch) = self.get_tree_branch_mut(repo, branch) else {
             bail!("Branch {branch} not found in the git-stack tree.");
         };
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         // Create a temporary file.
         let temp_file = tempfile::NamedTempFile::new()?;
 
         fs::write(temp_file.path(), branch.note.as_deref().unwrap_or(""))?;
 
         // Invoke the user's editor.
-        if !Command::new(editor)
-            .arg(temp_file.path().to_str().unwrap())
-            .status()?
-            .success()
-        {
+        if !launch_editor(temp_file.path())?.success() {
             eprintln!("Changes discarded.");
         }
         let text = fs::read(temp_file.path())?;
@@ -1053,14 +1048,14 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn edit_config(&self) -> Result<()> {
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    pub(crate) fn edit_state(&self) -> Result<()> {
+        // TODO: edit only the state for the current repo.
+        let _ = launch_editor(&get_xdg_path()?)?;
+        Ok(())
+    }
 
-        // TODO: edit only the config for the current repo.
-        // Invoke the user's editor.
-        let _ = Command::new(editor)
-            .arg(get_xdg_path()?.to_str().unwrap())
-            .status()?;
+    pub(crate) fn edit_github_config(&self) -> Result<()> {
+        let _ = launch_editor(&crate::github::ensure_github_config_path()?)?;
         Ok(())
     }
 
@@ -1382,6 +1377,12 @@ fn get_xdg_path() -> anyhow::Result<PathBuf> {
     base_dirs
         .get_state_file("state.yaml")
         .ok_or_else(|| anyhow::anyhow!("Failed to find state file"))
+}
+
+/// Launch the user's `$EDITOR` (falling back to `vi`) on `path`.
+fn launch_editor(path: &Path) -> Result<std::process::ExitStatus> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    Ok(Command::new(editor).arg(path).status()?)
 }
 
 #[cfg(test)]
