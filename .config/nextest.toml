@@ -1,0 +1,14 @@
+# nextest configuration.
+#
+# `leak-timeout` is the grace period nextest waits, after a test process exits, to
+# observe EOF on the stdout/stderr pipe it captured. Every git subprocess in this
+# crate is reaped (`child.wait()` / `.output()`) before its test returns, no test
+# spawns background threads, and the test repos disable git's background
+# auto-maintenance (see `disable_auto_maintenance` in git2_ops tests), so nothing
+# actually leaks a handle. The 100ms default is nonetheless too tight for this
+# crate's full parallel run: under load the pipe-close for a just-exited process is
+# occasionally observed a few hundred ms late, producing a false-positive LEAK on
+# whichever fast test lost the race (even trivial ones that spawn nothing). Widen
+# the window so those disappear while still catching a genuinely orphaned handle.
+[profile.default]
+leak-timeout = "2s"

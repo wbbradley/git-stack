@@ -538,11 +538,21 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// Disable git's background auto-maintenance and gc. Without this, `git commit` spawns a
+    /// detached `git maintenance run --auto --detach` that inherits the test process's
+    /// stdout/stderr pipe and keeps running after the test exits — nextest flags the still-open
+    /// pipe as a leaked handle.
+    fn disable_auto_maintenance(dir: &Path) {
+        git(dir, &["config", "maintenance.auto", "false"]);
+        git(dir, &["config", "gc.auto", "0"]);
+    }
+
     /// Init a repo with `main` checked out and a committer identity configured.
     fn init_repo(dir: &Path) {
         git(dir, &["init", "-q", "-b", "main"]);
         git(dir, &["config", "user.email", "test@example.com"]);
         git(dir, &["config", "user.name", "Test"]);
+        disable_auto_maintenance(dir);
     }
 
     /// Write `content` to `file` and commit it with message `msg`.
@@ -681,6 +691,7 @@ mod tests {
         git(dir, &["init", "-q", "-b", "main"]);
         git(dir, &["config", "user.email", "test@example.com"]);
         git(dir, &["config", "user.name", "Test"]);
+        disable_auto_maintenance(dir);
         git(dir, &["commit", "--allow-empty", "-q", "-m", "root"]);
         git(dir, &["checkout", "-q", "-b", "feature"]);
         git(

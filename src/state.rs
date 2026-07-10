@@ -1518,6 +1518,11 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "Test"]);
+        // Disable background auto-maintenance/gc: `git commit` otherwise spawns a detached
+        // `git maintenance run --auto --detach` that inherits the test's stdout/stderr pipe and
+        // outlives the test, which nextest flags as a leaked handle.
+        git(&["config", "maintenance.auto", "false"]);
+        git(&["config", "gc.auto", "0"]);
         git(&["commit", "--allow-empty", "-q", "-m", "root"]);
         git(&["update-ref", "refs/remotes/origin/main", "main"]);
         git(&[
