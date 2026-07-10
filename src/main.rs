@@ -1918,7 +1918,7 @@ fn ensure_branch_pr(
                 branch_name.yellow()
             );
             println!(
-                "  Run `git stack unmount {}` to update your stack tree.",
+                "  Run `git stack delete {}` to update your stack tree.",
                 branch_name
             );
             return Ok(());
