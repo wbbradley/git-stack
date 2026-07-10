@@ -9,6 +9,11 @@ All notable changes to this project are documented in this file.
   alias and is migrated to `authors_filter` on the next auth write. Author matching against the
   filter is now case-insensitive.
 
+### Internal
+- Test suite no longer emits spurious `nextest` LEAK warnings. The temp repos used in tests now
+  disable git's background auto-maintenance (`maintenance.auto`/`gc.auto`), which previously spawned
+  a detached `git maintenance` process that outlived the test and kept its output pipe open.
+
 ## [0.3.1] - 2026-07-09
 
 ### Changed
