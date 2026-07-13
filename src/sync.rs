@@ -22,7 +22,8 @@ use crate::{
     git::{fetch_with_recovery, git_trunk, run_git},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     github::{
-        GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest, get_repo_identifier,
+        CachedPullRequest, GitHubClient, PrState, PullRequest, RepoIdentifier, UpdatePrRequest,
+        get_repo_identifier,
     },
     state::{Branch, State},
 };
@@ -261,6 +262,11 @@ pub fn sync(git_repo: &GitRepo, state: &mut State, repo: &str, options: SyncOpti
         &mut remote_state,
         &mut seen_shas,
     );
+
+    // Persist discovered open PRs so the render path's offline fallback (fetch_pr_cache in main.rs)
+    // can surface them without a live fetch. Best-effort; independent of dry-run, mirroring how the
+    // closed-PR cache is already populated during sync's read phase.
+    persist_discovered_open_prs(&repo_id.full_name(), &discovered_prs);
 
     // Record PR head SHAs as seen (filtering to match GC criteria to avoid re-adding garbage)
     let origin_trunk = format!("{}/{}", DEFAULT_REMOTE, local_state.trunk);
@@ -702,6 +708,47 @@ fn merge_discovered_prs(
             .entry(branch)
             .or_insert_with(|| RemotePr::from(pr));
     }
+}
+
+/// Persist author-discovered open PRs to the on-disk `open_prs_v1` cache (best-effort wrapper).
+/// Opens a fresh `PrCacheHandle` (as every CLI invocation does) and delegates to
+/// `write_discovered_open_prs`. Never fatal: a cache open/write failure costs only the offline
+/// render convenience below, never the sync itself.
+fn persist_discovered_open_prs(repo_key: &str, discovered: &[PullRequest]) {
+    if discovered.is_empty() {
+        return;
+    }
+    let cache = match crate::pr_cache::PrCacheHandle::open() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Skipping open-PR cache write; failed to open PR cache: {e:#}");
+            return;
+        }
+    };
+    if let Err(e) = write_discovered_open_prs(&cache, repo_key, discovered) {
+        tracing::warn!("Failed to persist discovered open PRs to cache: {e:#}");
+    }
+}
+
+/// Upsert `discovered` open PRs into `open_prs_v1` for `repo_key`, keyed by head ref. Additive:
+/// `merge_open_prs(found, &[])` never removes a branch, so it can't clobber an entry the render
+/// path (`fetch_pr_cache` in `main.rs`, the read-side consumer of this table) is maintaining via
+/// its own scoped fetch. Empty head refs are skipped (they'd collide with redb's `(repo, "")`
+/// range sentinel), mirroring `merge_discovered_prs`. Pure over an injected handle so it is
+/// unit-testable against a temp `open_at` DB.
+fn write_discovered_open_prs(
+    cache: &crate::pr_cache::PrCacheHandle,
+    repo_key: &str,
+    discovered: &[PullRequest],
+) -> Result<()> {
+    let cached: Vec<(String, CachedPullRequest)> = discovered
+        .iter()
+        .filter(|pr| !pr.head.ref_name.is_empty())
+        .map(|pr| (pr.head.ref_name.clone(), CachedPullRequest::from(pr)))
+        .collect();
+    let found: Vec<(&str, &CachedPullRequest)> =
+        cached.iter().map(|(b, pr)| (b.as_str(), pr)).collect();
+    cache.merge_open_prs(repo_key, &found, &[])
 }
 
 /// Remote-only PR branches eligible to be pulled into the tree, after stack-scoping and
@@ -1971,5 +2018,78 @@ mod tests {
         let injected =
             remote_only_branches_to_inject(&local, &remote, &scope, &["wbbradley".into()]);
         assert!(injected.is_empty());
+    }
+
+    fn open_test_cache(dir: &tempfile::TempDir) -> crate::pr_cache::PrCacheHandle {
+        crate::pr_cache::PrCacheHandle::open_at(&dir.path().join("pr_cache.redb")).unwrap()
+    }
+
+    #[test]
+    fn write_discovered_open_prs_persists_to_open_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = open_test_cache(&dir);
+
+        let discovered = vec![
+            discovered_pr("mine", "main", 42, "wbbradley"),
+            discovered_pr("other", "mine", 43, "wbbradley"),
+        ];
+        write_discovered_open_prs(&cache, "acme/app", &discovered).unwrap();
+
+        let cached = cache.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached.get("mine").unwrap().number, 42);
+        assert_eq!(cached.get("mine").unwrap().head.sha, "sha-mine");
+        assert_eq!(cached.get("other").unwrap().number, 43);
+        assert_eq!(cached.get("other").unwrap().base.ref_name, "mine");
+    }
+
+    #[test]
+    fn write_discovered_open_prs_is_additive() {
+        // A pre-existing cached open PR (e.g. one the render path's scoped fetch persisted) must
+        // survive a discovery write — the merge upserts, never replaces the repo's whole row set.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = open_test_cache(&dir);
+
+        let existing =
+            CachedPullRequest::from(&discovered_pr("preexisting", "main", 1, "wbbradley"));
+        cache
+            .replace_open_prs("acme/app", &[("preexisting", &existing)])
+            .unwrap();
+
+        write_discovered_open_prs(
+            &cache,
+            "acme/app",
+            &[discovered_pr("mine", "main", 42, "wbbradley")],
+        )
+        .unwrap();
+
+        let cached = cache.open_prs_for_repo("acme/app").unwrap();
+        assert_eq!(cached.len(), 2);
+        assert!(cached.contains_key("preexisting"));
+        assert_eq!(cached.get("mine").unwrap().number, 42);
+    }
+
+    #[test]
+    fn write_discovered_open_prs_skips_empty_head_ref() {
+        // An empty head ref would collide with redb's `(repo, "")` range sentinel, so it must be
+        // dropped rather than written (mirrors merge_discovered_prs's empty-branch skip).
+        let dir = tempfile::tempdir().unwrap();
+        let cache = open_test_cache(&dir);
+
+        let mut pr = discovered_pr("mine", "main", 42, "wbbradley");
+        pr.head.ref_name = String::new();
+        write_discovered_open_prs(&cache, "acme/app", &[pr]).unwrap();
+
+        assert!(cache.open_prs_for_repo("acme/app").unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_discovered_open_prs_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = open_test_cache(&dir);
+
+        write_discovered_open_prs(&cache, "acme/app", &[]).unwrap();
+
+        assert!(cache.open_prs_for_repo("acme/app").unwrap().is_empty());
     }
 }

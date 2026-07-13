@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+- `git stack sync` now persists the open PRs it discovers by author to the on-disk PR cache, so a
+  later offline `git stack`/`status` render (no token, or GitHub unreachable) can still show those
+  PRs' badges and URLs. Best-effort — a cache write failure never affects the sync itself.
+
 ## [0.4.0] - 2026-07-10
 
 ### Breaking Changes
