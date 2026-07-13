@@ -1,14 +1,34 @@
 # nextest configuration.
 #
-# `leak-timeout` is the grace period nextest waits, after a test process exits, to
-# observe EOF on the stdout/stderr pipe it captured. Every git subprocess in this
-# crate is reaped (`child.wait()` / `.output()`) before its test returns, no test
-# spawns background threads, and the test repos disable git's background
+# `leak-timeout` is the grace period nextest waits, after a test *process* exits,
+# to observe EOF on the stdout/stderr pipe it captured. Every git subprocess in
+# this crate is reaped (`child.wait()` / `.output()`) before its test returns, no
+# test spawns background threads, and the test repos disable git's background
 # auto-maintenance (see `disable_auto_maintenance` in git2_ops tests), so nothing
-# actually leaks a handle. The 100ms default is nonetheless too tight for this
-# crate's full parallel run: under load the pipe-close for a just-exited process is
-# occasionally observed a few hundred ms late, producing a false-positive LEAK on
-# whichever fast test lost the race (even trivial ones that spawn nothing). Widen
-# the window so those disappear while still catching a genuinely orphaned handle.
+# actually leaks a handle.
+#
+# The intermittent LEAK seen under load was not a real leak: it floated between
+# trivial, pure-in-memory tests (a genuine leak would flag the *same* test every
+# run). Root cause is scheduler starvation of nextest's own async reader threads.
+# nextest defaults `test-threads` to the logical CPU count (18 here), so at full
+# tilt every core runs a test process and nextest's readers have no headroom; the
+# already-closed pipe is then observed late — past the window — on whichever fast
+# test lost the race.
+#
+# Two-part fix:
+#   * `test-threads = 16` leaves ~2 cores free so nextest's reader threads are
+#     scheduled promptly (attacks the cause). Capping our own concurrency cannot
+#     help when the box is oversubscribed by *external* load, hence the second
+#     lever below.
+#   * `leak-timeout = { period = "4s", ... }` widens the grace window as a safety
+#     net against that external starvation. `result = "fail"` keeps a *genuinely*
+#     orphaned handle (a child never reaped) fatal, so leak detection is preserved
+#     — the window is just wide enough that starvation-late observations fall
+#     inside it. The two-tier `{ period, result }` form is supported on the
+#     installed nextest 0.9.138.
+#
+# Rejected alternative: lowering the status level to hide the `leak` status — it
+# would also mask a genuine leak.
 [profile.default]
-leak-timeout = "2s"
+test-threads = 16
+leak-timeout = { period = "4s", result = "fail" }
