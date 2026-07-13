@@ -406,20 +406,44 @@ impl GitRepo {
     /// series is empty (no branch-only work remains). Fixes the stale-base bug where
     /// a cached LKG parent behind the merge-base replayed already-merged commits
     /// (see restack-problem.md).
-    pub fn restack_patch_series(&self, parent: &str, branch: &str) -> Result<Option<String>> {
+    ///
+    /// `lkg_parent` is the branch's recorded last-known-good parent tip (the old parent
+    /// tip the branch was built on), if known. When the parent was **rewritten with new
+    /// content** (e.g. a conflict resolution against trunk changed one of its commits),
+    /// `parent...branch`'s boundary falls back to `merge-base(parent, branch)` — a trunk
+    /// commit — and the branch's now-superseded *old parent* commits (no longer
+    /// patch-equivalent to the rewritten ones, so `--cherry-pick` can't drop them) get
+    /// re-replayed, manufacturing `add/add`/content conflicts. Excluding `^<lkg_parent>`
+    /// drops exactly those old-parent commits while still keeping the `parent...` boundary
+    /// that lets `--right-only` shed commits a `Merge branch 'main'` pulled in (a stale
+    /// `lkg` alone can't). Callers pass this only when `lkg_parent` is an ancestor of
+    /// `branch`, so the exclude is always meaningful.
+    pub fn restack_patch_series(
+        &self,
+        parent: &str,
+        branch: &str,
+        lkg_parent: Option<&str>,
+    ) -> Result<Option<String>> {
         let workdir = self
             .repo
             .workdir()
             .ok_or_else(|| anyhow!("Repository has no working directory"))?;
         let range = format!("{parent}...{branch}");
+        let mut args = vec![
+            "format-patch",
+            "--stdout",
+            "--cherry-pick",
+            "--right-only",
+            &range,
+        ];
+        // Exclude the old parent tip so a rewritten parent's superseded commits aren't
+        // replayed (see doc comment above).
+        let lkg_exclude = lkg_parent.map(|lkg| format!("^{lkg}"));
+        if let Some(lkg_exclude) = lkg_exclude.as_deref() {
+            args.push(lkg_exclude);
+        }
         let out = std::process::Command::new("git")
-            .args([
-                "format-patch",
-                "--stdout",
-                "--cherry-pick",
-                "--right-only",
-                &range,
-            ])
+            .args(&args)
             .current_dir(workdir)
             .output()
             .with_context(|| format!("git format-patch {range}"))?;
@@ -597,7 +621,7 @@ mod tests {
 
         let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
         let patch = git_repo
-            .restack_patch_series("main", "feature")
+            .restack_patch_series("main", "feature", None)
             .unwrap()
             .expect("branch has unique work to replay");
         let subjects = patch_subjects(&patch);
@@ -643,7 +667,7 @@ mod tests {
         // A still points at the old B1; replay A onto the rebased B.
         let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
         let patch = git_repo
-            .restack_patch_series("B", "A")
+            .restack_patch_series("B", "A", None)
             .unwrap()
             .expect("A has unique work to replay");
         let subjects = patch_subjects(&patch);
@@ -678,10 +702,121 @@ mod tests {
         let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
         assert!(
             git_repo
-                .restack_patch_series("main", "feature")
+                .restack_patch_series("main", "feature", None)
                 .unwrap()
                 .is_none(),
             "fully patch-equivalent branch should yield an empty series"
+        );
+    }
+
+    /// The PLAN.md rewritten-parent bug: the parent branch `p01` is rebuilt with **changed
+    /// content** (a conflict resolution rewrote its migration commit). The descendant `env`
+    /// was built on the *old* `p01` tip (its `lkg_parent`). The bare `new_parent...env` range
+    /// re-replays the superseded old-`p01` commit (not patch-equivalent to the rewritten one),
+    /// manufacturing an `add/add` conflict; excluding `^lkg_parent` must drop it so only `env`'s
+    /// own commit replays.
+    #[test]
+    fn restack_patch_series_drops_superseded_rewritten_parent_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // trunk M0; parent p01 adds a migration commit with the OLD content.
+        commit_file(dir.path(), "base.txt", "m0", "M0");
+        git(dir.path(), &["checkout", "-q", "-b", "p01"]);
+        commit_file(
+            dir.path(),
+            "migration.txt",
+            "down_revision=OLD",
+            "P01 migration",
+        );
+        let lkg = git_rev_parse(dir.path(), "p01"); // old parent tip == env's lkg_parent
+
+        // env forks off p01 with its own commit.
+        git(dir.path(), &["checkout", "-q", "-b", "env"]);
+        commit_file(dir.path(), "env.txt", "env-work", "ENV work");
+
+        // trunk advances; p01 is rebuilt onto it with DIFFERENT migration content.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "other.txt", "adv", "M1");
+        git(dir.path(), &["checkout", "-q", "-B", "p01", "main"]);
+        commit_file(
+            dir.path(),
+            "migration.txt",
+            "down_revision=NEW",
+            "P01 migration",
+        );
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+
+        // Without the exclude, the old-p01 migration commit is wrongly re-introduced.
+        let bare = git_repo
+            .restack_patch_series("p01", "env", None)
+            .unwrap()
+            .expect("series is non-empty");
+        assert!(
+            patch_subjects(&bare)
+                .iter()
+                .any(|s| s.contains("migration")),
+            "sanity: bare range should exhibit the bug by including the superseded parent commit"
+        );
+
+        // With `^lkg`, only env's own commit replays.
+        let patch = git_repo
+            .restack_patch_series("p01", "env", Some(&lkg))
+            .unwrap()
+            .expect("env has unique work to replay");
+        let subjects = patch_subjects(&patch);
+        assert_eq!(
+            subjects.len(),
+            1,
+            "only env's own commit should replay, got {subjects:?}"
+        );
+        assert!(
+            subjects[0].contains("ENV work"),
+            "expected ENV work, got {subjects:?}"
+        );
+    }
+
+    /// The `^lkg` exclude must not regress `e6a84ce`: with a **stale** `lkg` that sits behind
+    /// `merge-base(branch, main)`, a branch that merged `main` into itself still relies on the
+    /// `parent...branch` boundary (not `lkg`) to shed the already-upstream commit. Passing the
+    /// stale `lkg` as the exclude must leave `F1`/`F2` and still drop `U2`.
+    #[test]
+    fn restack_patch_series_lkg_exclude_keeps_merged_main_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // main: U1 (stale lkg sits here), then U2.
+        commit_file(dir.path(), "base.txt", "u1", "U1");
+        let stale_lkg = git_rev_parse(dir.path(), "main");
+        commit_file(dir.path(), "u2.txt", "u2", "U2");
+
+        // feature forks at U1, commits F1, merges main (pulling U2 in), then commits F2.
+        git(dir.path(), &["checkout", "-q", "-b", "feature", "main~1"]);
+        commit_file(dir.path(), "f1.txt", "f1", "F1");
+        git(dir.path(), &["merge", "-q", "--no-edit", "main"]);
+        commit_file(dir.path(), "f2.txt", "f2", "F2");
+
+        // main advances to U3.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "u3.txt", "u3", "U3");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        let patch = git_repo
+            .restack_patch_series("main", "feature", Some(&stale_lkg))
+            .unwrap()
+            .expect("branch has unique work to replay");
+        let subjects = patch_subjects(&patch);
+
+        assert!(
+            subjects.iter().any(|s| s.contains("F1")) && subjects.iter().any(|s| s.contains("F2")),
+            "expected F1 and F2 in {subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("U2")),
+            "already-upstream U2 must still be dropped with a stale lkg exclude, got {subjects:?}"
         );
     }
 

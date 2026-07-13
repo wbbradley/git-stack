@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- `git stack restack` no longer re-replays a parent branch's superseded commits when that parent was
+  rewritten with new content (e.g. a conflict resolution against trunk changed one of its commits).
+  The `ApplyMerge` patch series now excludes the recorded last-known-good parent tip
+  (`format-patch … <parent>...<branch> ^<lkg_parent>`), so only the branch's own commits are replayed
+  onto the rebuilt parent instead of colliding with it (`add/add`/content conflicts and the `git am`
+  dead-end). The `parent...branch` boundary is retained, so commits a `Merge branch 'main'` pulled in
+  are still dropped.
+
 ### Changed
 - `git stack sync` now persists the open PRs it discovers by author to the on-disk PR cache, so a
   later offline `git stack`/`status` render (no token, or GitHub unreachable) can still show those

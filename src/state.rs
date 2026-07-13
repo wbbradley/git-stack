@@ -1631,6 +1631,61 @@ mod tests {
         assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
     }
 
+    /// When a parent branch is rewritten with a fresh tip that is no longer an ancestor of a
+    /// descendant, the descendant's recorded `lkg_parent` (the *old* parent tip it was built on)
+    /// must be **preserved** — not silently backfilled to the trunk merge-base. The
+    /// `restack_patch_series` `^lkg` exclude relies on `lkg_parent` still pointing at the old parent
+    /// tip to shed the parent's superseded commits.
+    #[test]
+    fn compute_lkg_updates_preserves_lkg_across_parent_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+
+        // parent `p01` forks off main; capture its old tip (== env's recorded lkg_parent).
+        git_run(dir.path(), &["checkout", "-q", "-b", "p01"]);
+        git_run(dir.path(), &["commit", "--allow-empty", "-q", "-m", "P01"]);
+        let old_p01_tip = git_rev_parse(dir.path(), "p01");
+
+        // `env` forks off the old p01 tip with its own commit.
+        git_run(dir.path(), &["checkout", "-q", "-b", "env"]);
+        git_run(dir.path(), &["commit", "--allow-empty", "-q", "-m", "ENV"]);
+
+        // main advances; p01 is rebuilt onto it, giving p01 a fresh tip NOT in env's history.
+        git_run(dir.path(), &["checkout", "-q", "main"]);
+        git_run(dir.path(), &["commit", "--allow-empty", "-q", "-m", "M1"]);
+        git_run(dir.path(), &["checkout", "-q", "-B", "p01", "main"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "P01 rewritten"],
+        );
+        // merge-base(new p01, env) == the trunk root; this is what a buggy backfill would pick.
+        let trunk_merge_base = git_rev_parse(dir.path(), "main~1");
+        assert_ne!(trunk_merge_base, old_p01_tip);
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+
+        // Tree: main -> p01 -> env, with env's recorded lkg = the OLD p01 tip.
+        let mut main_branch = Branch::new("main".to_string(), None);
+        let mut p01 = Branch::new("p01".to_string(), Some(old_p01_tip.clone()));
+        p01.branches
+            .push(Branch::new("env".to_string(), Some(old_p01_tip.clone())));
+        main_branch.branches.push(p01);
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
+        assert_eq!(
+            updates.get("env"),
+            Some(&Some(old_p01_tip)),
+            "env's lkg must stay pinned to the old parent tip, not backfill to {trunk_merge_base}"
+        );
+    }
+
     #[test]
     fn compute_lkg_updates_leaves_no_entry_when_no_common_ancestor() {
         let dir = tempfile::tempdir().unwrap();

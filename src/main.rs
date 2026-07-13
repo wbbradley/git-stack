@@ -1687,9 +1687,14 @@ fn restack(
                         // Build the patch series exactly as `git rebase`'s `am` backend does
                         // (symmetric-difference range with `--cherry-pick --right-only`), so
                         // commits already upstream — including ones pulled in by a `Merge branch
-                        // 'main'` commit — are dropped rather than replayed. Compute before the
-                        // checkout below moves the branch ref.
-                        let format_patch = git_repo.restack_patch_series(&parent, &branch.name)?;
+                        // 'main'` commit — are dropped rather than replayed. Exclude the old parent
+                        // tip (`lkg_parent`) so a rewritten parent's superseded commits aren't
+                        // re-replayed. Compute before the checkout below moves the branch ref.
+                        let format_patch = git_repo.restack_patch_series(
+                            &parent,
+                            &branch.name,
+                            Some(lkg_parent),
+                        )?;
                         run_git(&["checkout", "-B", &branch.name, &parent])?;
                         let Some(format_patch) = format_patch else {
                             // No branch-only work remains; the `checkout -B` above already moved
