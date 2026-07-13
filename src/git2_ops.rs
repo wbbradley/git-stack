@@ -548,6 +548,32 @@ impl GitRepo {
         Ok(index_tree == head_tree)
     }
 
+    /// True if git has a `git am` (mailbox apply) operation in progress.
+    ///
+    /// Used by `restack --continue`/`--skip` to detect an am the user already finished by hand
+    /// (e.g. `git am --skip` after an empty/superseded patch). When false, there is nothing left
+    /// to advance, so the caller should just resume the remaining plan instead of running — and
+    /// erroring on — `git am --continue`. `ApplyMailboxOrRebase` (git couldn't disambiguate) is
+    /// treated as in-progress so an ambiguous state is never mistaken for finished.
+    pub fn am_in_progress(&self) -> bool {
+        matches!(
+            self.repo.state(),
+            git2::RepositoryState::ApplyMailbox | git2::RepositoryState::ApplyMailboxOrRebase
+        )
+    }
+
+    /// True if git has a `git rebase` operation in progress (any backend). Mirror of
+    /// [`Self::am_in_progress`] for the rebase-fallback restack path.
+    pub fn rebase_in_progress(&self) -> bool {
+        matches!(
+            self.repo.state(),
+            git2::RepositoryState::Rebase
+                | git2::RepositoryState::RebaseInteractive
+                | git2::RepositoryState::RebaseMerge
+                | git2::RepositoryState::ApplyMailboxOrRebase
+        )
+    }
+
     /// Get the URL of a remote.
     /// Equivalent to `git remote get-url <remote>`
     pub fn get_remote_url(&self, remote: &str) -> Result<String> {
@@ -1078,10 +1104,7 @@ mod tests {
         git(dir.path(), &["checkout", "-q", "main"]);
         commit_file(dir.path(), "x.txt", "parent version\n", "add x (parent)");
 
-        let applied = git_ok(
-            dir.path(),
-            &["am", "--3way", patch_path.to_str().unwrap()],
-        );
+        let applied = git_ok(dir.path(), &["am", "--3way", patch_path.to_str().unwrap()]);
         assert!(!applied, "expected the replayed add to conflict");
 
         let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
@@ -1096,5 +1119,86 @@ mod tests {
         assert!(git_repo.staged_matches_head().unwrap());
 
         let _ = git_ok(dir.path(), &["am", "--abort"]);
+    }
+
+    /// `am_in_progress` tracks git's live state: true while a `git am` sits on a conflict, false
+    /// once the user finishes it by hand (`git am --skip` completes the single-patch series). This
+    /// is what lets `restack --continue`/`--skip` resume instead of erroring on an already-done am.
+    #[test]
+    fn am_in_progress_reflects_git_am_state() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        commit_file(dir.path(), "base.txt", "base", "base");
+
+        // feature adds x.txt; capture it as a patch.
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        commit_file(dir.path(), "x.txt", "feature version\n", "add x");
+        let patch_path = dir.path().join("feature.patch");
+        {
+            let out = Command::new("git")
+                .args(["format-patch", "--stdout", "main..feature"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            std::fs::write(&patch_path, out.stdout).unwrap();
+        }
+
+        // main adds x.txt with different content so replaying the patch add/add-conflicts.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "x.txt", "parent version\n", "add x (parent)");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert!(!git_repo.am_in_progress(), "no am before it starts");
+
+        let applied = git_ok(dir.path(), &["am", "--3way", patch_path.to_str().unwrap()]);
+        assert!(!applied, "expected the replayed add to conflict");
+        assert!(
+            git_repo.am_in_progress(),
+            "am should be in progress mid-conflict"
+        );
+
+        // Finish it by hand: skipping the only patch completes the series.
+        git(dir.path(), &["am", "--skip"]);
+        assert!(
+            !git_repo.am_in_progress(),
+            "am should be finished after `git am --skip`"
+        );
+    }
+
+    /// `rebase_in_progress` tracks git's live state: true while a `git rebase` sits on a conflict,
+    /// false after the user aborts (or otherwise finishes) it.
+    #[test]
+    fn rebase_in_progress_reflects_git_rebase_state() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // main: base.txt="base". feature forks and edits it; main then edits it differently, so
+        // rebasing feature onto main conflicts on base.txt.
+        commit_file(dir.path(), "base.txt", "base\n", "base");
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        commit_file(dir.path(), "base.txt", "feature\n", "feature edit");
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "base.txt", "main edit\n", "main edit");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert!(!git_repo.rebase_in_progress(), "no rebase before it starts");
+
+        git(dir.path(), &["checkout", "-q", "feature"]);
+        let rebased = git_ok(dir.path(), &["rebase", "main"]);
+        assert!(!rebased, "expected the rebase to conflict");
+        assert!(
+            git_repo.rebase_in_progress(),
+            "rebase should be in progress mid-conflict"
+        );
+
+        git(dir.path(), &["rebase", "--abort"]);
+        assert!(
+            !git_repo.rebase_in_progress(),
+            "rebase should be finished after `git rebase --abort`"
+        );
     }
 }

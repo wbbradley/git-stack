@@ -1466,28 +1466,41 @@ fn handle_restack_continue(
             complete_squash(git_repo, &mut state, repo, &pending)?;
         }
         RestackMethod::Am => {
-            // If resolving the conflict left the replayed patch empty (its changes are already
-            // present in the new parent — a superseded/duplicated base commit resolved by keeping
-            // the parent's version), `git am --continue` refuses to advance ("No changes - did you
-            // forget to use 'git add'?"). Skip the empty patch instead of wedging the operation.
-            let am_status = if git_repo.staged_matches_head()? {
+            if !git_repo.am_in_progress() {
+                // The user finished the `git am` by hand (e.g. `git am --skip` on an empty patch,
+                // or `git am --continue` after resolving). There is nothing left to advance;
+                // `git am --continue` would just error and re-wedge `pending_restack`. Resume.
                 println!(
-                    "Resolved patch is empty (its changes are already present); \
-                     skipping it with `git am --skip`."
+                    "No `git am` in progress; it looks already finished. Resuming the restack."
                 );
-                run_git_status(&["am", "--skip"], None)?
             } else {
-                run_git_status(&["am", "--continue"], None)?
-            };
-            if !am_status.success() {
-                // A patch series may conflict more than once; keep the pending record and let
-                // the user resolve and run --continue (or --skip) again.
-                print_restack_conflict_help("`git am`", true);
-                std::process::exit(1);
+                // If resolving the conflict left the replayed patch empty (its changes are already
+                // present in the new parent — a superseded/duplicated base commit resolved by
+                // keeping the parent's version), `git am --continue` refuses to advance ("No
+                // changes - did you forget to use 'git add'?"). Skip the empty patch instead of
+                // wedging the operation.
+                let am_status = if git_repo.staged_matches_head()? {
+                    println!(
+                        "Resolved patch is empty (its changes are already present); \
+                         skipping it with `git am --skip`."
+                    );
+                    run_git_status(&["am", "--skip"], None)?
+                } else {
+                    run_git_status(&["am", "--continue"], None)?
+                };
+                if !am_status.success() {
+                    // A patch series may conflict more than once; keep the pending record and let
+                    // the user resolve and run --continue (or --skip) again.
+                    print_restack_conflict_help("`git am`", true);
+                    std::process::exit(1);
+                }
             }
         }
         RestackMethod::Rebase => {
-            if !run_git_status(&["rebase", "--continue"], None)?.success() {
+            if !git_repo.rebase_in_progress() {
+                // The user finished the rebase by hand; resume rather than error on --continue.
+                println!("No rebase in progress; it looks already finished. Resuming the restack.");
+            } else if !run_git_status(&["rebase", "--continue"], None)?.success() {
                 print_restack_conflict_help("Rebase", true);
                 std::process::exit(1);
             }
@@ -1532,7 +1545,12 @@ fn handle_restack_skip(
 
     match pending.method {
         RestackMethod::Am => {
-            if !run_git_status(&["am", "--skip"], None)?.success() {
+            if !git_repo.am_in_progress() {
+                // Already finished by hand (nothing left to skip); resume the plan.
+                println!(
+                    "No `git am` in progress; it looks already finished. Resuming the restack."
+                );
+            } else if !run_git_status(&["am", "--skip"], None)?.success() {
                 // Skipping surfaced the next patch's conflict; keep the pending record and let
                 // the user resolve and run --continue (or --skip) again.
                 print_restack_conflict_help("`git am`", true);
@@ -1540,7 +1558,10 @@ fn handle_restack_skip(
             }
         }
         RestackMethod::Rebase => {
-            if !run_git_status(&["rebase", "--skip"], None)?.success() {
+            if !git_repo.rebase_in_progress() {
+                // Already finished by hand (nothing left to skip); resume the plan.
+                println!("No rebase in progress; it looks already finished. Resuming the restack.");
+            } else if !run_git_status(&["rebase", "--skip"], None)?.success() {
                 print_restack_conflict_help("Rebase", true);
                 std::process::exit(1);
             }
