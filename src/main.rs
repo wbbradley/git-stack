@@ -101,6 +101,10 @@ enum Command {
         /// resume restacking the remaining branches.
         #[arg(long, default_value_t = false)]
         r#continue: bool,
+        /// Skip the conflicting branch's current patch (am/rebase), e.g. when it resolved to an
+        /// empty/already-present patch, then resume restacking the remaining branches.
+        #[arg(long, default_value_t = false)]
+        skip: bool,
         /// Abort an in-progress restack and restore the conflicting branch to its original state.
         #[arg(long, default_value_t = false)]
         abort: bool,
@@ -342,11 +346,13 @@ fn inner_main() -> Result<()> {
             Some(Command::Restack {
                 r#continue: true, ..
             }) => { /* allowed */ }
+            Some(Command::Restack { skip: true, .. }) => { /* allowed */ }
             Some(Command::Restack { abort: true, .. }) => { /* allowed */ }
             _ => {
                 bail!(
                     "A restack operation is in progress for this repository.\n\
                      Run `git stack restack --continue` after resolving conflicts,\n\
+                     `git stack restack --skip` to skip an empty/superseded patch,\n\
                      or `git stack restack --abort` to cancel."
                 );
             }
@@ -375,11 +381,16 @@ fn inner_main() -> Result<()> {
             ancestors,
             squash,
             r#continue,
+            skip,
             abort,
         }) => {
             // Handle --continue first
             if r#continue {
                 return handle_restack_continue(&git_repo, state, &repo, run_version);
+            }
+            // Handle --skip
+            if skip {
+                return handle_restack_skip(&git_repo, state, &repo, run_version);
             }
             // Handle --abort
             if abort {
@@ -1252,11 +1263,19 @@ fn get_concatenated_commit_messages(branch: &str, ancestor: &str) -> Result<Stri
 }
 
 /// Print the conflict guidance pointing at `--continue` / `--abort`. `what` labels the git op,
-/// e.g. "`git am`", "Rebase", "Merge", "Squash merge".
-fn print_restack_conflict_help(what: &str) {
+/// e.g. "`git am`", "Rebase", "Merge", "Squash merge". When `skip_supported` is set (am/rebase),
+/// also advertise `--skip` for the case where the resolved patch turns out empty.
+fn print_restack_conflict_help(what: &str, skip_supported: bool) {
     eprintln!("{what} hit a conflict.");
     eprintln!("Resolve the conflicts (e.g. `git mergetool`), `git add` the resolved files, then:");
     eprintln!("  {}", "git stack restack --continue".green().bold());
+    if skip_supported {
+        eprintln!();
+        eprintln!(
+            "Or, if this patch's changes are already present (empty after resolving), skip it:"
+        );
+        eprintln!("  {}", "git stack restack --skip".cyan().bold());
+    }
     eprintln!();
     eprintln!("Or to abort and restore the original branch:");
     eprintln!("  {}", "git stack restack --abort".yellow().bold());
@@ -1290,7 +1309,9 @@ fn record_restack_conflict(
     if let Err(e) = state.save_state() {
         eprintln!("Warning: failed to persist restack recovery state: {e}");
     }
-    print_restack_conflict_help(what);
+    // `--skip` only makes sense for the patch-replay mechanics (am/rebase).
+    let skip_supported = matches!(method, RestackMethod::Am | RestackMethod::Rebase);
+    print_restack_conflict_help(what, skip_supported);
     std::process::exit(1);
 }
 
@@ -1399,7 +1420,7 @@ fn squash_branch(
 
     if !merge_status.success() {
         // Conflict! The pending record is already persisted above; print guidance and exit.
-        print_restack_conflict_help("Squash merge");
+        print_restack_conflict_help("Squash merge", false);
         std::process::exit(1);
     }
 
@@ -1445,21 +1466,91 @@ fn handle_restack_continue(
             complete_squash(git_repo, &mut state, repo, &pending)?;
         }
         RestackMethod::Am => {
-            if !run_git_status(&["am", "--continue"], None)?.success() {
+            // If resolving the conflict left the replayed patch empty (its changes are already
+            // present in the new parent — a superseded/duplicated base commit resolved by keeping
+            // the parent's version), `git am --continue` refuses to advance ("No changes - did you
+            // forget to use 'git add'?"). Skip the empty patch instead of wedging the operation.
+            let am_status = if git_repo.staged_matches_head()? {
+                println!(
+                    "Resolved patch is empty (its changes are already present); \
+                     skipping it with `git am --skip`."
+                );
+                run_git_status(&["am", "--skip"], None)?
+            } else {
+                run_git_status(&["am", "--continue"], None)?
+            };
+            if !am_status.success() {
                 // A patch series may conflict more than once; keep the pending record and let
-                // the user resolve and run --continue again.
-                print_restack_conflict_help("`git am`");
+                // the user resolve and run --continue (or --skip) again.
+                print_restack_conflict_help("`git am`", true);
                 std::process::exit(1);
             }
         }
         RestackMethod::Rebase => {
             if !run_git_status(&["rebase", "--continue"], None)?.success() {
-                print_restack_conflict_help("Rebase");
+                print_restack_conflict_help("Rebase", true);
                 std::process::exit(1);
             }
         }
         RestackMethod::Merge => {
             run_git(&["commit", "--no-edit"])?;
+        }
+    }
+
+    // Conflicting branch is done — drop the marker, then resume the rest of the plan.
+    state.set_pending_restack(repo, None);
+    state.save_state()?;
+
+    let r = pending.resume;
+    restack(
+        git_repo,
+        state,
+        repo,
+        run_version,
+        Some(r.restack_branch),
+        r.orig_branch,
+        false, // never re-fetch on resume
+        r.push,
+        r.ancestors,
+        r.squash,
+    )
+}
+
+/// Handle the `--skip` flag: drop the conflicting branch's current patch/commit (am/rebase only),
+/// then resume restacking the remaining branches. This is the explicit escape hatch for a
+/// superseded patch that resolved to empty — one `git am --continue` cannot advance past.
+fn handle_restack_skip(
+    git_repo: &GitRepo,
+    mut state: State,
+    repo: &str,
+    run_version: String,
+) -> Result<()> {
+    let pending = state
+        .get_pending_restack(repo)
+        .ok_or_else(|| anyhow!("No pending restack operation to skip."))?
+        .clone();
+
+    match pending.method {
+        RestackMethod::Am => {
+            if !run_git_status(&["am", "--skip"], None)?.success() {
+                // Skipping surfaced the next patch's conflict; keep the pending record and let
+                // the user resolve and run --continue (or --skip) again.
+                print_restack_conflict_help("`git am`", true);
+                std::process::exit(1);
+            }
+        }
+        RestackMethod::Rebase => {
+            if !run_git_status(&["rebase", "--skip"], None)?.success() {
+                print_restack_conflict_help("Rebase", true);
+                std::process::exit(1);
+            }
+        }
+        RestackMethod::Merge | RestackMethod::Squash => {
+            bail!(
+                "`git stack restack --skip` only applies to am/rebase restacks. \
+                 Use `git stack restack --continue` after resolving, or \
+                 `git stack restack --abort` to cancel."
+            );
         }
     }
 
@@ -2546,6 +2637,44 @@ mod tests {
         match args.command {
             Some(Command::Edit { config }) => assert!(config),
             _ => panic!("expected Command::Edit"),
+        }
+    }
+
+    #[test]
+    fn restack_parses_skip_flag() {
+        let args = Args::try_parse_from(["git-stack", "restack", "--skip"])
+            .expect("restack --skip should parse");
+        match args.command {
+            Some(Command::Restack {
+                skip,
+                r#continue,
+                abort,
+                ..
+            }) => {
+                assert!(skip);
+                assert!(!r#continue);
+                assert!(!abort);
+            }
+            _ => panic!("expected Command::Restack"),
+        }
+    }
+
+    #[test]
+    fn restack_defaults_have_skip_false() {
+        let args =
+            Args::try_parse_from(["git-stack", "restack"]).expect("bare restack should parse");
+        match args.command {
+            Some(Command::Restack {
+                skip,
+                r#continue,
+                abort,
+                ..
+            }) => {
+                assert!(!skip);
+                assert!(!r#continue);
+                assert!(!abort);
+            }
+            _ => panic!("expected Command::Restack"),
         }
     }
 

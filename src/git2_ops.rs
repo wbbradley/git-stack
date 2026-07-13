@@ -519,6 +519,35 @@ impl GitRepo {
         Ok((stats.insertions(), stats.deletions()))
     }
 
+    /// True if the staged index is identical to HEAD's tree — i.e. there are no staged changes.
+    ///
+    /// During a conflicted `git am`, once the user resolves the conflict and `git add`s the
+    /// result, this means the replayed patch is **empty**: its changes are already present in the
+    /// new parent (a superseded/duplicated base commit resolved by keeping the parent's version).
+    /// `git am --continue` refuses to advance an empty patch ("No changes - did you forget to use
+    /// 'git add'?"), so the caller must `git am --skip` it instead.
+    ///
+    /// Reloads the on-disk index so an external `git add` is visible. Returns `false` if the index
+    /// still has unresolved conflicts (the caller handles those separately).
+    pub fn staged_matches_head(&self) -> Result<bool> {
+        let _bench = GitBenchmark::start("git2:staged-matches-head");
+        let mut index = self.repo.index().context("Failed to open index")?;
+        // Pick up `git add`s performed by the CLI git process, not just this handle's cache.
+        index.read(true).context("Failed to reload index")?;
+        if index.has_conflicts() {
+            return Ok(false);
+        }
+        let index_tree = index.write_tree().context("Failed to write index tree")?;
+        let head_tree = self
+            .repo
+            .head()
+            .context("Failed to resolve HEAD")?
+            .peel_to_tree()
+            .context("Failed to peel HEAD to tree")?
+            .id();
+        Ok(index_tree == head_tree)
+    }
+
     /// Get the URL of a remote.
     /// Equivalent to `git remote get-url <remote>`
     pub fn get_remote_url(&self, remote: &str) -> Result<String> {
@@ -970,5 +999,102 @@ mod tests {
         // Repo B uses its own cache file, so it must compute the real (`false`) answer.
         let git_repo_b = GitRepo::open_with_cache_at(dir_b.path(), &cache_b).unwrap();
         assert!(!git_repo_b.is_ancestor("feature", "main").unwrap());
+    }
+
+    /// Run a git command, returning whether it succeeded (does not assert). Used for commands
+    /// that are expected to fail, e.g. `git am --3way` hitting a conflict.
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// A clean working tree with no staged changes: the index tree equals HEAD.
+    #[test]
+    fn staged_matches_head_true_when_index_equals_head() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+        commit_file(dir.path(), "a.txt", "1", "a1");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert!(git_repo.staged_matches_head().unwrap());
+    }
+
+    /// A staged content change makes the index differ from HEAD.
+    #[test]
+    fn staged_matches_head_false_with_staged_change() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+        commit_file(dir.path(), "a.txt", "1", "a1");
+
+        std::fs::write(dir.path().join("a.txt"), "2").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        assert!(!git_repo.staged_matches_head().unwrap());
+
+        // Re-staging the committed content restores index == HEAD.
+        std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        assert!(git_repo.staged_matches_head().unwrap());
+    }
+
+    /// The empty-patch scenario: a superseded commit is replayed via `git am --3way`, hits an
+    /// add/add conflict, and the user resolves it by keeping the parent's version. The staged
+    /// tree then equals HEAD, so `staged_matches_head` reports the patch is empty (must be
+    /// `git am --skip`ped, not `--continue`d). While the conflict is unresolved it reports false.
+    #[test]
+    fn staged_matches_head_after_resolving_am_patch_to_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // base commit shared by both sides.
+        commit_file(dir.path(), "base.txt", "base", "base");
+
+        // feature adds x.txt with the "feature" content; capture just that commit as a patch.
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        commit_file(dir.path(), "x.txt", "feature version\n", "add x");
+        let patch = {
+            let out = Command::new("git")
+                .args(["format-patch", "--stdout", "main..feature"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let patch_path = dir.path().join("feature.patch");
+        std::fs::write(&patch_path, &patch).unwrap();
+
+        // main independently adds x.txt with different ("parent") content, so replaying the
+        // feature patch add/add-conflicts on x.txt.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "x.txt", "parent version\n", "add x (parent)");
+
+        let applied = git_ok(
+            dir.path(),
+            &["am", "--3way", patch_path.to_str().unwrap()],
+        );
+        assert!(!applied, "expected the replayed add to conflict");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+        // Unresolved conflict: not an empty patch.
+        assert!(!git_repo.staged_matches_head().unwrap());
+
+        // Resolve by keeping the parent's version (`--ours` == HEAD during `git am`).
+        git(dir.path(), &["checkout", "--ours", "x.txt"]);
+        git(dir.path(), &["add", "x.txt"]);
+
+        // The patch's only change is now superseded — the staged tree equals HEAD.
+        assert!(git_repo.staged_matches_head().unwrap());
+
+        let _ = git_ok(dir.path(), &["am", "--abort"]);
     }
 }
