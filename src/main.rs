@@ -1750,6 +1750,13 @@ fn restack(
             continue;
         }
 
+        // Churn guard: if `parent` is already an ancestor of `branch`, the branch is correctly
+        // stacked on its parent, so we MUST NOT re-apply it. Re-applying would replay the branch's
+        // commits (see the `restack_patch_series` call below) and mint fresh SHAs even though the
+        // resulting trees are identical, which severs each descendant's descent from this branch and
+        // re-triggers the replay-anchor cascade on the next `restack -afp`. When already stacked we
+        // only push, and only when the branch is out of sync with origin — an in-sync branch is a
+        // true no-op. See `git2_ops::tests::already_stacked_branch_is_skipped_not_rechurned`.
         if git_repo.is_ancestor(&parent, &branch.name)? {
             tracing::debug!(
                 "Branch '{}' is already stacked on '{}'.",

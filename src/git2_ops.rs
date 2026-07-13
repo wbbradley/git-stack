@@ -641,6 +641,29 @@ mod tests {
         git(dir, &["commit", "-q", "-m", msg]);
     }
 
+    /// Apply a `format-patch` series via `git am --3way`, feeding it on stdin. When
+    /// `committer_date` is set it pins `GIT_COMMITTER_DATE` so the replayed commit's SHA is
+    /// deterministic (the patch carries the *author* date, so the committer date is the only free
+    /// variable in the SHA).
+    fn git_am_stdin(dir: &Path, patch: &str, committer_date: Option<&str>) {
+        use std::io::Write;
+        let mut cmd = Command::new("git");
+        cmd.args(["am", "--3way"])
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped());
+        if let Some(date) = committer_date {
+            cmd.env("GIT_COMMITTER_DATE", date);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(patch.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
     /// Extract the `Subject:` lines from a `format-patch` series (one per patch).
     fn patch_subjects(patch: &str) -> Vec<String> {
         patch
@@ -830,6 +853,111 @@ mod tests {
         assert!(
             subjects[0].contains("ENV work"),
             "expected ENV work, got {subjects:?}"
+        );
+    }
+
+    /// Churn guard (PLAN "don't churn a branch already correctly stacked on its parent and in sync
+    /// with origin"): once a descendant has been restacked onto its (rewritten) parent, `restack`'s
+    /// `is_ancestor(parent, branch)` skip must fire on the next invocation so the branch is NOT
+    /// re-applied. Re-applying would mint a fresh SHA and sever descendants' descent, re-triggering
+    /// the replay-anchor cascade. This reproduces the rewritten-parent scenario, performs the
+    /// ApplyMerge fast-path replay of the descendant, and asserts (a) the replay is clean (no
+    /// superseded parent commit re-introduced), (b) the skip predicate holds for the whole chain, (c)
+    /// an in-sync branch is a true no-op (origin matches, so the loop would not even push), and (d)
+    /// the skip is load-bearing — re-applying instead of skipping would churn the SHA.
+    #[test]
+    fn already_stacked_branch_is_skipped_not_rechurned() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // trunk M0; parent p01 adds a migration commit with the OLD content.
+        commit_file(dir.path(), "base.txt", "m0", "M0");
+        git(dir.path(), &["checkout", "-q", "-b", "p01"]);
+        commit_file(
+            dir.path(),
+            "migration.txt",
+            "down_revision=OLD",
+            "P01 migration",
+        );
+        let lkg = git_rev_parse(dir.path(), "p01"); // old parent tip == env's lkg_parent
+
+        // env forks off p01 with its own commit.
+        git(dir.path(), &["checkout", "-q", "-b", "env"]);
+        commit_file(dir.path(), "env.txt", "env-work", "ENV work");
+
+        // trunk advances; p01 is rebuilt onto it with DIFFERENT migration content.
+        git(dir.path(), &["checkout", "-q", "main"]);
+        commit_file(dir.path(), "other.txt", "adv", "M1");
+        git(dir.path(), &["checkout", "-q", "-B", "p01", "main"]);
+        commit_file(
+            dir.path(),
+            "migration.txt",
+            "down_revision=NEW",
+            "P01 migration",
+        );
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+
+        // Perform the ApplyMerge fast-path replay of env onto the rewritten p01, exactly as
+        // `restack` does: build the `^lkg`-excluded series, reset the branch onto the new parent,
+        // then `git am` the series. Pin the committer date so the SHA is deterministic.
+        let series = git_repo
+            .restack_patch_series("p01", "env", Some(&lkg))
+            .unwrap()
+            .expect("env has unique work to replay");
+        git(dir.path(), &["checkout", "-q", "-B", "env", "p01"]);
+        git_am_stdin(dir.path(), &series, Some("2005-04-07T22:13:13"));
+        let restacked = git_rev_parse(dir.path(), "env");
+
+        // (a) Clean replay: env carries only its own commit over p01 — the superseded OLD migration
+        // commit was not re-introduced.
+        let range = format!("{}..{}", git_rev_parse(dir.path(), "p01"), "env");
+        let log = Command::new("git")
+            .args(["log", "--oneline", "--format=%s", &range])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let subjects: Vec<String> = String::from_utf8(log.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["ENV work".to_string()],
+            "env should carry only its own commit over p01"
+        );
+
+        // (b) Skip predicate now holds for the whole chain, so a second `restack` re-applies
+        // nothing: p01 is an ancestor of env, and main is an ancestor of p01 (the trunk child is
+        // likewise skippable).
+        assert!(
+            git_repo.is_ancestor("p01", "env").unwrap(),
+            "restacked descendant must be recognized as already stacked → skipped, not churned"
+        );
+        assert!(
+            git_repo.is_ancestor("main", "p01").unwrap(),
+            "trunk child must be recognized as already stacked → skipped, not churned"
+        );
+
+        // (c) In-sync with origin: with origin/env matching env, the skip path's push guard is a
+        // true no-op (it only pushes when the branch differs from origin).
+        git(dir.path(), &["update-ref", "refs/remotes/origin/env", "env"]);
+        assert!(
+            git_repo.shas_match("refs/remotes/origin/env", "env"),
+            "an in-sync branch must not be pushed by the skip path"
+        );
+
+        // (d) The skip is load-bearing: re-running the same replay (a needless re-application) mints
+        // a fresh SHA. `restack`'s `is_ancestor` guard short-circuits before this replay, which is
+        // exactly what prevents the churn.
+        git(dir.path(), &["checkout", "-q", "-B", "env", "p01"]);
+        git_am_stdin(dir.path(), &series, Some("2006-04-07T22:13:13"));
+        let rechurned = git_rev_parse(dir.path(), "env");
+        assert_ne!(
+            restacked, rechurned,
+            "re-applying instead of skipping churns the SHA — the is_ancestor skip is required"
         );
     }
 
