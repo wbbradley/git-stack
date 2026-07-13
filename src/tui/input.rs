@@ -13,6 +13,8 @@ pub enum AppAction {
     Select,
     /// Open the selected branch's PR in the default browser.
     OpenInBrowser,
+    /// Refresh the stack view from local state.
+    Refresh,
     /// Quit without action.
     Quit,
     /// No action.
@@ -44,9 +46,23 @@ fn handle_key(key: KeyEvent) -> AppAction {
         // Open PR in browser
         KeyCode::Char('o') => AppAction::OpenInBrowser,
 
+        // Refresh
+        KeyCode::Char('r') => AppAction::Refresh,
+
         // Quit
         KeyCode::Char('q') | KeyCode::Esc => AppAction::Quit,
 
         _ => AppAction::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn r_refreshes() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(handle_event(event), AppAction::Refresh);
     }
 }

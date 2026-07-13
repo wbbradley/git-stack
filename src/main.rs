@@ -1175,8 +1175,33 @@ fn interactive(
         );
     }
 
-    // Run TUI and handle checkout if user selected a branch
-    if let Some(branch_to_checkout) = tui::run_tui(renderable, verbose)? {
+    let branch_to_checkout = {
+        let mut refresh = || {
+            state = State::load_state()?;
+            let _trunk = state.ensure_trunk(git_repo, repo);
+            state.auto_cleanup_missing_branches(git_repo, repo)?;
+            let tree = state
+                .get_tree(repo)
+                .ok_or_else(|| anyhow!("No stack configured for this repository."))?;
+            let authors_filter = effective_authors_filter(git_repo)?;
+            Ok(build_renderable_tree(
+                git_repo,
+                repo,
+                tree,
+                orig_branch,
+                verbose,
+                show_all,
+                &authors_filter,
+                false,
+            )
+            .0)
+        };
+
+        tui::run_tui(renderable, verbose, &mut refresh)?
+    };
+
+    // Handle checkout if the user selected a branch.
+    if let Some(branch_to_checkout) = branch_to_checkout {
         run_git(&["checkout", &branch_to_checkout])?;
     }
 

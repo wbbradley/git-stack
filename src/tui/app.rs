@@ -96,6 +96,30 @@ impl App {
         self.should_quit = true;
     }
 
+    /// Replace the rendered tree while preserving the selected branch when possible.
+    pub fn apply_refreshed_tree(&mut self, new_tree: RenderableTree) {
+        let selected_branch = self
+            .tree
+            .branches
+            .get(self.cursor)
+            .map(|branch| branch.name.clone());
+
+        self.tree = new_tree;
+        self.cursor = selected_branch
+            .and_then(|name| {
+                self.tree
+                    .branches
+                    .iter()
+                    .position(|branch| branch.name == name)
+            })
+            .or(self.tree.current_branch_index)
+            .unwrap_or(self.cursor)
+            .min(self.tree.branches.len().saturating_sub(1));
+        self.list_state
+            .select((!self.tree.branches.is_empty()).then_some(self.cursor));
+        self.status_message = None;
+    }
+
     /// Set a transient status message to display in the help bar.
     fn set_status(&mut self, msg: String) {
         self.status_message = Some((msg, Instant::now() + STATUS_MESSAGE_TTL));
@@ -141,6 +165,7 @@ impl App {
             AppAction::MoveDown => self.move_down(),
             AppAction::Select => self.select(),
             AppAction::OpenInBrowser => self.open_selected_in_browser(),
+            AppAction::Refresh => {}
             AppAction::Quit => self.quit(),
             AppAction::None => {}
         }
@@ -169,12 +194,16 @@ fn restore_terminal(terminal: &mut Terminal) -> Result<()> {
 }
 
 /// Run the TUI application. Returns the branch to checkout, if any.
-pub fn run_tui(tree: RenderableTree, verbose: bool) -> Result<Option<String>> {
+pub fn run_tui(
+    tree: RenderableTree,
+    verbose: bool,
+    refresh: &mut dyn FnMut() -> Result<RenderableTree>,
+) -> Result<Option<String>> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new(tree, verbose);
 
     // Main event loop
-    let result = run_event_loop(&mut terminal, &mut app);
+    let result = run_event_loop(&mut terminal, &mut app, refresh);
 
     // Always restore terminal, even on error
     restore_terminal(&mut terminal)?;
@@ -183,7 +212,11 @@ pub fn run_tui(tree: RenderableTree, verbose: bool) -> Result<Option<String>> {
     Ok(app.checkout_branch)
 }
 
-fn run_event_loop(terminal: &mut Terminal, app: &mut App) -> Result<()> {
+fn run_event_loop(
+    terminal: &mut Terminal,
+    app: &mut App,
+    refresh: &mut dyn FnMut() -> Result<RenderableTree>,
+) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|frame| render(frame, app))?;
 
@@ -191,7 +224,14 @@ fn run_event_loop(terminal: &mut Terminal, app: &mut App) -> Result<()> {
         if event::poll(std::time::Duration::from_millis(100))? {
             let event = event::read()?;
             let action = handle_event(event);
-            app.handle_action(action);
+            if action == AppAction::Refresh {
+                match refresh() {
+                    Ok(tree) => app.apply_refreshed_tree(tree),
+                    Err(error) => app.set_status(format!("Refresh failed: {error}")),
+                }
+            } else {
+                app.handle_action(action);
+            }
         }
     }
     Ok(())
@@ -380,6 +420,8 @@ fn render_help(frame: &mut Frame, area: Rect, status: Option<&str>) {
             Span::raw(" checkout  "),
             Span::styled("o", Style::default().fg(Color::Yellow)),
             Span::raw(" open  "),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::raw(" refresh  "),
             Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" quit"),
         ]),
@@ -479,5 +521,49 @@ mod tests {
         let mut app = app_with_two_branches();
         app.set_status("hello".to_string());
         assert_eq!(app.active_status(), Some("hello"));
+    }
+
+    #[test]
+    fn apply_refreshed_tree_preserves_selection_by_name() {
+        let mut app = app_with_two_branches();
+        app.cursor = 1;
+        app.list_state.select(Some(1));
+        let tree = RenderableTree {
+            branches: vec![branch("feature-b", 0, None), branch("feature-a", 1, None)],
+            current_branch_index: Some(1),
+        };
+
+        app.apply_refreshed_tree(tree);
+
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.tree.branches[app.cursor].name, "feature-b");
+        assert_eq!(app.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn apply_refreshed_tree_falls_back_when_branch_removed() {
+        let mut app = app_with_two_branches();
+        app.cursor = 1;
+        let tree = RenderableTree {
+            branches: vec![branch("main", 0, None), branch("feature-c", 1, None)],
+            current_branch_index: Some(1),
+        };
+
+        app.apply_refreshed_tree(tree);
+
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn apply_refreshed_tree_handles_empty_tree() {
+        let mut app = app_with_two_branches();
+        app.apply_refreshed_tree(RenderableTree {
+            branches: Vec::new(),
+            current_branch_index: None,
+        });
+
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.list_state.selected(), None);
     }
 }
