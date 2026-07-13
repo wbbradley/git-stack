@@ -2,7 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.5.0] - 2026-07-13
+
+### Added
+- `git stack restack --skip` skips a restack conflict (am/rebase) whose patch resolved to empty or
+  already-present, clearing the pending restack and resuming the rest of the stack. Previously the
+  only escape from such a patch was `--abort`, which discarded correctly-restacked work. Additive:
+  `--continue` and `--abort` are unchanged; the conflict help and the "restack in progress" gate now
+  advertise `--skip` for am/rebase restacks.
+
+### Changed
+- `git stack sync` now persists the open PRs it discovers by author to the on-disk PR cache, so a
+  later offline `git stack`/`status` render (no token, or GitHub unreachable) can still show those
+  PRs' badges and URLs. Best-effort — a cache write failure never affects the sync itself.
 
 ### Fixed
 - `git stack restack` no longer re-replays a parent branch's superseded commits when that parent was
@@ -12,11 +24,19 @@ All notable changes to this project are documented in this file.
   onto the rebuilt parent instead of colliding with it (`add/add`/content conflicts and the `git am`
   dead-end). The `parent...branch` boundary is retained, so commits a `Merge branch 'main'` pulled in
   are still dropped.
-
-### Changed
-- `git stack sync` now persists the open PRs it discovers by author to the on-disk PR cache, so a
-  later offline `git stack`/`status` render (no token, or GitHub unreachable) can still show those
-  PRs' badges and URLs. Best-effort — a cache write failure never affects the sync itself.
+- `git stack restack --continue` now auto-skips a conflicting patch that resolved to empty (its
+  changes are already present in the new parent, e.g. a superseded base commit resolved by keeping
+  the parent's version). Previously `git am --continue` refused to advance an empty patch, wedging
+  the stack with only `--abort` as a way out.
+- `git stack restack --continue` / `--skip` now resume cleanly when you finished the underlying
+  `git am`/`git rebase` by hand (`git am --skip`/`--continue`, `git rebase --continue`). Previously
+  the tool ran `git am --continue` unconditionally, which errored with no operation in progress and
+  left the restack wedged (only `--abort` could clear it, discarding the correct result).
+- `git stack restack --squash` no longer re-squashes a branch that is already a single commit
+  correctly stacked on its parent. Previously every `--squash` run (and every `--continue` resume)
+  minted a fresh SHA over an identical tree — force-pushing it under `-p` — which severed each
+  descendant's descent and re-triggered restack churn down the stack. An already-squashed, in-sync
+  branch is now a true no-op; it pushes only when out of sync with origin.
 
 ## [0.4.0] - 2026-07-10
 

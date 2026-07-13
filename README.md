@@ -164,9 +164,12 @@ If `git stack` reports issues:
 - Ensure your working tree is clean (`git status`)
 - On a conflict, restack pauses and records a recovery point. Resolve the conflict
   (`git mergetool`), `git add` the resolved files, then run `git stack restack --continue`
-  to finish the branch and resume the rest of the stack, or `git stack restack --abort` to
-  restore the conflicting branch to its original state. This works for every stack method,
-  and `--abort` recovers even if you already ran a bare `git am --abort` / `git rebase --abort`.
+  to finish the branch and resume the rest of the stack. If the conflicting patch resolved to
+  nothing — its changes are already present, e.g. a superseded or duplicated commit — run
+  `git stack restack --skip` to drop that patch and continue. Or run `git stack restack --abort`
+  to restore the conflicting branch to its original state. This works for every stack method;
+  `--continue`/`--skip` also tolerate an `am`/`rebase` you finished by hand, and `--abort`
+  recovers even if you already ran a bare `git am --abort` / `git rebase --abort`.
 
 ## License
 
