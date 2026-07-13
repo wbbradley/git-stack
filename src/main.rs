@@ -1733,11 +1733,40 @@ fn restack(
         let source = git_repo.sha(&branch.name)?;
 
         // Handle squash mode - squash all commits into one on top of parent.
-        // NOTE: unlike the am/rebase/merge paths, squash mode has no `is_ancestor` skip, so a
-        // `--continue` resume re-squashes already-completed branches (same trees, new SHAs, and
-        // a redundant force-push only when `-p` is set). Functionally correct; the
-        // squash + `--ancestors` + conflict + `--continue` scenario is narrow.
         if squash {
+            // Churn guard for squash mode (mirrors the am/rebase/merge guard below, but narrower).
+            // Re-squashing a branch that is ALREADY a single commit correctly stacked on `parent`
+            // mints a fresh SHA over an identical tree, severing each descendant's descent and
+            // re-triggering the replay-anchor cascade on the next `restack` — the same churn the
+            // ApplyMerge guard was added to prevent. A plain `is_ancestor(parent, branch)` skip
+            // (as the non-squash paths use) is too broad here: it would wrongly skip a branch that
+            // still has multiple commits needing to be squashed. So skip only when the branch is
+            // already at most one commit over `parent` AND `parent` is an ancestor of it — then a
+            // re-squash would reproduce the same single commit (same tree, same concatenated
+            // message) and only churn the SHA. When already-squashed we only push, and only when
+            // out of sync with origin (an in-sync branch is a true no-op). This also removes the
+            // former `--continue`-resume re-squash churn. See
+            // `git2_ops::tests::already_squashed_branch_is_skipped_not_rechurned`.
+            if git_repo.is_ancestor(&parent, &branch.name)?
+                && git_repo.commits_ahead(&parent, &branch.name)? <= 1
+            {
+                tracing::debug!(
+                    "Branch '{}' is already squashed on '{}'.",
+                    branch.name,
+                    parent
+                );
+                let mut status = "no changes".to_string();
+                if push
+                    && !git_repo
+                        .shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
+                {
+                    git_push(git_repo, &branch.name)?;
+                    pushed_branches.push(branch.name.clone());
+                    status = "no changes, pushed".to_string();
+                }
+                branch_results.push((branch.name.clone(), status));
+                continue;
+            }
             squash_branch(git_repo, &mut state, repo, &branch, &parent, resume.clone())?;
             let status = if push {
                 git_push(git_repo, &branch.name)?;

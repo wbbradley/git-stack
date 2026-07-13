@@ -193,6 +193,41 @@ impl GitRepo {
         Ok(base)
     }
 
+    /// Number of commits reachable from `tip` but not from `base`
+    /// (i.e. `git rev-list --count <base>..<tip>`).
+    ///
+    /// The squash churn guard uses this to tell "already a single commit over its parent"
+    /// (count `<= 1` → re-squashing would only churn the SHA over an identical tree) from
+    /// "still has multiple commits that need collapsing" (count `> 1` → must squash).
+    pub fn commits_ahead(&self, base: &str, tip: &str) -> Result<usize> {
+        let base_oid = self
+            .repo
+            .revparse_single(base)
+            .with_context(|| format!("Failed to resolve base ref: {}", base))?
+            .peel_to_commit()
+            .with_context(|| format!("Failed to peel base to commit: {}", base))?
+            .id();
+        let tip_oid = self
+            .repo
+            .revparse_single(tip)
+            .with_context(|| format!("Failed to resolve tip ref: {}", tip))?
+            .peel_to_commit()
+            .with_context(|| format!("Failed to peel tip to commit: {}", tip))?
+            .id();
+
+        let _bench = GitBenchmark::start("git2:commits-ahead");
+        let mut walk = self.repo.revwalk().context("creating revwalk")?;
+        walk.push(tip_oid).context("pushing tip in revwalk")?;
+        walk.hide(base_oid).context("hiding base in revwalk")?;
+
+        let mut count = 0usize;
+        for oid in walk {
+            oid.context("walking commits between base and tip")?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Check if a local branch exists.
     /// Only checks for local branches, not remote refs.
     pub fn branch_exists(&self, branch: &str) -> bool {
@@ -673,6 +708,30 @@ mod tests {
             .collect()
     }
 
+    /// Squash `branch` into a single commit on top of `parent`, exactly as `restack --squash` does
+    /// (checkout parent, `merge --squash`, commit), then move `branch` onto the result. Pins the
+    /// author + committer dates so the resulting SHA is deterministic — a squash mints a brand-new
+    /// commit, so both dates are free variables in its SHA. Returns the new `branch` SHA.
+    fn squash_onto(dir: &Path, parent: &str, branch: &str, msg: &str, date: &str) -> String {
+        let tmp = format!("tmp-{branch}");
+        git(dir, &["checkout", "-q", parent]);
+        git(dir, &["checkout", "-q", "-B", &tmp]);
+        git(dir, &["merge", "-q", "--squash", branch]);
+        assert!(
+            Command::new("git")
+                .args(["commit", "-q", "-m", msg])
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git(dir, &["checkout", "-q", "-B", branch]);
+        git(dir, &["branch", "-q", "-D", &tmp]);
+        git_rev_parse(dir, branch)
+    }
+
     /// The `restack-problem.md` minimal repro: a feature branch that merged `main` into
     /// itself pulls an already-upstream commit (`U2`) into its history. The old
     /// `lkg..branch` range replayed it; the fixed symmetric-difference range must drop it
@@ -943,7 +1002,10 @@ mod tests {
 
         // (c) In-sync with origin: with origin/env matching env, the skip path's push guard is a
         // true no-op (it only pushes when the branch differs from origin).
-        git(dir.path(), &["update-ref", "refs/remotes/origin/env", "env"]);
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/env", "env"],
+        );
         assert!(
             git_repo.shas_match("refs/remotes/origin/env", "env"),
             "an in-sync branch must not be pushed by the skip path"
@@ -958,6 +1020,96 @@ mod tests {
         assert_ne!(
             restacked, rechurned,
             "re-applying instead of skipping churns the SHA — the is_ancestor skip is required"
+        );
+    }
+
+    /// `commits_ahead` counts exactly the commits in `base..tip`.
+    #[test]
+    fn commits_ahead_counts_range() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        commit_file(dir.path(), "base.txt", "m0", "M0");
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+
+        // Nothing on feature yet beyond main.
+        assert_eq!(git_repo.commits_ahead("main", "feature").unwrap(), 0);
+
+        commit_file(dir.path(), "a.txt", "a", "A");
+        assert_eq!(git_repo.commits_ahead("main", "feature").unwrap(), 1);
+
+        commit_file(dir.path(), "b.txt", "b", "B");
+        commit_file(dir.path(), "c.txt", "c", "C");
+        assert_eq!(git_repo.commits_ahead("main", "feature").unwrap(), 3);
+
+        // A ref is never ahead of itself.
+        assert_eq!(git_repo.commits_ahead("feature", "feature").unwrap(), 0);
+    }
+
+    /// Squash-mode churn guard (PLAN "Squash-mode restack re-squashes an already-squashed, in-sync
+    /// branch"): the squash path must skip a branch that is already a single commit correctly
+    /// stacked on its parent, but MUST still squash a branch that has multiple commits. This
+    /// asserts the guard predicate `is_ancestor(parent, branch) && commits_ahead(parent, branch)
+    /// <= 1` (a) fires for an already-squashed branch, (b) does NOT fire for a multi-commit branch
+    /// (a plain `is_ancestor` skip would wrongly skip it), (c) fires again once that branch has
+    /// been squashed to one commit, and (d) is load-bearing — re-squashing instead of skipping
+    /// churns the SHA and severs descendants' descent.
+    #[test]
+    fn already_squashed_branch_is_skipped_not_rechurned() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let cache_path = dir.path().join("mb_cache.redb");
+
+        // trunk M0; p01 is already a single commit over main (an already-squashed branch).
+        commit_file(dir.path(), "base.txt", "m0", "M0");
+        git(dir.path(), &["checkout", "-q", "-b", "p01"]);
+        commit_file(dir.path(), "p01.txt", "p01", "P01");
+
+        // env stacks THREE commits on p01 — a branch that genuinely still needs squashing.
+        git(dir.path(), &["checkout", "-q", "-b", "env"]);
+        commit_file(dir.path(), "a.txt", "a", "A");
+        commit_file(dir.path(), "b.txt", "b", "B");
+        commit_file(dir.path(), "c.txt", "c", "C");
+
+        let git_repo = GitRepo::open_with_cache_at(dir.path(), &cache_path).unwrap();
+
+        // (a) p01 is already squashed: parent is an ancestor and exactly one commit over it → skip.
+        assert!(git_repo.is_ancestor("main", "p01").unwrap());
+        assert_eq!(git_repo.commits_ahead("main", "p01").unwrap(), 1);
+
+        // (b) env has three commits over p01 → the guard must NOT skip it (it needs squashing). A
+        // plain `is_ancestor` skip (what the non-squash paths use) would wrongly skip it here.
+        assert!(git_repo.is_ancestor("p01", "env").unwrap());
+        assert_eq!(git_repo.commits_ahead("p01", "env").unwrap(), 3);
+
+        // (c) After squashing env onto p01 it becomes one commit, so a subsequent `restack --squash`
+        // recognizes it as already-squashed and skips it (no re-churn).
+        let squashed = squash_onto(
+            dir.path(),
+            "p01",
+            "env",
+            "ENV squashed",
+            "2005-04-07T22:13:13",
+        );
+        assert!(git_repo.is_ancestor("p01", "env").unwrap());
+        assert_eq!(git_repo.commits_ahead("p01", "env").unwrap(), 1);
+
+        // (d) The skip is load-bearing: re-squashing the already-squashed env (a needless
+        // re-application) mints a fresh SHA over the same tree — the descent-severing churn the
+        // guard prevents.
+        let rechurned = squash_onto(
+            dir.path(),
+            "p01",
+            "env",
+            "ENV squashed",
+            "2006-04-07T22:13:13",
+        );
+        assert_ne!(
+            squashed, rechurned,
+            "re-squashing instead of skipping churns the SHA — the guard is required"
         );
     }
 
