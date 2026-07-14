@@ -910,6 +910,37 @@ fn compute_sync_plan(
     let mut remote_changes = Vec::new();
     let mut warnings = Vec::new();
 
+    tracing::debug!(
+        "Checking for merged PRs. Local branches: {:?}, Closed PRs: {:?}",
+        local.branches.keys().collect::<Vec<_>>(),
+        remote.closed_prs.keys().collect::<Vec<_>>()
+    );
+
+    // Resolve the complete removal topology before finalizing mounts. An open child PR may
+    // already be based on the same surviving ancestor that removing its closed parent will select;
+    // in that case the unmount is the sole topology operation and preserves the child's LKG.
+    let unmount_set: HashSet<String> = local
+        .branches
+        .keys()
+        .filter(|branch_name| {
+            *branch_name != &local.trunk
+                && !remote.prs.contains_key(*branch_name)
+                && remote.closed_prs.get(*branch_name).is_some_and(|pr| {
+                    matches!(pr.state, RemotePrState::Merged | RemotePrState::Closed)
+                })
+        })
+        .cloned()
+        .collect();
+    let unmount_destinations: HashMap<String, String> = unmount_set
+        .iter()
+        .map(|branch_name| {
+            (
+                branch_name.clone(),
+                resolve_repoint(branch_name, &local.branches, &local.trunk, &unmount_set),
+            )
+        })
+        .collect();
+
     // Compute local changes (pull direction)
     if !options.push_only {
         // Collect branches that need to be mounted, then topologically sort them
@@ -944,7 +975,14 @@ fn compute_sync_plan(
                 if local_branch.parent != target_branch.parent
                     && let Some(parent) = &target_branch.parent
                 {
-                    branches_to_mount.push((branch_name.clone(), parent.clone()));
+                    let parent_removal_already_repoints_here = local_branch
+                        .parent
+                        .as_ref()
+                        .and_then(|current_parent| unmount_destinations.get(current_parent))
+                        == Some(parent);
+                    if !parent_removal_already_repoints_here {
+                        branches_to_mount.push((branch_name.clone(), parent.clone()));
+                    }
                 }
             }
         }
@@ -1023,40 +1061,17 @@ fn compute_sync_plan(
     // This runs regardless of push_only/pull_only since it's about reconciling state
     let mut branches_to_delete: Vec<String> = Vec::new();
 
-    tracing::debug!(
-        "Checking for merged PRs. Local branches: {:?}, Closed PRs: {:?}",
-        local.branches.keys().collect::<Vec<_>>(),
-        remote.closed_prs.keys().collect::<Vec<_>>()
-    );
-
-    // First pass: collect the raw set of branches to unmount (eligible by closed PR).
-    let mut unmount_set: HashSet<String> = HashSet::new();
-    for branch_name in local.branches.keys() {
-        if branch_name == &local.trunk {
-            continue;
-        }
-        if !remote.prs.contains_key(branch_name)
-            && let Some(closed_pr) = remote.closed_prs.get(branch_name)
-            && matches!(
-                closed_pr.state,
-                RemotePrState::Merged | RemotePrState::Closed
-            )
-        {
-            unmount_set.insert(branch_name.clone());
-        }
-    }
-
-    // Second pass: emit unmount entries with transitively-resolved repoint targets,
-    // and compute safe-to-delete.
+    // Emit unmount entries using the destinations resolved before mount planning, and compute
+    // safe-to-delete.
     let mut branches_to_unmount: Vec<(String, String)> = Vec::new(); // (branch, repoint_to)
     for branch_name in local.branches.keys() {
-        if !unmount_set.contains(branch_name) {
+        let Some(repoint_to) = unmount_destinations.get(branch_name) else {
             continue;
-        }
+        };
         let closed_pr = remote
             .closed_prs
             .get(branch_name)
-            .expect("unmount_set membership implies closed PR");
+            .expect("unmount destination implies closed PR");
 
         tracing::debug!(
             "Branch '{}' has closed PR #{} with state {:?}",
@@ -1065,8 +1080,7 @@ fn compute_sync_plan(
             closed_pr.state
         );
 
-        let repoint_to = resolve_repoint(branch_name, &local.branches, &local.trunk, &unmount_set);
-        branches_to_unmount.push((branch_name.clone(), repoint_to));
+        branches_to_unmount.push((branch_name.clone(), repoint_to.clone()));
 
         // Determine if local branch is safe to delete
         // Safe if: merged, OR (closed AND remote exists AND local is ancestor of remote)
@@ -1842,6 +1856,13 @@ mod tests {
         }
     }
 
+    fn merged_remote_pr(number: u64, base: &str) -> RemotePr {
+        RemotePr {
+            state: RemotePrState::Merged,
+            ..remote_pr(number, base)
+        }
+    }
+
     /// Build a `RemoteState` from (branch, base, pr_number, author) tuples for the open PRs.
     fn remote_state(open: &[(&str, &str, u64, &str)]) -> RemoteState {
         let mut prs = HashMap::new();
@@ -1870,6 +1891,14 @@ mod tests {
 
     fn scope_of(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn state_with_tree(repo: &str, tree: Branch) -> State {
+        State {
+            repos: [(repo.to_string(), RepoState::new(tree))]
+                .into_iter()
+                .collect(),
+        }
     }
 
     #[test]
@@ -2026,6 +2055,231 @@ mod tests {
         assert_eq!(
             resolve_repoint("orphan", &branches, &trunk, &unmount_set),
             trunk
+        );
+    }
+
+    #[test]
+    fn planner_lets_parent_removal_preserve_child_lkg_after_multi_commit_squash() {
+        let _state_home = redirect_sync_test_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_sync_test_repo(dir.path());
+
+        test_git(dir.path(), &["checkout", "-q", "-b", "parent"]);
+        commit_test_file(dir.path(), "parent-one.txt", "one\n", "parent work one");
+        commit_test_file(dir.path(), "parent-two.txt", "two\n", "parent work two");
+        let old_parent_tip = test_git_output(dir.path(), &["rev-parse", "parent"]);
+
+        test_git(dir.path(), &["checkout", "-q", "-b", "child"]);
+        commit_test_file(dir.path(), "child.txt", "child\n", "child work");
+
+        test_git(dir.path(), &["checkout", "-q", "main"]);
+        commit_test_file(dir.path(), "main.txt", "advanced\n", "advance main");
+        test_git(dir.path(), &["merge", "--squash", "parent"]);
+        test_git(dir.path(), &["commit", "-q", "-m", "squash parent work"]);
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = sync_test_repo_key(dir.path());
+        let local = local_state(
+            "main",
+            &[
+                ("main", None),
+                ("parent", Some("main")),
+                ("child", Some("parent")),
+            ],
+        );
+        let mut remote = remote_state(&[("child", "main", 22, "alice")]);
+        remote
+            .closed_prs
+            .insert("parent".to_string(), merged_remote_pr(21, "main"));
+        let target = build_target_state(
+            &git_repo,
+            &local,
+            &remote,
+            &scope_of(&["main", "parent", "child"]),
+            &[],
+        );
+
+        let mut parent = Branch::new("parent".to_string(), None);
+        parent.branches.push(Branch::new(
+            "child".to_string(),
+            Some(old_parent_tip.clone()),
+        ));
+        let mut main = Branch::new("main".to_string(), None);
+        main.branches.push(parent);
+        let mut state = state_with_tree(&repo, main);
+
+        let plan = compute_sync_plan(
+            &git_repo,
+            &state,
+            &repo,
+            &local,
+            &remote,
+            &target,
+            &SyncOptions::default(),
+        );
+
+        assert!(plan.local_changes.iter().any(|change| matches!(
+            change,
+            LocalChange::UnmountBranch {
+                name,
+                repoint_children_to
+            } if name == "parent" && repoint_children_to == "main"
+        )));
+        assert!(!plan.local_changes.iter().any(|change| matches!(
+            change,
+            LocalChange::MountBranch { name, parent }
+                if name == "child" && parent == "main"
+        )));
+
+        for change in &plan.local_changes {
+            apply_local_change(&git_repo, &mut state, &repo, change).unwrap();
+        }
+
+        let child = state.get_tree_branch(&repo, "child").unwrap();
+        assert_eq!(
+            state.get_parent_branch_of(&repo, "child").unwrap().name,
+            "main"
+        );
+        assert_eq!(child.lkg_parent.as_deref(), Some(old_parent_tip.as_str()));
+
+        let series = git_repo
+            .restack_patch_series("main", "child", child.lkg_parent.as_deref())
+            .unwrap()
+            .expect("child work should remain to replay");
+        assert!(series.contains("child work"));
+        assert!(!series.contains("parent work one"));
+        assert!(!series.contains("parent work two"));
+
+        test_git(dir.path(), &["checkout", "-q", "-B", "child", "main"]);
+        apply_patch_series(dir.path(), &series);
+        assert_eq!(
+            test_git_output(dir.path(), &["log", "--format=%s", "main..child"]),
+            "child work"
+        );
+    }
+
+    #[test]
+    fn planner_suppresses_mount_through_consecutive_removed_parents() {
+        let _state_home = redirect_sync_test_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_sync_test_repo(dir.path());
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = sync_test_repo_key(dir.path());
+        let local = local_state(
+            "main",
+            &[
+                ("main", None),
+                ("A", Some("main")),
+                ("B", Some("A")),
+                ("child", Some("B")),
+            ],
+        );
+        let mut remote = remote_state(&[("child", "main", 33, "alice")]);
+        remote
+            .closed_prs
+            .insert("A".to_string(), merged_remote_pr(31, "main"));
+        remote
+            .closed_prs
+            .insert("B".to_string(), merged_remote_pr(32, "A"));
+        let target = build_target_state(
+            &git_repo,
+            &local,
+            &remote,
+            &scope_of(&["main", "A", "B", "child"]),
+            &[],
+        );
+        let state = state_with_tree(&repo, Branch::new("main".to_string(), None));
+
+        let plan = compute_sync_plan(
+            &git_repo,
+            &state,
+            &repo,
+            &local,
+            &remote,
+            &target,
+            &SyncOptions::default(),
+        );
+
+        assert!(!plan.local_changes.iter().any(|change| matches!(
+            change,
+            LocalChange::MountBranch { name, parent }
+                if name == "child" && parent == "main"
+        )));
+    }
+
+    #[test]
+    fn planner_keeps_genuine_reparent_and_records_selected_parent_tip() {
+        let _state_home = redirect_sync_test_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_sync_test_repo(dir.path());
+        test_git(dir.path(), &["checkout", "-q", "-b", "alternate"]);
+        test_git(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "alternate parent"],
+        );
+        let alternate_tip = test_git_output(dir.path(), &["rev-parse", "alternate"]);
+        test_git(dir.path(), &["checkout", "-q", "main"]);
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = sync_test_repo_key(dir.path());
+        let local = local_state(
+            "main",
+            &[
+                ("main", None),
+                ("removed", Some("main")),
+                ("child", Some("removed")),
+                ("alternate", Some("main")),
+            ],
+        );
+        let mut remote = remote_state(&[("child", "alternate", 42, "alice")]);
+        remote
+            .closed_prs
+            .insert("removed".to_string(), merged_remote_pr(41, "main"));
+        let target = build_target_state(
+            &git_repo,
+            &local,
+            &remote,
+            &scope_of(&["main", "removed", "child", "alternate"]),
+            &[],
+        );
+
+        let mut removed = Branch::new("removed".to_string(), None);
+        removed.branches.push(Branch::new(
+            "child".to_string(),
+            Some("old-removed-tip".to_string()),
+        ));
+        let mut main = Branch::new("main".to_string(), None);
+        main.branches = vec![removed, Branch::new("alternate".to_string(), None)];
+        let mut state = state_with_tree(&repo, main);
+
+        let plan = compute_sync_plan(
+            &git_repo,
+            &state,
+            &repo,
+            &local,
+            &remote,
+            &target,
+            &SyncOptions::default(),
+        );
+
+        assert!(plan.local_changes.iter().any(|change| matches!(
+            change,
+            LocalChange::MountBranch { name, parent }
+                if name == "child" && parent == "alternate"
+        )));
+        for change in &plan.local_changes {
+            apply_local_change(&git_repo, &mut state, &repo, change).unwrap();
+        }
+        assert_eq!(
+            state.get_parent_branch_of(&repo, "child").unwrap().name,
+            "alternate"
+        );
+        assert_eq!(
+            state.get_tree_branch(&repo, "child").unwrap().lkg_parent,
+            Some(alternate_tip)
         );
     }
 
