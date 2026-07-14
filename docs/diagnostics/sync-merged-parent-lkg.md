@@ -109,7 +109,15 @@ applies that series cleanly to squash-merged `main`.
 ## Natural observations
 
 The fix remains under observation until two naturally occurring parent-removal syncs succeed,
-including at least one multi-commit parent squash. Record each case here with:
+including at least one multi-commit parent squash. The installed observation build is:
+
+- Installed 2026-07-14:
+  - version: `git-stack 0.5.0`;
+  - source SHA: `5f742d93798a33402ad942345b302da3b58141ca`;
+  - installed binary: `/Users/wbbradley/.cargo/bin/git-stack`;
+  - binary SHA-256: `f1792ac12fdba0d2010e868899ad2dca2336d733909dced1ed780c397c181cf8`.
+
+For each natural case, capture:
 
 - git-stack version, installed binary SHA-256, and source SHA;
 - exact sync/restack commands;
