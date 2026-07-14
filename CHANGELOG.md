@@ -17,6 +17,10 @@ All notable changes to this project are documented in this file.
   PRs' badges and URLs. Best-effort — a cache write failure never affects the sync itself.
 
 ### Fixed
+- `git stack sync` now preserves a surviving child's last-known-good parent when removing a merged
+  or closed parent from the stack tree. A later restack therefore excludes the removed parent's old
+  commits instead of replaying them with the child's work and producing spurious conflicts; chained
+  merged-parent removals preserve the same boundary regardless of removal order.
 - `git stack restack` no longer re-replays a parent branch's superseded commits when that parent was
   rewritten with new content (e.g. a conflict resolution against trunk changed one of its commits).
   The `ApplyMerge` patch series now excludes the recorded last-known-good parent tip

@@ -1468,12 +1468,7 @@ fn unmount_branch_from_tree(
             child.yellow(),
             repoint_children_to.green()
         );
-        state.mount(
-            git_repo,
-            repo,
-            &child,
-            Some(repoint_children_to.to_string()),
-        )?;
+        state.reparent_preserving_lkg(git_repo, repo, &child, repoint_children_to.to_string())?;
     }
 
     // Delete the branch from the tree
@@ -1740,6 +1735,94 @@ fn find_branch_by_name_mut<'a>(tree: &'a mut Branch, name: &str) -> Option<&'a m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        io::Write,
+        path::Path,
+        process::{Command, Stdio},
+    };
+
+    use crate::state::RepoState;
+
+    fn init_sync_test_repo(dir: &Path) {
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "maintenance.auto", "false"]);
+        git(&["config", "gc.auto", "0"]);
+        git(&["commit", "--allow-empty", "-q", "-m", "root"]);
+        git(&["update-ref", "refs/remotes/origin/main", "main"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+    }
+
+    fn test_git(dir: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    fn test_git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_test_file(dir: &Path, path: &str, contents: &str, message: &str) {
+        fs::write(dir.join(path), contents).unwrap();
+        test_git(dir, &["add", path]);
+        test_git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    fn apply_patch_series(dir: &Path, series: &str) {
+        let mut child = Command::new("git")
+            .args(["am", "--3way"])
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(series.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    fn sync_test_repo_key(dir: &Path) -> String {
+        dir.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    fn redirect_sync_test_state_home() -> tempfile::TempDir {
+        let state_home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(state_home.path().join(env!("CARGO_PKG_NAME"))).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
+        state_home
+    }
 
     fn lb(parent: Option<&str>) -> LocalBranch {
         LocalBranch {
@@ -1943,6 +2026,130 @@ mod tests {
         assert_eq!(
             resolve_repoint("orphan", &branches, &trunk, &unmount_set),
             trunk
+        );
+    }
+
+    #[test]
+    fn consecutive_unmounts_preserve_child_lkg_in_either_order() {
+        let _state_home = redirect_sync_test_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_sync_test_repo(dir.path());
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = sync_test_repo_key(dir.path());
+
+        for order in [["A", "B"], ["B", "A"]] {
+            let child = Branch::new("child".to_string(), Some("old-b-tip".to_string()));
+            let mut branch_b = Branch::new("B".to_string(), Some("old-a-tip".to_string()));
+            branch_b.branches.push(child);
+            let mut branch_a = Branch::new("A".to_string(), Some("old-main-tip".to_string()));
+            branch_a.branches.push(branch_b);
+            let mut main_branch = Branch::new("main".to_string(), None);
+            main_branch.branches.push(branch_a);
+            let mut state = State {
+                repos: [(repo.clone(), RepoState::new(main_branch))]
+                    .into_iter()
+                    .collect(),
+            };
+
+            for branch in order {
+                unmount_branch_from_tree(&git_repo, &mut state, &repo, branch, "main").unwrap();
+            }
+
+            assert!(!state.branch_exists_in_tree(&repo, "A"));
+            assert!(!state.branch_exists_in_tree(&repo, "B"));
+            assert_eq!(
+                state.get_parent_branch_of(&repo, "child").unwrap().name,
+                "main",
+                "unexpected parent after removal order {order:?}"
+            );
+            assert_eq!(
+                state.get_tree_branch(&repo, "child").unwrap().lkg_parent,
+                Some("old-b-tip".to_string()),
+                "LKG changed after removal order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_unmount_keeps_restack_series_scoped_to_child_work() {
+        let _state_home = redirect_sync_test_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_sync_test_repo(dir.path());
+
+        test_git(dir.path(), &["checkout", "-q", "-b", "parent"]);
+        commit_test_file(dir.path(), "parent-one.txt", "one\n", "parent work one");
+        commit_test_file(dir.path(), "parent-two.txt", "two\n", "parent work two");
+        let old_parent_tip = test_git_output(dir.path(), &["rev-parse", "parent"]);
+
+        test_git(dir.path(), &["checkout", "-q", "-b", "child"]);
+        commit_test_file(dir.path(), "child.txt", "child\n", "child work");
+
+        // Advance main, then squash-merge the parent. The resulting main tree has the parent's
+        // content, but neither individual parent commit is reachable or patch-equivalent to the
+        // combined squash commit.
+        test_git(dir.path(), &["checkout", "-q", "main"]);
+        commit_test_file(dir.path(), "main.txt", "advanced\n", "advance main");
+        test_git(dir.path(), &["merge", "--squash", "parent"]);
+        test_git(dir.path(), &["commit", "-q", "-m", "squash parent work"]);
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = sync_test_repo_key(dir.path());
+        let mut parent = Branch::new("parent".to_string(), None);
+        parent.branches.push(Branch::new(
+            "child".to_string(),
+            Some(old_parent_tip.clone()),
+        ));
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches.push(parent);
+        let mut state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        unmount_branch_from_tree(&git_repo, &mut state, &repo, "parent", "main").unwrap();
+
+        let child = state.get_tree_branch(&repo, "child").unwrap();
+        assert_eq!(child.lkg_parent.as_deref(), Some(old_parent_tip.as_str()));
+        assert_eq!(
+            state.get_parent_branch_of(&repo, "child").unwrap().name,
+            "main"
+        );
+
+        let unbounded_series = git_repo
+            .restack_patch_series("main", "child", None)
+            .unwrap()
+            .expect("the unbounded series should reproduce the old-parent replay bug");
+        assert!(unbounded_series.contains("parent work one"));
+        assert!(unbounded_series.contains("parent work two"));
+
+        let series = git_repo
+            .restack_patch_series("main", "child", child.lkg_parent.as_deref())
+            .unwrap()
+            .expect("child work should remain to replay");
+        assert!(series.contains("child work"));
+        assert!(!series.contains("parent work one"));
+        assert!(!series.contains("parent work two"));
+
+        test_git(dir.path(), &["checkout", "-q", "-B", "child", "main"]);
+        apply_patch_series(dir.path(), &series);
+        assert_eq!(
+            test_git_output(dir.path(), &["log", "--format=%s", "main..child"]),
+            "child work"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("child.txt")).unwrap(),
+            "child\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parent-one.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("parent-two.txt")).unwrap(),
+            "two\n"
         );
     }
 

@@ -156,6 +156,12 @@ impl RepoState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LkgParentPolicy {
+    RecordSelectedParent,
+    Preserve,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct State {
     /// The directory name is the key, and the value is the repo state.
@@ -728,6 +734,41 @@ impl State {
         branch_name: &str,
         parent_branch: Option<String>,
     ) -> Result<()> {
+        self.mount_with_lkg_policy(
+            git_repo,
+            repo,
+            branch_name,
+            parent_branch,
+            LkgParentPolicy::RecordSelectedParent,
+        )
+    }
+
+    /// Move an existing subtree for a topology-only change without changing the branch's replay
+    /// boundary. Unlike an ordinary mount, this preserves `lkg_parent` verbatim, including `None`.
+    pub(crate) fn reparent_preserving_lkg(
+        &mut self,
+        git_repo: &GitRepo,
+        repo: &str,
+        branch_name: &str,
+        parent_branch: String,
+    ) -> Result<()> {
+        self.mount_with_lkg_policy(
+            git_repo,
+            repo,
+            branch_name,
+            Some(parent_branch),
+            LkgParentPolicy::Preserve,
+        )
+    }
+
+    fn mount_with_lkg_policy(
+        &mut self,
+        git_repo: &GitRepo,
+        repo: &str,
+        branch_name: &str,
+        parent_branch: Option<String>,
+        lkg_parent_policy: LkgParentPolicy,
+    ) -> Result<()> {
         let trunk = self.ensure_trunk(git_repo, repo);
 
         if let Some(ref trunk) = trunk
@@ -776,12 +817,17 @@ impl State {
         }
 
         // Get the branch to add (either preserved or new)
-        let mut branch_to_add = existing_branch.unwrap_or_else(|| {
-            Branch::new(branch_name.to_string(), git_repo.sha(&parent_branch).ok())
-        });
+        let mut branch_to_add = match existing_branch {
+            Some(branch) => branch,
+            None if matches!(lkg_parent_policy, LkgParentPolicy::Preserve) => {
+                bail!("Branch {branch_name} not found in the git-stack tree.")
+            }
+            None => Branch::new(branch_name.to_string(), git_repo.sha(&parent_branch).ok()),
+        };
 
-        // Update the lkg_parent to the new parent
-        branch_to_add.lkg_parent = git_repo.sha(&parent_branch).ok();
+        if matches!(lkg_parent_policy, LkgParentPolicy::RecordSelectedParent) {
+            branch_to_add.lkg_parent = git_repo.sha(&parent_branch).ok();
+        }
 
         // Add the branch to the new parent
         let new_parent_branch = self.get_tree_branch_mut(repo, &parent_branch);
@@ -1556,6 +1602,128 @@ mod tests {
 
     fn repo_key(dir: &Path) -> String {
         dir.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    fn redirect_state_home() -> tempfile::TempDir {
+        let state_home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(state_home.path().join(env!("CARGO_PKG_NAME"))).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
+        state_home
+    }
+
+    #[test]
+    fn topology_reparent_preserves_lkg_and_subtree_metadata() {
+        let _state_home = redirect_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+
+        let mut child = Branch::new("child".to_string(), Some("old-parent-tip".to_string()));
+        child.stack_method = StackMethod::Merge;
+        child.note = Some("keep this note".to_string());
+        child.pr_number = Some(42);
+        child.branches.push(Branch::new(
+            "grandchild".to_string(),
+            Some("child-tip".to_string()),
+        ));
+        let child_without_lkg = Branch::new("child-without-lkg".to_string(), None);
+
+        let mut removed_parent = Branch::new("removed-parent".to_string(), None);
+        removed_parent.branches = vec![child, child_without_lkg];
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches.push(removed_parent);
+        let mut state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        state
+            .reparent_preserving_lkg(&git_repo, &repo, "child", "main".to_string())
+            .unwrap();
+        state
+            .reparent_preserving_lkg(&git_repo, &repo, "child-without-lkg", "main".to_string())
+            .unwrap();
+
+        let child = state.get_tree_branch(&repo, "child").unwrap();
+        assert_eq!(child.lkg_parent.as_deref(), Some("old-parent-tip"));
+        assert_eq!(child.stack_method, StackMethod::Merge);
+        assert_eq!(child.note.as_deref(), Some("keep this note"));
+        assert_eq!(child.pr_number, Some(42));
+        assert_eq!(child.branches.len(), 1);
+        assert_eq!(child.branches[0].name, "grandchild");
+        assert_eq!(
+            state.get_parent_branch_of(&repo, "child").unwrap().name,
+            "main"
+        );
+        assert_eq!(
+            state
+                .get_tree_branch(&repo, "child-without-lkg")
+                .unwrap()
+                .lkg_parent,
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_mount_records_selected_parent_tip() {
+        let _state_home = redirect_state_home();
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let main_sha = git_rev_parse(dir.path(), "main");
+
+        git_run(dir.path(), &["checkout", "-q", "-b", "parent-a"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "parent A"],
+        );
+        git_run(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "feature"],
+        );
+        git_run(dir.path(), &["checkout", "-q", "main"]);
+        git_run(dir.path(), &["checkout", "-q", "-b", "parent-b"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "parent B"],
+        );
+        let parent_b_sha = git_rev_parse(dir.path(), "parent-b");
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+        let mut parent_a = Branch::new("parent-a".to_string(), Some(main_sha.clone()));
+        parent_a.branches.push(Branch::new(
+            "feature".to_string(),
+            Some("old-parent-a-tip".to_string()),
+        ));
+        let parent_b = Branch::new("parent-b".to_string(), Some(main_sha.clone()));
+        let mut main_branch = Branch::new("main".to_string(), None);
+        main_branch.branches = vec![parent_a, parent_b];
+        let mut state = State {
+            repos: [(repo.clone(), RepoState::new(main_branch))]
+                .into_iter()
+                .collect(),
+        };
+
+        state
+            .mount(&git_repo, &repo, "feature", Some("parent-b".to_string()))
+            .unwrap();
+        assert_eq!(
+            state.get_tree_branch(&repo, "feature").unwrap().lkg_parent,
+            Some(parent_b_sha)
+        );
+
+        state
+            .mount(&git_repo, &repo, "feature", Some("main".to_string()))
+            .unwrap();
+        assert_eq!(
+            state.get_tree_branch(&repo, "feature").unwrap().lkg_parent,
+            Some(main_sha)
+        );
     }
 
     #[test]
