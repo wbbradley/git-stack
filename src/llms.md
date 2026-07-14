@@ -1,345 +1,172 @@
-# git-stack — agent-targeted reference
+# git-stack agent reference
 
-This document is printed by `git stack llms`. It is meant for LLM/agent
-consumers landing in a repository managed with `git-stack`. Everything an agent
-needs to drive the common
-checkout → commit → `restack` → `pr create` → `sync` loop is here — the mental
-model, every subcommand and its flags, the on-disk state and config files, auth
-resolution, restack/PR/sync semantics, and the gotchas that block commands. No
-[source code](https://github.com/wbbradley/git-stack) reading required.
+`git stack llms` prints this self-contained guide. `git-stack` is the binary;
+git exposes it as `git stack`. The forms are equivalent; this guide uses
+`git stack`.
 
-`git-stack` installs as a `git-stack` binary that git invokes as the `git stack`
-subcommand. Every command below is written `git stack <cmd>`; invoking the
-binary directly as `git-stack <cmd>` is equivalent.
+## Model and normal workflow
 
-## 1. What `git-stack` is
+git-stack records a tree of ordinary git branches rooted at the remote's
+default branch (usually `main`). Trunk is not a stacked branch and cannot have a
+PR. Every other branch has one parent and zero or more children. A branch's own
+work is the commits between it and its parent.
 
-`git-stack` manages **stacked branches**: chains of feature branches where each
-branch builds on the one below it instead of all branching off trunk. You keep
-each logical change small and reviewable, stack the next change on top, and let
-`git-stack` keep the whole tower rebased and its PRs correctly targeted as lower
-branches change.
-
-The stack is a **tree rooted at trunk** (`main`/`master`). Every branch has
-exactly one parent (the branch it is stacked on) and any number of children.
-`git-stack` stores this tree per-repository in a state file — it is metadata
-*about* your branches, layered on top of ordinary git branches and refs. Git
-itself has no notion of the stack; `git-stack` is the bookkeeping that remembers
-"branch `feature-b` is stacked on `feature-a`, which is stacked on `main`."
-
-## 2. Mental model
-
-- **Trunk is the root.** Each repo's tree is rooted at the trunk branch
-  (detected from the remote's default branch, typically `main`). Trunk itself is
-  never a stacked branch and cannot have a PR.
-- **Parent / child.** A branch is *mounted* on a parent. `feature-b` mounted on
-  `feature-a` means `feature-a` is `feature-b`'s parent and `feature-b` is one
-  of `feature-a`'s children. Commits unique to a branch are those between the
-  parent and the branch tip.
-- **LKG parent (last-known-good parent).** Each branch records the SHA/ref of
-  its parent as of the last successful restack. This lets `git-stack` take a
-  fast `git format-patch`/`git am` path: it knows exactly which commits are
-  "yours" (the range parent..branch as of the LKG point) and replays only those
-  onto the parent's new tip, instead of re-deriving the range every time. The
-  LKG parent is refreshed on load and after each successful restack.
-- **StackMethod.** Each branch restacks by one of two methods (serialized in the
-  state file):
-  - `apply_merge` (**default**) — replay your commits onto the parent tip with
-    `git format-patch` + `git am`. Rewrites the branch's history, so restacking
-    force-pushes with lease. Best for solo branches; keeps history linear/clean.
-  - `merge` — pull the parent's changes in with `git merge`. Does not rewrite
-    history, so it is safe for branches shared with others (no force-push). Set
-    this on a branch you share to avoid clobbering collaborators.
-- **Auto-mount.** Most read/navigation commands auto-mount the current branch if
-  it is not yet in the tree — they infer a sensible parent and add it — so you
-  rarely need an explicit `git stack mount`. `status`, `up`, `down`, `log`,
-  `diff`, `note`, `restack`, and `interactive` all auto-mount the branch they
-  operate on.
-
-## 3. Subcommands
-
-`git stack` with no subcommand is `git stack status`.
-
-| Command | What it does |
-|---------|--------------|
-| `git stack status` | Show the stack tree for the current repo (default command). |
-| `git stack interactive` | Launch the interactive TUI for navigating/checking out branches. |
-| `git stack up` | Check out the parent branch (move up the stack). |
-| `git stack down` | Check out the child branch (only when there is exactly one child). |
-| `git stack edit` | Open the state file (or github.yaml with --config) in $EDITOR for manual editing. |
-| `git stack restack` | Rebase the current (or `-b`) branch onto its parent. |
-| `git stack log` | Show the commit log between a branch and its parent. |
-| `git stack note` | Show or edit the free-form note attached to a branch. |
-| `git stack diff` | Diff a branch against its parent. |
-| `git stack checkout <branch_name>` | Create `<branch_name>` as a child of the current branch (or check it out if it exists). |
-| `git stack mount [parent_branch]` | Mount the current branch on `parent_branch` (defaults to trunk); retargets an existing PR's base. |
-| `git stack delete <branch_name>` | Remove a branch from the stack tree (metadata only). |
-| `git stack cleanup` | Remove tree branches missing from git; prune out-of-scope (foreign-author) branches. |
-| `git stack pr create\|view\|sync` | Manage GitHub PRs for the stack (see §7). |
-| `git stack auth login\|status\|logout` | Manage GitHub authentication (see §6). |
-| `git stack cache clear` | Clear the PR cache and seen-SHA set. |
-| `git stack completions <shell>` | Print shell completions (works outside a git repo). |
-| `git stack sync` | Bidirectionally sync local stack state with GitHub PRs (see §8). |
-| `git stack llms` | Print this document (works outside a git repo). |
-
-### Flags, command by command
-
-- **`git stack status`** — `-f`/`--fetch` fetch from the remote before
-  rendering. Renders even with no GitHub token (PR columns are simply omitted).
-- **`git stack interactive`** — no flags. TUI: navigate branches, `o` opens the
-  selected branch's PR in the browser, checkout on selection.
-- **`git stack up`** — no flags. Checks out the parent of the current branch.
-- **`git stack down`** — no flags. Checks out the sole child; errors if a branch
-  has zero or multiple children (ambiguous).
-- **`git stack edit`** — `--config` opens `~/.config/git-stack/github.yaml`; otherwise opens `state.yaml`.
-- **`git stack restack`** — see §5 for semantics.
-  - `-b`/`--branch <name>` — restack this branch instead of the current one.
-  - `-f`/`--fetch` — fetch from the remote first.
-  - `-p`/`--push` — push the branch(es) to the remote after a successful restack.
-  - `-a`/`--ancestors` — recursively restack every ancestor from trunk up.
-  - `-s`/`--squash` — squash all of the branch's commits into one.
-  - `--continue` — resume a restack (any method) interrupted by a conflict (after resolving).
-  - `--abort` — cancel an in-progress restack and restore the original branch state.
-- **`git stack log [branch]`** — no flags. Log of the range parent..branch.
-- **`git stack note [branch]`** — `-e`/`--edit` open the note in `$EDITOR`
-  instead of printing it.
-- **`git stack diff [branch]`** — no flags. `git diff` of parent..branch.
-- **`git stack checkout <branch_name>`** — no flags. Positional branch name.
-- **`git stack mount [parent_branch]`** — no flags. Optional positional parent
-  (defaults to trunk). If the current branch has a PR, its base is retargeted to
-  the new parent.
-- **`git stack delete <branch_name>`** — no flags. Positional branch name.
-  Removes it from the tree only; does not delete the git branch or any PR.
-- **`git stack cleanup`** — remove branches from the tree that no longer exist
-  locally or on the remote, re-mounting their children onto the grandparent. When
-  author filtering is active — which is the **default** (see §6), unless
-  `authors_filter: []` is set — it *also* prunes branches confidently attributed to
-  an author outside the effective filter (the same set `status` hides), prompting
-  for confirmation before persisting (and refusing on a non-interactive terminal).
-  `-n`/`--dry-run` previews without changing anything; `-a`/`--all` cleans every
-  repo tree in the state file — missing-branch removal only, no author prune (so it
-  never needs identity resolution) — and drops invalid repos too.
-- **`git stack pr create|view|sync`** — see §7.
-- **`git stack auth login|status|logout`** — see §6.
-- **`git stack cache clear`** — no flags. Empties the PR cache and seen-SHA set.
-- **`git stack completions <shell>`** — positional shell (`bash`, `zsh`,
-  `fish`, `elvish`, `powershell`).
-- **`git stack sync`** — `--push` push-only, `--pull` pull-only (mutually
-  exclusive; default is both), `-n`/`--dry-run` preview without changing
-  anything. See §8.
-- **`git stack llms`** — no flags. Prints this document.
-
-Global flags (valid on any subcommand): `-v`/`--verbose`, `--benchmark` (print
-git-command timing stats), `--json` (emit those stats as JSON, implies
-`--benchmark`), `--show-all` (bypasses author-filter hiding for this invocation,
-including the default filter-to-your-own-login behavior described in §6).
-
-## 4. State file
-
-Location: `~/.local/state/git-stack/state.yaml` (via the XDG state dir with
-prefix `git-stack`). It is YAML, written with `0600` permissions. `git stack
-edit` opens it in `$EDITOR` for manual repair.
-
-Structure: a top-level map keyed by **canonical repo path**. Each repo's value
-inlines the root `Branch` of that repo's tree (the trunk branch) plus two
-bookkeeping fields:
-
-- Per `Branch`: `name`, `stack_method` (`apply_merge` | `merge`), optional
-  `note`, `lkg_parent` (nullable), optional `pr_number`, and `branches` (the
-  list of child `Branch`es — this is what makes it a tree).
-- Per repo: `seen_remote_shas` (SHAs observed on the remote, used to prove a
-  local branch can be safely pruned) and, when a restack is interrupted by a
-  conflict, `pending_restack` (records the `method` — `am`/`rebase`/`merge`/
-  `squash` — the conflicting branch, its pre-restack SHA, and enough of the
-  original invocation to resume the remaining branches).
-
-Sample `state.yaml`:
-
-```yaml
-/Users/you/src/myrepo:
-  name: main
-  stack_method: apply_merge
-  lkg_parent: null
-  branches:
-    - name: feature-a
-      stack_method: apply_merge
-      lkg_parent: main
-      pr_number: 42
-      branches:
-        - name: feature-b
-          stack_method: apply_merge
-          lkg_parent: feature-a
-          pr_number: 43
-          branches: []
-  seen_remote_shas:
-    - 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b
-```
-
-## 5. Restack semantics
-
-`git stack restack` rebases a branch onto the current tip of its parent so the
-branch contains only its own commits, replayed on top of up-to-date parent work.
-
-- The **working tree must be clean** — restack refuses to run on a dirty tree.
-- `apply_merge` branches (the default) replay commits via `format-patch`/`am`,
-  which rewrites history; after a successful restack the branch is
-  **force-pushed with lease** when `-p` is set. `merge` branches use `git merge`
-  and never force-push.
-- **Conflicts.** On a conflict (in *any* method — `am`, `rebase`, `merge`, or
-  `squash`), restack stops, records a `pending_restack` in the state file, and
-  leaves the tree in a conflicted state. Resolve with `git mergetool` (or
-  standard git conflict resolution), `git add` the resolved files, then run
-  **`git stack restack --continue`** to finish the conflicting branch and resume
-  the remaining branches, or **`git stack restack --abort`** to restore the
-  conflicting branch to its exact pre-restack SHA. `--abort` recovers even if you
-  already ran a bare `git am --abort` / `git rebase --abort`, because the anchor
-  SHA lives in git-stack's own record, not git's transient state.
-- `-afp` is the common "sync the whole stack and push" combo: fetch (`-f`),
-  restack all ancestors from trunk up (`-a`), and push each on success (`-p`).
-- **Squash flow.** `git stack restack -s` squashes the branch's commits into
-  one. Like the other methods, a conflict records a `pending_restack` (with
-  `method: squash`) and stops; `--continue` / `--abort` behave as above.
-
-## 6. Config and authentication
-
-Commands that talk to GitHub (`sync`, `pr create`, `pr view`, `pr sync`, and the
-PR columns in `status`) need a token. Config lives at
-`~/.config/git-stack/github.yaml` (XDG config dir, prefix `git-stack`), written
-`0600`. Fields: `default_token` (a PAT), per-host tokens under `hosts`, and
-`oauth_token` / `oauth_scope` from the device-flow login.
-
-**Token resolution order** (first source that yields a non-empty token wins):
-
-1. `GITHUB_TOKEN` environment variable
-2. `GH_TOKEN` environment variable
-3. `git config --get github.token`
-4. `github.yaml`: host-specific token → `default_token` (PAT) → `oauth_token`
-5. Borrowed [`gh` CLI](https://cli.github.com/) token (`gh auth token`), if
-   you're logged into `gh`
-
-**Auth commands:**
-
-- `git stack auth login` — interactive OAuth **device flow** (recommended):
-  prints a code and URL, you approve in the browser, the token is stored as
-  `oauth_token`.
-- `git stack auth login --pat` — skip the browser menu and paste a personal
-  access token (stored as `default_token`).
-- `git stack auth status` — show which source the active token comes from (no
-  token value is printed).
-- `git stack auth logout` — clear git-stack's stored tokens. `--oauth` clears
-  only the OAuth token; `--pat` clears only `default_token`. With neither, both
-  are cleared. (This does not touch env vars, git config, or `gh`.)
-
-Graceful degradation: with **no** resolvable token, read-only commands still
-render the tree (just without PR numbers/state) — *provided* the effective author
-filter doesn't need your login. That holds when the repo has no GitHub remote, or
-when `authors_filter: []` / `--show-all` is in effect. With the **default** filter
-in a GitHub repo and no cached login, resolving "your own login" fails, so
-`status`/`interactive`/`cleanup`/`sync` **error with actionable guidance** instead
-(see the `authors_filter` note just below).
-
-`authors_filter` (list of GitHub logins; the old key `display_authors` still works
-as a deprecated alias) in `github.yaml` is a **three-state** knob controlling which
-branches `status`/`interactive` show (matching is case-insensitive):
-
-- **key absent (the default)** → filter to *your own* GitHub login, i.e. behaves as
-  `authors_filter: [<you>]`. This is derived, not written to disk: git-stack looks
-  up your login via `GET /user` and caches it host-keyed in the redb state store
-  (`~/.local/state/git-stack/pr_cache.redb`), refreshing on `auth login` and `sync`.
-  If the filter is unset **and** no login is cached **and** one can't be fetched now
-  (offline + token-less), the command **errors with actionable guidance** rather than
-  guessing — it never silently shows or hides everything.
-- **`authors_filter: []`** → show everyone (filtering off; never needs your login).
-- **`authors_filter: [a, b]`** → filter to exactly those authors.
-
-When filtering is active, branches whose PR author isn't listed are hidden, except
-the current branch and its ancestor chain to trunk, and any branch whose author
-can't be determined at all. A hidden branch's visible descendants reparent to
-the nearest visible ancestor for display purposes only. `--show-all` disables
-this for one invocation. The same effective filter also drives `cleanup` pruning
-and `sync` remote-only-branch injection (see §5, §8).
-
-Author resolution for hiding isn't limited to open PRs: it also checks
-closed/merged PRs (via the same on-disk watermark cache `sync` uses), and, for
-branches with no PR match by exact branch name, falls back to asking GitHub
-who authored the branch's tip commit. Only a branch whose author truly can't
-be resolved by any of these (e.g. unpushed local work) stays protected as
-"no PR yet."
-
-## 7. PR workflow
-
-- **`git stack pr create`** creates a GitHub PR for the current branch (or `-b`)
-  using its **git-stack parent as the base branch** (not trunk), so the PR shows
-  only that branch's own changes. It recursively **ensures every ancestor PR
-  exists first**, pushing branches as needed, so the whole stack is represented.
-  The title defaults to the branch's first commit message.
-  - `-t`/`--title <title>` — override the title.
-  - `-m`/`--body <body>` — set the PR body.
-  - `--draft` — create as a draft.
-  - `--web` — open the PR in the browser after creating.
-  - You **cannot** create a PR for trunk.
-- **`git stack pr view [branch]`** — open the branch's PR in the browser.
-- **`git stack pr sync`** — retarget PR **bases** to match the current git-stack
-  parents, processing **bottom-up** so bases are always valid. `-a`/`--all`
-  syncs every PR in the stack (default: just the current branch);
-  `-n`/`--dry-run` previews without changing anything. This only fixes PR bases;
-  it does not push commits (use `restack -p` or `sync` for that).
-
-## 8. Sync semantics
-
-`git stack sync` reconciles local stack state with GitHub PRs using a
-Terraform-style staged pipeline: **read** (gather local + remote state) →
-**model** (build the target state) → **diff** (compute per-side changes) →
-**validate** (ensure changes are non-lossy) → **apply** (execute only if safe).
-It fetches with `--tags -f --prune` and never discards unpushed work.
-
-- **Default: bidirectional** — a weak push followed by a weak pull. "Weak" means
-  it only makes safe, non-lossy updates.
-- `--push` — push-only (local → GitHub). `--pull` — pull-only (GitHub → local).
-  The two are mutually exclusive.
-- `-n`/`--dry-run` — run read→model→diff→validate and print the plan without
-  applying.
-- **Auto-prune.** Sync automatically removes local branches that have been
-  **merged** or that merely **duplicate the remote** branch, using
-  `seen_remote_shas` to confirm no unpushed work would be lost.
-- **Author-based discovery.** On every pull-direction sync, git-stack enumerates
-  the open PRs authored by the effective `authors_filter` (one GitHub GraphQL
-  query; see §6) and folds them into the pull pipeline, so running `sync` from a
-  trunk-only tree reconstructs and mounts your stacks (PR base chains bridge
-  intermediate branches). Skipped under `--push` and when `authors_filter: []`
-  ("everyone") is set; best-effort — a discovery failure falls back to the
-  stack-scoped fetch and never aborts the sync.
-
-## 9. Worked walkthrough
-
-Start on trunk (`main`) and build a two-branch stack:
+Typical loop:
 
 ```bash
-git stack checkout feature-a     # create feature-a as a child of main
-# ...edit, git add, git commit...
-
-git stack checkout feature-b     # create feature-b as a child of feature-a
-# ...edit, git add, git commit...
-
-git stack                        # inspect the tree
-git stack restack -afp           # fetch, restack the whole stack from trunk, push
-git stack pr create              # PR for feature-b, based on feature-a,
-                                 # ensuring feature-a's PR (based on main) exists
-git stack sync                   # keep local state and PRs in agreement
+git stack checkout feature-a   # child of the current branch
+# edit; git add; git commit
+git stack restack -afp         # fetch, restack ancestors from trunk, push
+git stack pr create            # PR based on the git-stack parent
+git stack sync                 # reconcile local state and GitHub
 ```
 
-A `git stack status` render for this stack looks roughly like:
+Each branch has a restack method:
 
-```
-main
-└── feature-a  #42
-    └── feature-b  #43  ← current
-```
+- `apply_merge` (default): replay branch-only patches onto the new parent with
+  `format-patch`/`am`. History is rewritten; `-p` force-pushes with lease. Best
+  for solo work and linear history.
+- `merge`: merge the parent into the branch. It does not rewrite history or
+  force-push, so use it for shared branches.
 
-and the resulting `state.yaml` entry:
+Each branch also records an LKG (last-known-good) parent ref/SHA. Patch replay
+uses the parent/branch symmetric difference and excludes the old LKG parent,
+which drops upstream and superseded-parent commits while retaining the branch's
+own work. LKGs refresh on load and after successful restacks.
+
+Most commands that operate on the current branch (`status`, `interactive`,
+`up`, `down`, `log`, `note`, `diff`, and `restack`) auto-mount it when absent by
+inferring a parent. Use `mount` to choose a parent explicitly.
+
+## Complete command reference
+
+`git stack` with no subcommand means `git stack status`.
+
+| Command | Flags and behavior |
+|---|---|
+| `git stack status` | Render the tree. `-f`/`--fetch` fetches first. Without usable GitHub data, PR columns may be omitted; see Authentication. |
+| `git stack interactive` | Open the navigation/checkout TUI. Arrow keys navigate, Enter checks out, `o` opens the selected PR, `r` refreshes local state in place, and `q`/Esc quits. |
+| `git stack up` | Check out the current branch's parent. |
+| `git stack down` | Check out its child; errors unless it has exactly one child. |
+| `git stack edit` | Open `state.yaml` in `$EDITOR`; `--config` opens `github.yaml`. |
+| `git stack restack` | Restack the current branch. `-b`/`--branch <name>` selects another branch; `-f`/`--fetch` fetches first; `-p`/`--push` pushes successful branches; `-a`/`--ancestors` processes ancestors from trunk upward; `-s`/`--squash` makes one commit. Recovery flags: `--continue`, `--skip`, `--abort`; see Restack. |
+| `git stack log [branch]` | Show the parent..branch commit log (current branch by default). |
+| `git stack note [branch]` | Print the branch note; `-e`/`--edit` opens it in `$EDITOR`. |
+| `git stack diff [branch]` | Show the parent..branch diff (current branch by default). |
+| `git stack checkout <branch>` | If absent, create the branch as a child of the current branch; otherwise check it out. |
+| `git stack mount [parent]` | Mount the current branch on `parent` (trunk by default). If it has a PR, retarget the PR base. This changes metadata, not git history. |
+| `git stack delete <branch>` | Remove only stack metadata; do not delete the git branch or PR. There is no `unmount` command. |
+| `git stack cleanup` | Remove tree branches missing locally and remotely, remounting children on the grandparent; with author filtering, also confirm-prune out-of-scope branches (and refuse that prune non-interactively). `-n`/`--dry-run` previews. `-a`/`--all` cleans every stored repo (missing branches and invalid repos only; no author prune). |
+| `git stack pr create` | Create the current branch's PR. `-b`/`--branch <name>`, `-t`/`--title <title>`, `-m`/`--body <body>`, `--draft`, `--web`. |
+| `git stack pr view [branch]` | Open the branch PR in a browser. |
+| `git stack pr sync` | Retarget PR bases to stack parents, bottom-up. `-a`/`--all` handles the whole stack; `-n`/`--dry-run` previews. Does not push commits. |
+| `git stack auth login` | OAuth device flow. `--pat` instead prompts for a personal access token. |
+| `git stack auth status` | Show the active token source without printing the token. |
+| `git stack auth logout` | Clear stored OAuth and PAT tokens; `--oauth` or `--pat` limits what is cleared. Does not change env, git config, or `gh`. |
+| `git stack cache clear` | Clear the PR cache and seen-SHA set. |
+| `git stack completions <shell>` | Print completions for `bash`, `zsh`, `fish`, `elvish`, or `powershell`; works outside a repo. |
+| `git stack sync` | Bidirectional sync by default. `--push` is push-only; `--pull` is pull-only (mutually exclusive); `-n`/`--dry-run` plans without applying. |
+| `git stack llms` | Print this guide; works outside a repo. |
+
+Global flags: `-v`/`--verbose`; `--benchmark` for git-command timings;
+`--json` for JSON timings (implies `--benchmark`); `--show-all` to bypass
+author filtering for this invocation.
+
+## Restack and conflict recovery
+
+Restack requires a clean working tree. `-afp` is the common whole-stack form:
+fetch, process ancestors from trunk upward, then push. `apply_merge` pushes use
+force-with-lease; `merge` pushes do not. An already-correctly-stacked branch is
+a no-op (including an already-single-commit branch under `--squash`), except
+that `-p` pushes it if its remote is out of sync.
+
+On an `am`, rebase, merge, or squash conflict, git-stack records
+`pending_restack` and pauses. Resolve normally, `git add` the result, then:
+
+- `git stack restack --continue` finishes the branch and resumes the saved plan.
+  For `am`, it automatically skips a patch that resolved to empty.
+- `git stack restack --skip` explicitly skips the current `am`/rebase patch and
+  resumes. It is invalid for merge/squash conflicts.
+- `git stack restack --abort` restores the branch's exact pre-restack SHA.
+
+Continue/skip also recover if the underlying `git am` or `git rebase` was
+finished by hand. Abort still works after a bare `git am --abort` or
+`git rebase --abort`. While recovery is pending, all other commands are blocked.
+
+## PRs and sync
+
+`pr create` bases a PR on its git-stack parent, not trunk, so it contains only
+that branch's changes. It recursively ensures ancestor PRs exist, pushing as
+needed. The default title is the first commit message. Trunk cannot have a PR.
+
+`sync` runs a staged read -> model -> diff -> validate -> apply pipeline and
+fetches with tags, force-update, and prune. It never discards unpushed work.
+Default sync is a weak (safe, non-lossy) push followed by a weak pull. It also:
+
+- removes local branches that are merged or duplicate their remote, using
+  `seen_remote_shas` to prove pruning is safe;
+- on pull-direction runs, discovers open PRs by effective `authors_filter` and
+  reconstructs remote stacks from their base chains, even from a trunk-only
+  tree. Discovery is skipped for `--push` and `authors_filter: []`; failures
+  fall back to stack-scoped data without aborting;
+- best-effort caches discovered open PRs, so later offline status/TUI renders
+  can retain their badges and URLs.
+
+## Authentication and author filtering
+
+GitHub commands and PR display use the first non-empty token from:
+
+1. `GITHUB_TOKEN`
+2. `GH_TOKEN`
+3. `git config --get github.token`
+4. `github.yaml`: host token, then `default_token` (PAT), then `oauth_token`
+5. `gh auth token`
+
+Config is `~/.config/git-stack/github.yaml` (mode `0600`). Besides tokens, it
+supports `authors_filter` (the deprecated `display_authors` alias is migrated on
+the next auth write):
 
 ```yaml
-/Users/you/src/myrepo:
+default_token: <PAT>
+hosts: {github.example.com: <host-PAT>}
+oauth_token: <device-flow-token>
+oauth_scope: repo
+authors_filter: [octocat]
+```
+
+All fields are optional.
+
+- absent (default): filter to your GitHub login, obtained from `/user` and
+  cached per host;
+- `authors_filter: []`: show everyone and require no login resolution;
+- `authors_filter: [a, b]`: show those logins (case-insensitive).
+
+Filtering affects status/TUI display, cleanup's confirmed author pruning, and
+sync's remote-branch injection/discovery. The current branch, its ancestors,
+trunk, and branches whose author cannot be resolved stay visible. Hidden
+branches' visible descendants reparent to the nearest visible ancestor for
+display only. Author lookup considers open and closed/merged PRs, then the tip
+commit author. `--show-all` disables filtering only for that invocation.
+
+With no token, non-GitHub operations still work and cached PR data may render.
+However, when the filter is absent in a GitHub repo and the user's login is not
+cached, `status`, `interactive`, `cleanup`, and `sync` must resolve that login;
+if offline/tokenless they fail with guidance rather than guessing. Authenticate,
+set `authors_filter` explicitly, or use `authors_filter: []`/`--show-all`.
+
+## Files and invariants
+
+State is `~/.local/state/git-stack/state.yaml` (XDG state dir, mode `0600`), a
+map keyed by canonical repo path. Each repo value contains the trunk `Branch`
+and `seen_remote_shas`; it temporarily contains `pending_restack` during
+recovery. A branch has `name`, `stack_method` (`apply_merge` or `merge`),
+nullable `lkg_parent`, child `branches`, and optional `note` and `pr_number`.
+`pending_restack` records `method` (`am`, `rebase`, `merge`, or `squash`),
+`branch_name`, `parent`, `original_sha`, optional squash temp/message fields,
+and `resume` with the original target/return branches and flags.
+
+```yaml
+/Users/you/src/repo:
   name: main
   stack_method: apply_merge
   lkg_parent: null
@@ -348,39 +175,11 @@ and the resulting `state.yaml` entry:
       stack_method: apply_merge
       lkg_parent: main
       pr_number: 42
-      branches:
-        - name: feature-b
-          stack_method: apply_merge
-          lkg_parent: feature-a
-          pr_number: 43
-          branches: []
+      branches: []
+  seen_remote_shas: [1a2b3c4d5e6f]
 ```
 
-Typical daily loop:
-
-1. `git stack checkout <name>` to start a new branch on top of the current one.
-2. Make commits normally with `git`.
-3. `git stack restack` (or `-afp`) after the parent changes, to stay rebased.
-4. `git stack pr create` once the branch is ready for review.
-5. `git stack sync` to keep local state and GitHub PR bases consistent.
-
-## 10. Gotchas
-
-- **Dirty tree blocks restack.** Commit or stash first.
-- **A pending restack blocks everything.** While `pending_restack` is set (after
-  a conflict in any restack method), only `git stack restack --continue` and
-  `git stack restack --abort` run; every other command errors until the restack
-  is resolved or aborted.
-- **Concurrent runs are serialized.** A repo-scoped advisory lock ensures only
-  one `git stack` operation touches a repo at a time; a second invocation waits
-  for the first.
-- **Case-insensitive remote-ref collisions** (e.g. `Feature` vs `feature` on a
-  case-insensitive filesystem) are detected and recovered from during fetch.
-- **No token ≠ broken.** Without a GitHub token, read-only commands still work;
-  only PR-related output/actions are unavailable.
-- **Deletion is `git stack delete`.** To remove a branch from the tree, use
-  `git stack delete <branch_name>`. There is no `unmount` subcommand — ignore
-  any stale message that mentions one.
-- **`mount`/`delete` are metadata-only.** They change the git-stack tree, not
-  your git branches, history, or (for `delete`) any open PR. `mount` will,
-  however, retarget an existing PR's base to the new parent.
+`git stack edit` permits manual repair. PR/login caches live in
+`~/.local/state/git-stack/pr_cache.redb`. Repo operations use an advisory lock,
+so concurrent invocations serialize. Fetch detects and recovers from
+case-insensitive remote-ref collisions.
