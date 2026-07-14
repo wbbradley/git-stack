@@ -1687,6 +1687,10 @@ fn restack(
         squash,
     };
 
+    // Read once for this run. Conflict recovery re-enters `restack`, so resumed plans pick up the
+    // same restack-only push configuration without storing it in pending state.
+    let push_no_verify = push && github::restack_push_no_verify();
+
     // Track what changes occurred during restack (branch_name, status)
     let mut branch_results: Vec<(String, String)> = Vec::new();
 
@@ -1785,7 +1789,7 @@ fn restack(
                     && !git_repo
                         .shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
                 {
-                    git_push(git_repo, &branch.name)?;
+                    restack_push(git_repo, &branch.name, true, push_no_verify)?;
                     pushed_branches.push(branch.name.clone());
                     status = "no changes, pushed".to_string();
                 }
@@ -1794,7 +1798,7 @@ fn restack(
             }
             squash_branch(git_repo, &mut state, repo, &branch, &parent, resume.clone())?;
             let status = if push {
-                git_push(git_repo, &branch.name)?;
+                restack_push(git_repo, &branch.name, true, push_no_verify)?;
                 pushed_branches.push(branch.name.clone());
                 "squashed, pushed"
             } else {
@@ -1821,18 +1825,12 @@ fn restack(
             if push
                 && !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch.name), &branch.name)
             {
-                let refspec = format!("{branch_name}:{branch_name}", branch_name = branch.name);
-                let mut args = vec!["push", "-u"];
-                if matches!(branch.stack_method, StackMethod::ApplyMerge) {
-                    tracing::debug!(
-                        "Force-pushing (with lease) '{}' to {DEFAULT_REMOTE}...",
-                        branch.name
-                    );
-                    args.push("--force-with-lease");
-                }
-                args.push(DEFAULT_REMOTE);
-                args.push(&refspec);
-                run_git(&args)?;
+                restack_push(
+                    git_repo,
+                    &branch.name,
+                    matches!(branch.stack_method, StackMethod::ApplyMerge),
+                    push_no_verify,
+                )?;
                 pushed_branches.push(branch.name.clone());
                 status = "no changes, pushed".to_string();
             }
@@ -1896,7 +1894,7 @@ fn restack(
                             );
                         }
                         let status = if push {
-                            git_push(git_repo, &branch.name)?;
+                            restack_push(git_repo, &branch.name, true, push_no_verify)?;
                             pushed_branches.push(branch.name.clone());
                             "restacked, pushed"
                         } else {
@@ -1924,7 +1922,7 @@ fn restack(
                         );
                     }
                     let status = if push {
-                        git_push(git_repo, &branch.name)?;
+                        restack_push(git_repo, &branch.name, true, push_no_verify)?;
                         pushed_branches.push(branch.name.clone());
                         "restacked, pushed"
                     } else {
@@ -2187,15 +2185,33 @@ fn collect_branches_with_depth(
     result
 }
 
-fn git_push(git_repo: &GitRepo, branch: &str) -> Result<()> {
+fn restack_push_args(branch: &str, force_with_lease: bool, no_verify: bool) -> Vec<String> {
+    let mut args = vec!["push".to_string(), "-u".to_string()];
+    if no_verify {
+        args.push("--no-verify".to_string());
+    }
+    if force_with_lease {
+        args.push("--force-with-lease".to_string());
+    }
+    args.push(DEFAULT_REMOTE.to_string());
+    args.push(format!("{branch}:{branch}"));
+    args
+}
+
+/// Push a restacked branch when its remote differs, preserving the restack path's force policy.
+fn restack_push(
+    git_repo: &GitRepo,
+    branch: &str,
+    force_with_lease: bool,
+    no_verify: bool,
+) -> Result<()> {
     if !git_repo.shas_match(&format!("{DEFAULT_REMOTE}/{}", branch), branch) {
-        run_git(&[
-            "push",
-            "-u",
-            "--force-with-lease",
-            DEFAULT_REMOTE,
-            &format!("{}:{}", branch, branch),
-        ])?;
+        if force_with_lease {
+            tracing::debug!("Force-pushing (with lease) '{branch}' to {DEFAULT_REMOTE}...");
+        }
+        let args = restack_push_args(branch, force_with_lease, no_verify);
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_git(&args)?;
     }
     Ok(())
 }
@@ -2701,6 +2717,51 @@ mod tests {
             pr_number: None,
             branches,
         }
+    }
+
+    #[test]
+    fn restack_push_args_preserve_default_force_push() {
+        assert_eq!(
+            restack_push_args("feature", true, false),
+            [
+                "push",
+                "-u",
+                "--force-with-lease",
+                "origin",
+                "feature:feature"
+            ]
+        );
+    }
+
+    #[test]
+    fn restack_push_args_add_no_verify_to_force_push() {
+        assert_eq!(
+            restack_push_args("feature", true, true),
+            [
+                "push",
+                "-u",
+                "--no-verify",
+                "--force-with-lease",
+                "origin",
+                "feature:feature"
+            ]
+        );
+    }
+
+    #[test]
+    fn restack_push_args_preserve_non_force_merge_push() {
+        assert_eq!(
+            restack_push_args("feature", false, false),
+            ["push", "-u", "origin", "feature:feature"]
+        );
+    }
+
+    #[test]
+    fn restack_push_args_add_no_verify_without_forcing_merge_push() {
+        assert_eq!(
+            restack_push_args("feature", false, true),
+            ["push", "-u", "--no-verify", "origin", "feature:feature"]
+        );
     }
 
     #[test]

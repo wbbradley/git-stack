@@ -1205,6 +1205,14 @@ pub fn configured_authors_filter() -> ConfiguredAuthorsFilter {
     }
 }
 
+/// Whether pushes issued by `git stack restack --push` should bypass Git's pre-push hook.
+/// Missing config files and missing keys retain Git's default hook behavior.
+pub fn restack_push_no_verify() -> bool {
+    load_github_config_file()
+        .map(|config| config.restack_push_no_verify)
+        .unwrap_or(false)
+}
+
 /// Pure resolution core for the three-state author filter, with all identity inputs injected so
 /// the "can't resolve → error" path is unit-testable with no live API.
 ///
@@ -1487,6 +1495,9 @@ struct GitHubConfigFile {
         skip_serializing_if = "Option::is_none"
     )]
     authors_filter: Option<Vec<String>>,
+    /// Add `--no-verify` to pushes performed by `git stack restack --push`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restack_push_no_verify: bool,
     /// OAuth device-flow token (distinct from `default_token`, which holds a PAT).
     #[serde(skip_serializing_if = "Option::is_none")]
     oauth_token: Option<String>,
@@ -1909,6 +1920,32 @@ mod tests {
             !yaml.contains("authors_filter"),
             "None authors_filter must not emit a key, got:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn restack_push_no_verify_defaults_to_false_when_absent() {
+        let config: GitHubConfigFile = serde_yaml::from_str("default_token: tok\n").unwrap();
+        assert!(!config.restack_push_no_verify);
+    }
+
+    #[test]
+    fn restack_push_no_verify_deserializes_and_survives_serialization() {
+        let config: GitHubConfigFile =
+            serde_yaml::from_str("restack_push_no_verify: true\n").unwrap();
+        assert!(config.restack_push_no_verify);
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("restack_push_no_verify: true"));
+    }
+
+    #[test]
+    fn false_restack_push_no_verify_is_not_materialized_on_auth_writeback() {
+        let config = GitHubConfigFile {
+            default_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("restack_push_no_verify"));
     }
 
     #[test]

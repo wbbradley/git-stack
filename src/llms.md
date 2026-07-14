@@ -80,6 +80,12 @@ force-with-lease; `merge` pushes do not. An already-correctly-stacked branch is
 a no-op (including an already-single-commit branch under `--squash`), except
 that `-p` pushes it if its remote is out of sync.
 
+`github.yaml` supports `restack_push_no_verify: true` to add Git's
+`--no-verify` option to every push actually emitted by `restack -p`, bypassing
+the local pre-push hook. It defaults to `false`, does not cause otherwise
+unneeded pushes, and does not affect pushes from `sync`, `pr create`, or other
+commands.
+
 On an `am`, rebase, merge, or squash conflict, git-stack records
 `pending_restack` and pauses. Resolve normally, `git add` the result, then:
 
@@ -132,6 +138,7 @@ hosts: {github.example.com: <host-PAT>}
 oauth_token: <device-flow-token>
 oauth_scope: repo
 authors_filter: [octocat]
+restack_push_no_verify: false
 ```
 
 All fields are optional.

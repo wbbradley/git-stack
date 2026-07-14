@@ -46,6 +46,16 @@ The `-afp` flags:
 - `-f` / `--fetch`: fetch updates from remote first
 - `-p` / `--push`: push branch updates to remote on success
 
+By default, restack pushes run Git's pre-push hook. To bypass that hook for every push emitted by
+`git stack restack --push`, set this opt-in key in `~/.config/git-stack/github.yaml`:
+
+```yaml
+restack_push_no_verify: true
+```
+
+The setting defaults to `false` and applies only to restack pushes; `sync`, `pr create`, and other
+commands keep their existing hook behavior.
+
 ### Diff Against Parent
 
 ```bash
