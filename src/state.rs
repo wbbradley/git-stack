@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, Ref, RefCell},
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     default, fs,
-    io::IsTerminal,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
@@ -1101,8 +1101,21 @@ impl State {
     }
 
     pub(crate) fn edit_github_config(&self) -> Result<()> {
-        let _ = launch_editor(&crate::github::ensure_github_config_path()?)?;
-        Ok(())
+        let path = crate::github::ensure_github_config_path()?;
+        edit_until_valid(
+            &path,
+            |path| launch_editor(path).map(|_| ()),
+            crate::github::validate_github_config,
+            || {
+                print!("Press ENTER to edit again...");
+                io::stdout().flush()?;
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input)? == 0 {
+                    bail!("standard input closed while waiting to re-edit the GitHub config");
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Try to auto-mount the current branch if it's not in the tree.
@@ -1431,6 +1444,27 @@ fn launch_editor(path: &Path) -> Result<std::process::ExitStatus> {
     Ok(Command::new(editor).arg(path).status()?)
 }
 
+fn edit_until_valid(
+    path: &Path,
+    mut edit: impl FnMut(&Path) -> Result<()>,
+    validate: impl Fn(&Path) -> Result<()>,
+    mut wait_to_retry: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    loop {
+        edit(path)?;
+        match validate(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "The GitHub config file at {} is erroneous:\n{error:#}",
+                    path.display()
+                );
+                wait_to_retry()?;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,6 +1502,39 @@ mod tests {
         assert_eq!(repo_state.tree.name, "main");
         assert_eq!(repo_state.tree.stack_method, StackMethod::ApplyMerge);
         assert_eq!(repo_state.tree.pr_number, None);
+    }
+
+    #[test]
+    fn config_editor_reopens_until_validation_succeeds() {
+        let path = Path::new("github.yaml");
+        let edit_count = Cell::new(0);
+        let validation_count = Cell::new(0);
+        let wait_count = Cell::new(0);
+
+        edit_until_valid(
+            path,
+            |_| {
+                edit_count.set(edit_count.get() + 1);
+                Ok(())
+            },
+            |_| {
+                let attempt = validation_count.get() + 1;
+                validation_count.set(attempt);
+                if attempt < 3 {
+                    bail!("bad yaml on attempt {attempt}");
+                }
+                Ok(())
+            },
+            || {
+                wait_count.set(wait_count.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(edit_count.get(), 3);
+        assert_eq!(validation_count.get(), 3);
+        assert_eq!(wait_count.get(), 2);
     }
 
     fn sample_resume() -> RestackResume {

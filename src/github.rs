@@ -6,7 +6,7 @@
 use std::{
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -1476,6 +1476,7 @@ fn find_github_config(host: &str) -> Result<String, GitHubError> {
 
 /// GitHub config file structure
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct GitHubConfigFile {
     default_token: Option<String>,
     hosts: Option<std::collections::HashMap<String, String>>,
@@ -1521,6 +1522,20 @@ pub fn ensure_github_config_path() -> Result<PathBuf> {
     base_dirs
         .place_config_file("github.yaml")
         .context("Failed to determine config file path")
+}
+
+/// Validate an edited GitHub config while preserving serde_yaml's location and schema details in
+/// the returned error.
+pub(crate) fn validate_github_config(path: &Path) -> Result<()> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading GitHub config file {}", path.display()))?;
+    // The normal loader treats an empty file like an absent config, with every setting defaulted.
+    if contents.trim().is_empty() {
+        return Ok(());
+    }
+    serde_yaml::from_str::<GitHubConfigFile>(&contents)
+        .with_context(|| format!("parsing GitHub config file {}", path.display()))?;
+    Ok(())
 }
 
 /// Save GitHub token to config file
@@ -1869,6 +1884,14 @@ mod tests {
     fn authors_filter_alias_deserializes() {
         let config: GitHubConfigFile = serde_yaml::from_str("display_authors:\n- x\n").unwrap();
         assert_eq!(config.authors_filter, Some(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected_with_expected_keys() {
+        let error = serde_yaml::from_str::<GitHubConfigFile>("authors: [x]\n").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown field `authors`"), "{message}");
+        assert!(message.contains("authors_filter"), "{message}");
     }
 
     #[test]

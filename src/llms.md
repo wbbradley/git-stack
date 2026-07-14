@@ -48,7 +48,7 @@ inferring a parent. Use `mount` to choose a parent explicitly.
 | `git stack interactive` | Open the navigation/checkout TUI. Arrow keys navigate, Enter checks out, `o` opens the selected PR, `r` refreshes local state in place, and `q`/Esc quits. |
 | `git stack up` | Check out the current branch's parent. |
 | `git stack down` | Check out its child; errors unless it has exactly one child. |
-| `git stack edit` | Open `state.yaml` in `$EDITOR`; `--config` opens `github.yaml`. |
+| `git stack edit` | Open `state.yaml` in `$EDITOR`; `--config` opens `github.yaml`, validates it after each edit, and reopens it after errors. |
 | `git stack restack` | Restack the current branch. `-b`/`--branch <name>` selects another branch; `-f`/`--fetch` fetches first; `-p`/`--push` pushes successful branches; `-a`/`--ancestors` processes ancestors from trunk upward; `-s`/`--squash` makes one commit. Recovery flags: `--continue`, `--skip`, `--abort`; see Restack. |
 | `git stack log [branch]` | Show the parent..branch commit log (current branch by default). |
 | `git stack note [branch]` | Print the branch note; `-e`/`--edit` opens it in `$EDITOR`. |
