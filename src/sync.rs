@@ -2330,6 +2330,7 @@ mod tests {
         let _state_home = redirect_sync_test_state_home();
         let dir = tempfile::tempdir().unwrap();
         init_sync_test_repo(dir.path());
+        let stale_main = test_git_output(dir.path(), &["rev-parse", "main"]);
 
         test_git(dir.path(), &["checkout", "-q", "-b", "parent"]);
         commit_test_file(dir.path(), "parent-one.txt", "one\n", "parent work one");
@@ -2346,6 +2347,16 @@ mod tests {
         commit_test_file(dir.path(), "main.txt", "advanced\n", "advance main");
         test_git(dir.path(), &["merge", "--squash", "parent"]);
         test_git(dir.path(), &["commit", "-q", "-m", "squash parent work"]);
+        let updated_remote_main = test_git_output(dir.path(), &["rev-parse", "main"]);
+        test_git(
+            dir.path(),
+            &[
+                "update-ref",
+                "refs/remotes/origin/main",
+                &updated_remote_main,
+            ],
+        );
+        test_git(dir.path(), &["reset", "--hard", "-q", &stale_main]);
 
         let git_repo =
             GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
@@ -2365,6 +2376,11 @@ mod tests {
 
         unmount_branch_from_tree(&git_repo, &mut state, &repo, "parent", "main").unwrap();
 
+        // The next command eagerly refreshes LKGs before restack fetches/advances local main.
+        // Local main is a valid ancestor of the trusted old-parent boundary, so refresh must not
+        // move the boundary backward to stale main.
+        state.refresh_lkgs(&git_repo, &repo).unwrap();
+
         let child = state.get_tree_branch(&repo, "child").unwrap();
         assert_eq!(child.lkg_parent.as_deref(), Some(old_parent_tip.as_str()));
         assert_eq!(
@@ -2373,24 +2389,27 @@ mod tests {
         );
 
         let unbounded_series = git_repo
-            .restack_patch_series("main", "child", None)
+            .restack_patch_series("origin/main", "child", None)
             .unwrap()
             .expect("the unbounded series should reproduce the old-parent replay bug");
         assert!(unbounded_series.contains("parent work one"));
         assert!(unbounded_series.contains("parent work two"));
 
         let series = git_repo
-            .restack_patch_series("main", "child", child.lkg_parent.as_deref())
+            .restack_patch_series("origin/main", "child", child.lkg_parent.as_deref())
             .unwrap()
             .expect("child work should remain to replay");
         assert!(series.contains("child work"));
         assert!(!series.contains("parent work one"));
         assert!(!series.contains("parent work two"));
 
-        test_git(dir.path(), &["checkout", "-q", "-B", "child", "main"]);
+        test_git(
+            dir.path(),
+            &["checkout", "-q", "-B", "child", "origin/main"],
+        );
         apply_patch_series(dir.path(), &series);
         assert_eq!(
-            test_git_output(dir.path(), &["log", "--format=%s", "main..child"]),
+            test_git_output(dir.path(), &["log", "--format=%s", "origin/main..child"]),
             "child work"
         );
         assert_eq!(

@@ -130,3 +130,73 @@ For each natural case, capture:
 
 Acceptance requires both cases to show no redundant child mount, an unchanged trusted child LKG
 after sync, and a restack containing only child work.
+
+### Failed observation: eager refresh moved the preserved LKG backward
+
+On 2026-07-14, the observation build failed on a second real parent removal in
+`/Users/wbbradley/src/langchainplus`. This case does not count toward the two required successful
+observations. It used the installed build above from source
+`5f742d93798a33402ad942345b302da3b58141ca` and these commands:
+
+```text
+git stack sync
+git stack restack -afp
+git stack restack --abort
+# Manual recovery after the abort left the branch at trunk:
+git reflog
+git checkout -B wbbradley/context-hub-webhook-cap 915e26d052
+```
+
+Before the parent merged, the relevant physical history and recorded replay boundary were:
+
+```text
+main 3bdd14cdce36d78977a3013d4b81659aa0511217
+  wbbradley/webhookdelivery-context-hub
+    9973011bf50059803972e3e16a6f104c2ef983ae
+    f111b3b39baf3bcae582234ade4caf230638f848
+      wbbradley/context-hub-webhook-cap
+        915e26d052537c46ed76454a05ea608206c4ada4
+        lkg_parent: f111b3b39baf3bcae582234ade4caf230638f848
+```
+
+PR `#30299` combined the two parent commits into squash commit
+`6b4b3f43b18aa17a75344e4dbe1a8c43dd9f2edb`. After sync removed the old parent refs, the intended
+topology was `main <- wbbradley/context-hub-webhook-cap` with the child's LKG still at `f111b3b39b`.
+The redundant child mount was correctly absent, but the next command's eager LKG refresh selected
+stale local `main` and changed the child's LKG to
+`3bdd14cdce36d78977a3013d4b81659aa0511217`. Because that SHA is also an ancestor of the removed
+parent, the child remained a valid descendant and the old refresh logic unconditionally replaced
+the newer replay boundary. `git stack log` consequently classified both old parent commits and the
+child commit as child work.
+
+The surviving reflogs record the failed restack and recovery exactly:
+
+```text
+31ee80f797343a66c793f8c78474c04c9c9fa522 origin/main@{2026-07-14 19:52:56 -0600} fetch --tags -f --prune origin: fast-forward
+31ee80f797343a66c793f8c78474c04c9c9fa522 wbbradley/context-hub-webhook-cap@{2026-07-14 19:53:10 -0600} branch: Reset to main
+31ee80f797343a66c793f8c78474c04c9c9fa522 HEAD@{2026-07-14 19:53:18 -0600} am --abort
+915e26d052537c46ed76454a05ea608206c4ada4 HEAD@{2026-07-14 19:53:18 -0600} checkout: moving from 915e26d052537c46ed76454a05ea608206c4ada4 to wbbradley/context-hub-webhook-cap
+915e26d052537c46ed76454a05ea608206c4ada4 wbbradley/context-hub-webhook-cap@{2026-07-14 19:53:18 -0600} branch: Reset to HEAD
+```
+
+The branch ref was manually recovered to `915e26d052`; its current metadata still records the
+regressed LKG `3bdd14cdce`. The exact sync plan text and restack/abort stdout were not preserved, so
+this record does not reconstruct them beyond the commands and reflog evidence above.
+
+### Follow-up implementation and abort investigation
+
+The LKG refresh now treats a valid replay boundary monotonically: when the selected parent's tip is
+an ancestor of that boundary, refresh preserves it; when the parent tip is a descendant, refresh
+may advance it. Regression coverage models stale local trunk, a two-commit removed parent, its
+combined squash on updated remote trunk, and one child-only commit. It performs the LKG-preserving
+unmount, runs the next command's eager refresh, and verifies that only child work is replayed cleanly
+onto the squash-updated trunk. A complementary test proves descendant parent tips still advance an
+older LKG.
+
+The abort symptom was investigated separately. The force-restore implementation predates this
+incident (commit `506b1e6494979257b6803bc799279988d63f7975`, 2026-07-09), and a new CLI integration
+regression enters a real `git am` conflict before invoking `git stack restack --abort`. It confirms
+successful exit, removal of the pending operation, and restoration of both `HEAD` and the named
+branch ref to `pending.original_sha`. No remaining abort code defect was reproduced; the real
+reflog proves that the underlying `git am --abort` returned to trunk, but the unavailable command
+output prevents determining why the subsequent force-restore was not reflected in that run.

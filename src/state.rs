@@ -897,27 +897,50 @@ impl State {
                         .unwrap_or_else(|| parent.clone());
 
                     let tree_branch = self.get_tree_branch(repo, &branch).unwrap();
-                    if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
-                        if git_repo.is_ancestor(lkg_parent, &branch_ref)? {
-                            parent_lkgs
-                                .insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
+                    let valid_lkg_parent =
+                        if let Some(lkg_parent) = tree_branch.lkg_parent.as_deref() {
+                            if git_repo.is_ancestor(lkg_parent, &branch_ref)? {
+                                parent_lkgs
+                                    .insert(tree_branch.name.clone(), Some(lkg_parent.to_string()));
+                                Some(lkg_parent)
+                            } else {
+                                parent_lkgs.insert(tree_branch.name.clone(), None);
+                                None
+                            }
                         } else {
-                            parent_lkgs.insert(tree_branch.name.clone(), None);
-                        }
-                    }
+                            None
+                        };
                     if git_repo
                         .is_ancestor(&parent_ref, &branch_ref)
                         .unwrap_or(false)
                         && let Ok(new_lkg_parent) = git_repo.sha(&parent_ref)
                     {
-                        tracing::debug!(
-                            lkg_parent = ?new_lkg_parent,
-                            "Branch {} is a descendent of {}",
-                            branch.yellow(),
-                            parent.yellow(),
-                        );
-                        // Save the LKG parent for the branch.
-                        parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
+                        // A valid stored boundary can be ahead of the newly selected parent after
+                        // sync removes a merged parent. Keep it when the selected parent's tip is
+                        // its ancestor; moving backward would replay the removed parent's work.
+                        // A descendant selected-parent tip is newer and may safely advance it.
+                        let would_move_backward = if let Some(lkg_parent) = valid_lkg_parent {
+                            git_repo.is_ancestor(&new_lkg_parent, lkg_parent)?
+                        } else {
+                            false
+                        };
+                        if would_move_backward {
+                            tracing::debug!(
+                                lkg_parent = ?valid_lkg_parent,
+                                selected_parent_tip = ?new_lkg_parent,
+                                "Preserving valid LKG ahead of selected parent for {}",
+                                branch.yellow(),
+                            );
+                        } else {
+                            tracing::debug!(
+                                lkg_parent = ?new_lkg_parent,
+                                "Branch {} is a descendent of {}",
+                                branch.yellow(),
+                                parent.yellow(),
+                            );
+                            // Save the LKG parent for the branch.
+                            parent_lkgs.insert(branch.clone(), Some(new_lkg_parent));
+                        }
                     } else if !matches!(parent_lkgs.get(&branch), Some(Some(_)))
                         && let Ok(merge_base) = git_repo.merge_base(&parent_ref, &branch_ref)
                     {
@@ -1864,6 +1887,78 @@ mod tests {
 
         let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
         assert_eq!(updates.get("feature"), Some(&Some(sha_a)));
+    }
+
+    #[test]
+    fn compute_lkg_updates_preserves_valid_boundary_ahead_of_selected_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let stale_main = git_rev_parse(dir.path(), "main");
+
+        git_run(dir.path(), &["checkout", "-b", "removed-parent"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "parent one"],
+        );
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "parent two"],
+        );
+        let old_parent_tip = git_rev_parse(dir.path(), "removed-parent");
+        git_run(dir.path(), &["checkout", "-b", "child"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "child work"],
+        );
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+        let mut main = Branch::new("main".to_string(), None);
+        main.branches.push(Branch::new(
+            "child".to_string(),
+            Some(old_parent_tip.clone()),
+        ));
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main))].into_iter().collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
+        assert_eq!(
+            updates.get("child"),
+            Some(&Some(old_parent_tip)),
+            "stale selected parent {stale_main} must not move a valid replay boundary backward"
+        );
+    }
+
+    #[test]
+    fn compute_lkg_updates_advances_boundary_to_descendant_parent_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let old_lkg = git_rev_parse(dir.path(), "main");
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "advance main"],
+        );
+        let current_main = git_rev_parse(dir.path(), "main");
+        git_run(dir.path(), &["checkout", "-b", "child"]);
+        git_run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "child work"],
+        );
+
+        let git_repo =
+            GitRepo::open_with_cache_at(dir.path(), &dir.path().join("mb_cache.redb")).unwrap();
+        let repo = repo_key(dir.path());
+        let mut main = Branch::new("main".to_string(), None);
+        main.branches
+            .push(Branch::new("child".to_string(), Some(old_lkg)));
+        let state = State {
+            repos: [(repo.clone(), RepoState::new(main))].into_iter().collect(),
+        };
+
+        let updates = state.compute_lkg_updates(&git_repo, &repo, None).unwrap();
+        assert_eq!(updates.get("child"), Some(&Some(current_main)));
     }
 
     /// When a parent branch is rewritten with a fresh tip that is no longer an ancestor of a
