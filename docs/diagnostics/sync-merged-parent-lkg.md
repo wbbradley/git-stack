@@ -200,3 +200,13 @@ successful exit, removal of the pending operation, and restoration of both `HEAD
 branch ref to `pending.original_sha`. No remaining abort code defect was reproduced; the real
 reflog proves that the underlying `git am --abort` returned to trunk, but the unavailable command
 output prevents determining why the subsequent force-restore was not reflected in that run.
+
+The replacement observation build was installed on 2026-07-14:
+
+- version: `git-stack 0.5.0`;
+- source SHA: `4d5dd72b8147ed80ef5a57a6a8e51d41bcea9ade`;
+- installed binary: `/Users/wbbradley/.cargo/bin/git-stack`;
+- binary SHA-256: `490bcfbb9a5454545ed800d9114d9146fd3aacb0514364045b24eb904ce59399`.
+
+Future observations must report this source SHA and digest (or a later build containing the fix) to
+count toward acceptance.
