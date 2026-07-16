@@ -1113,7 +1113,7 @@ fn status(
     if served_from_cache {
         eprintln!(
             "{}",
-            "note: showing cached PR data (a live fetch failed; run `git stack --fetch` to \
+            "note: showing cached PR data (a live fetch failed; run `git stack status --fetch` to \
              refresh)"
                 .yellow()
         );
@@ -1169,7 +1169,7 @@ fn interactive(
     if served_from_cache {
         eprintln!(
             "{}",
-            "note: showing cached PR data (a live fetch failed; run `git stack --fetch` to \
+            "note: showing cached PR data (a live fetch failed; run `git stack status --fetch` to \
              refresh)"
                 .yellow()
         );
