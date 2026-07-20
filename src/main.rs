@@ -5,7 +5,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use colored::Colorize;
-use git::{after_text, git_checkout_main, git_fetch, git_trunk, run_git_status};
+use git::{
+    after_text, checkout_tracked_branch, git_checkout_main, git_fetch, git_trunk, run_git_status,
+};
 use state::{
     Branch, PendingRestackOperation, RestackMethod, RestackResume, RestackStep, StackMethod,
 };
@@ -467,11 +469,11 @@ fn inner_main() -> Result<()> {
         }
         Some(Command::Up) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
-            navigate_up(&state, &repo, &current_branch)
+            navigate_up(&git_repo, &state, &repo, &current_branch)
         }
         Some(Command::Down) => {
             state.try_auto_mount(&git_repo, &repo, &current_branch)?;
-            navigate_down(&state, &repo, &current_branch)
+            navigate_down(&git_repo, &state, &repo, &current_branch)
         }
         Some(Command::Delete { branch_name }) => state.delete_branch(&repo, &branch_name),
         Some(Command::Cleanup { dry_run, all }) => {
@@ -1202,7 +1204,7 @@ fn interactive(
 
     // Handle checkout if the user selected a branch.
     if let Some(branch_to_checkout) = branch_to_checkout {
-        run_git(&["checkout", &branch_to_checkout])?;
+        checkout_tracked_branch(git_repo, &branch_to_checkout)?;
     }
 
     state.save_state()?;
@@ -1210,12 +1212,12 @@ fn interactive(
 }
 
 /// Navigate up the stack to the parent branch.
-fn navigate_up(state: &State, repo: &str, current_branch: &str) -> Result<()> {
+fn navigate_up(git_repo: &GitRepo, state: &State, repo: &str, current_branch: &str) -> Result<()> {
     let parent = state.get_parent_branch_of(repo, current_branch);
 
     match parent {
         Some(parent_branch) => {
-            run_git(&["checkout", &parent_branch.name])?;
+            checkout_tracked_branch(git_repo, &parent_branch.name)?;
             Ok(())
         }
         None => {
@@ -1228,7 +1230,12 @@ fn navigate_up(state: &State, repo: &str, current_branch: &str) -> Result<()> {
 }
 
 /// Navigate down the stack to a child branch.
-fn navigate_down(state: &State, repo: &str, current_branch: &str) -> Result<()> {
+fn navigate_down(
+    git_repo: &GitRepo,
+    state: &State,
+    repo: &str,
+    current_branch: &str,
+) -> Result<()> {
     let branch = state.get_tree_branch(repo, current_branch);
 
     match branch {
@@ -1242,7 +1249,7 @@ fn navigate_down(state: &State, repo: &str, current_branch: &str) -> Result<()> 
                     );
                 }
                 1 => {
-                    run_git(&["checkout", &children[0].name])?;
+                    checkout_tracked_branch(git_repo, &children[0].name)?;
                     Ok(())
                 }
                 n => {

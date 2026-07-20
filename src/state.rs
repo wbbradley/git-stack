@@ -13,7 +13,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    git::{GitTrunk, after_text, git_branch_exists, git_trunk},
+    git::{GitTrunk, after_text, checkout_tracked_branch, git_branch_exists, git_trunk},
     git2_ops::{DEFAULT_REMOTE, GitRepo},
     run_git,
 };
@@ -291,7 +291,7 @@ impl State {
                     <parent-branch>` to stack {branch_name} on top of the parent branch.",
                 );
             }
-            run_git(&["checkout", &branch_name])?;
+            checkout_tracked_branch(git_repo, &branch_name)?;
             return Ok(());
         }
 

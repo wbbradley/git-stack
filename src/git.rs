@@ -95,11 +95,24 @@ fn git_failure_error(args: &[&str], stderr: &str, status: ExitStatus) -> anyhow:
             stderr.trim(),
         )
     } else {
-        anyhow!(
-            "`git {}` failed with exit status: {}",
-            args.join(" "),
-            status
-        )
+        // Backstop: include git's own stderr so failures like a worktree
+        // conflict ("'<branch>' is already used by worktree at '<path>'")
+        // reach the user instead of being reduced to a bare exit status.
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            anyhow!(
+                "`git {}` failed with exit status: {}",
+                args.join(" "),
+                status
+            )
+        } else {
+            anyhow!(
+                "`git {}` failed with exit status: {}\n{}",
+                args.join(" "),
+                status,
+                stderr
+            )
+        }
     }
 }
 
@@ -383,6 +396,118 @@ pub(crate) fn git_branch_exists(repo: &GitRepo, branch: &str) -> bool {
     repo.branch_exists(branch)
 }
 
+/// One worktree as reported by `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeEntry {
+    /// Absolute path git reports for the worktree.
+    path: String,
+    /// Short branch name checked out there, or `None` for a detached HEAD.
+    branch: Option<String>,
+    /// Whether git marked the worktree prunable (its directory is gone/stale).
+    prunable: bool,
+}
+
+/// Parse `git worktree list --porcelain` output into worktree entries.
+///
+/// Records are separated by blank lines and begin with a `worktree <path>`
+/// line. A `branch refs/heads/<name>` line names the checked-out branch;
+/// `detached` worktrees have no branch line; a `prunable <reason>` line marks a
+/// stale worktree whose directory has gone away.
+fn parse_worktree_list(output: &str) -> Vec<WorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut prunable = false;
+
+    let mut flush =
+        |path: &mut Option<String>, branch: &mut Option<String>, prunable: &mut bool| {
+            if let Some(p) = path.take() {
+                entries.push(WorktreeEntry {
+                    path: p,
+                    branch: branch.take(),
+                    prunable: std::mem::take(prunable),
+                });
+            } else {
+                // No open record; drop any stray attributes.
+                branch.take();
+                *prunable = false;
+            }
+        };
+
+    for line in output.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            flush(&mut path, &mut branch, &mut prunable);
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            // Defensive flush in case records are not blank-line separated.
+            flush(&mut path, &mut branch, &mut prunable);
+            path = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            prunable = true;
+        }
+    }
+    flush(&mut path, &mut branch, &mut prunable);
+    entries
+}
+
+/// Canonicalize a filesystem path for comparison, falling back to a
+/// trailing-slash-trimmed copy when the path no longer resolves (e.g. a stale
+/// worktree directory).
+fn canonicalize_worktree_path(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| path.trim_end_matches('/').to_string())
+}
+
+/// If `branch` is checked out in a worktree *other than* the current one,
+/// return that worktree's git-reported path. Returns `None` when the branch is
+/// not checked out elsewhere, is checked out in the current worktree (a valid
+/// no-op), lives in a prunable/stale worktree (let git's own message, which
+/// suggests `git worktree prune`, surface via the stderr backstop), or when
+/// worktree enumeration fails for any reason — a diagnostic pre-check must
+/// never block a normal checkout.
+fn worktree_holding_branch(git_repo: &GitRepo, branch: &str) -> Option<String> {
+    let current_root = canonicalize_worktree_path(&git_repo.root().ok()?);
+    let out = run_git(&["worktree", "list", "--porcelain"]).ok()?;
+    for entry in parse_worktree_list(&out.stdout) {
+        if entry.branch.as_deref() != Some(branch) {
+            continue;
+        }
+        if entry.prunable {
+            return None;
+        }
+        if canonicalize_worktree_path(&entry.path) == current_root {
+            // Already on this branch in the current worktree — valid no-op.
+            return None;
+        }
+        return Some(entry.path);
+    }
+    None
+}
+
+/// Check out an existing tracked branch, first explaining the common failure
+/// where the branch is checked out in another git worktree. git refuses that
+/// checkout with exit 128 and a message git-stack would otherwise discard, so
+/// pre-empt it with an actionable error naming the branch and worktree path.
+/// Any other failure still surfaces git's own stderr via the low-level backstop
+/// in [`git_failure_error`].
+pub(crate) fn checkout_tracked_branch(git_repo: &GitRepo, branch: &str) -> Result<()> {
+    if let Some(path) = worktree_holding_branch(git_repo, branch) {
+        bail!(
+            "branch '{branch}' is checked out in another worktree at\n'{path}'. \
+             Switch to that directory, or remove the worktree with\n\
+             `git worktree remove {path}`, before checking it out here."
+        );
+    }
+    run_git(&["checkout", branch])?;
+    Ok(())
+}
+
 pub(crate) fn run_git_status_clean() -> Result<bool> {
     Ok(run_git(&["status", "--porcelain"])?.is_empty())
 }
@@ -589,5 +714,67 @@ mod tests {
             '/repo/.git/refs/heads/foo.lock': File exists.";
         let refs = vec!["refs/heads/foo".to_string(), "refs/heads/bar".to_string()];
         assert!(!is_case_collision_failure(stderr, &refs));
+    }
+
+    #[test]
+    fn parse_worktree_list_maps_branches_and_detached() {
+        // Two records separated by a blank line: the main worktree on `main`,
+        // a linked worktree on `feature`, and a detached-HEAD worktree.
+        let output = "worktree /repo\n\
+            HEAD 1111111111111111111111111111111111111111\n\
+            branch refs/heads/main\n\
+            \n\
+            worktree /repo/../feature-wt\n\
+            HEAD 2222222222222222222222222222222222222222\n\
+            branch refs/heads/feature\n\
+            \n\
+            worktree /repo/../detached-wt\n\
+            HEAD 3333333333333333333333333333333333333333\n\
+            detached\n";
+        let entries = parse_worktree_list(output);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "/repo");
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert!(!entries[0].prunable);
+        assert_eq!(entries[1].path, "/repo/../feature-wt");
+        assert_eq!(entries[1].branch.as_deref(), Some("feature"));
+        // Detached worktree has no branch line.
+        assert_eq!(entries[2].path, "/repo/../detached-wt");
+        assert_eq!(entries[2].branch, None);
+    }
+
+    #[test]
+    fn parse_worktree_list_marks_prunable() {
+        let output = "worktree /repo\n\
+            HEAD 1111111111111111111111111111111111111111\n\
+            branch refs/heads/main\n\
+            \n\
+            worktree /gone/feature-wt\n\
+            HEAD 2222222222222222222222222222222222222222\n\
+            branch refs/heads/feature\n\
+            prunable gitdir file points to non-existent location\n";
+        let entries = parse_worktree_list(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].branch.as_deref(), Some("feature"));
+        assert!(entries[1].prunable);
+    }
+
+    #[test]
+    fn parse_worktree_list_handles_trailing_record_without_blank_line() {
+        // `run_git` trims trailing whitespace, so the final record may lack its
+        // separating blank line; it must still be captured.
+        let output = "worktree /repo\n\
+            branch refs/heads/main\n\
+            \n\
+            worktree /repo/../feature-wt\n\
+            branch refs/heads/feature";
+        let entries = parse_worktree_list(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn parse_worktree_list_empty_input() {
+        assert!(parse_worktree_list("").is_empty());
     }
 }
